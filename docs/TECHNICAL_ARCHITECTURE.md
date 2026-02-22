@@ -75,6 +75,14 @@ Function `loop(ts)`:
 
 - Autonomous turret with threat targeting and high fire rate.
 - Tracks heat, ammo, cooldown, and audio mix.
+- Uses predictive lead (`phalanxLeadSec` + `phalanxTargetPoint`) for moving targets.
+- Target score blends threat, ETA, and range with explicit payload awareness:
+  - city/base/hellRaiser pressure
+  - elevated priority for threats targeting `PHALANX`
+- Terminal override path preempts normal score ordering when an inbound
+  `PHALANX` threat is inside short ETA window.
+- Engagement gate has emergency widening for terminal-priority targets.
+- Hit model is probabilistic with velocity-aware miss envelope and per-target resistance.
 
 ### Hell Raiser
 
@@ -97,21 +105,42 @@ Function `loop(ts)`:
 - Public API includes launch/hit/impact/wave/emp/nearMiss/phalanx/thunder/hellRaiser.
 - `audio.update()` receives game telemetry (`danger`, `weather`, `phalanxLevel`, etc.).
 
-## 9. Performance Notes
+## 9. Debug Telemetry Architecture
+
+- Toggle and export:
+  - `F8`: telemetry enable/disable
+  - `F9`: export `scope: "wave"` (current wave snapshot)
+  - `F10`: export `scope: "session"` (all captured waves)
+- Wave lifecycle:
+  - per-wave records are created on `debugStartWave()`
+  - finalized on transition, clear, or game over
+- Top-level envelope:
+  - `schema`, `generatedAt`, `session`, `scope`, `waves[]`
+- Per-wave payload:
+  - `meta`, `stats`, `events[]`, dropped-event counters
+- Key event families:
+  - `enemy_spawn`, `enemy_impact`, `enemy_split`, `enemy_killed`
+  - `defense_lock`, `defense_burst`, `defense_state`, `asset_destroyed`
+- Phalanx instrumentation (current):
+  - `defense_lock`: `dist`, `score`, `payloadType`, `timeToImpact`, `terminalPriority`
+  - `defense_burst`: `shots`, `hits`, `kills`, `aimErr`, `targetDist`,
+    `hitRadiusPeak`, `missPeak`, plus `payloadType`, `timeToImpact`, `terminalPriority`
+
+## 10. Performance Notes
 
 - Frequent object arrays are manually updated and pruned each frame.
 - Trail and particle lengths are capped.
 - Bloom buffer is reused and resized with viewport.
 - Most effects are approximated for speed over physically-based simulation.
 
-## 10. Rebuild-Critical Constants and Behaviors
+## 11. Rebuild-Critical Constants and Behaviors
 
 - Base interceptor baseline speed constant: `BASE_PLAYER_SPEED = 640`.
 - Interceptor runtime speed: `interceptorSpeed(mult)` with level/weather scaling.
 - Threat scaling drives both audio intensity and AI urgency.
 - Large explosions can splash-destroy multiple ground assets.
 
-## 11. Known Naming/Compatibility Notes
+## 12. Known Naming/Compatibility Notes
 
 - File name intentionally uses `misslecommand_enhanced.html` (legacy typo retained).
 - `index.html` exists as launcher/redirect entry for Pages.

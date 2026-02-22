@@ -29,6 +29,9 @@
 - `RMB` or `E`: EMP pulse
 - `C`: toggle auto defense
 - `H`: deploy/retract Hell Raiser
+- `F8`: toggle debug telemetry
+- `F9`: export current wave debug JSON
+- `F10`: export full session debug JSON
 - `M`: mute/unmute
 - `+` / `-`: volume up/down
 - `]` / `PageUp`: skip to next wave
@@ -73,6 +76,10 @@
 
 - Automated high-rate turret near center defense line.
 - Has its own ammo pool, targeting logic, and heat/cool behavior.
+- Uses predictive lead to engage high-velocity targets.
+- Prioritizes high-threat inbound missiles and applies emergency terminal priority
+  to protect itself when under imminent attack.
+- Emits detailed per-lock and per-burst telemetry for AI-assisted tuning.
 
 ### 6.4 Hell Raiser
 
@@ -140,3 +147,14 @@
 - Primary constraint: keep game runtime in a single HTML file.
 - Must run in modern desktop browsers without build tooling.
 - Maintain responsive behavior for varied viewport sizes.
+
+## 13. Debug and Observability
+
+- Telemetry is operator-controlled and defaults to OFF at startup.
+- Export modes:
+  - `wave`: focused snapshot of active wave state/events.
+  - `session`: full multi-wave timeline for balancing and diagnostics.
+- Intended use:
+  - diagnose auto-defense weaknesses
+  - quantify Phalanx lock quality, timing, and conversion
+  - support external analytics/AI post-run evaluation

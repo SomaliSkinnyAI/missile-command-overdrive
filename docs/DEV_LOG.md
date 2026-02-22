@@ -18,6 +18,21 @@ Purpose: maintain a running, chronological technical record to support future ma
 - Increased late-game defensive viability by scaling interceptor speed and auto-defense throughput.
 - Performed high-fidelity render pass for UFO/Boss UFO/Raider/Daemon/carrier/drone.
 
+### Phalanx Intercept and Telemetry Tuning
+
+- Resolved Level-20 Phalanx failure mode where sustained fire could produce zero hits.
+  - replaced static lead assumptions with predictive target-point math
+  - aligned hit validation to predicted target position
+  - added velocity-aware miss envelope for fast targets
+- Added anti-collapse targeting bias:
+  - raised threat weighting for projectiles targeting `PHALANX`
+  - added terminal-priority override for imminent `PHALANX` inbound threats
+  - widened emergency engagement gate (range/alignment) for terminal defense
+- Expanded debug payload for analysis:
+  - `defense_lock`: `payloadType`, `timeToImpact`, `terminalPriority`
+  - `defense_burst`: `payloadType`, `timeToImpact`, `terminalPriority`,
+    plus aim/dispersion metrics (`aimErr`, `targetDist`, `hitRadiusPeak`, `missPeak`)
+
 ### Deployment and GitHub
 
 - Initialized repository and pushed initial release.

@@ -12,6 +12,9 @@ A single-file HTML5 reimagining of Missile Command with enhanced visuals, audio,
 - `LMB`: Fire interceptor
 - `H`: Toggle Hell Raiser deploy/retract
 - `C`: Toggle auto defense
+- `F8`: Toggle debug telemetry
+- `F9`: Export current wave telemetry JSON
+- `F10`: Export full session telemetry JSON
 - `E` or `RMB`: EMP pulse
 - `M`: Mute
 - `+` / `-`: Volume up/down

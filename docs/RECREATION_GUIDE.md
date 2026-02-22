@@ -57,6 +57,8 @@ A single-file HTML5 game with:
 11. UX + tooling
 - Add controls/help text/HUD overlays.
 - Add test shortcuts (level skip, secret triggers).
+- Add debug controls (`F8` toggle, `F9` wave export, `F10` session export).
+- Emit per-wave stats and event timelines for post-run analysis.
 
 ## 3. Behavioral Acceptance Checklist
 
@@ -68,6 +70,8 @@ A single-file HTML5 game with:
 - Auto-defense can meaningfully engage late-game waves.
 - Hell Raiser deploys, is vulnerable while surfaced, and retracts.
 - Hell Raiser swarm missiles retarget individual targets.
+- Phalanx uses predictive lead and can emergency-prioritize imminent threats to itself.
+- Debug exports include lock/burst telemetry rich enough for AI-assisted diagnostics.
 - Secret daemon trigger works.
 - GitHub Pages root URL launches game.
 
@@ -94,3 +98,22 @@ Then bundle into single-file release artifact for deployment parity.
 - base/phalanx/hellraiser ammo and cooldown behavior
 - enemy split/deploy events
 - mobile viewport scaling and HUD overlap
+- debug export correctness (`wave` vs `session` scope)
+- phalanx response time to `payload.type === "phalanx"` inbound threats
+
+## 6. Telemetry Schema Essentials (for recreation parity)
+
+- Session envelope:
+  - `schema`, `generatedAt`, `session`, `scope`, `waves[]`
+- Scopes:
+  - `wave`: current/last wave only
+  - `session`: all waves captured since debug-enabled/reset
+- Per-wave:
+  - `meta`, `stats`, `events[]`, `dropped`
+- Minimum event set for balancing:
+  - `enemy_spawn`, `enemy_impact`, `enemy_killed`, `enemy_split`
+  - `defense_lock`, `defense_burst`, `defense_state`, `asset_destroyed`
+- Phalanx-specific fields to preserve:
+  - `defense_lock`: `payloadType`, `timeToImpact`, `terminalPriority`
+  - `defense_burst`: `aimErr`, `targetDist`, `hitRadiusPeak`, `missPeak`,
+    `payloadType`, `timeToImpact`, `terminalPriority`

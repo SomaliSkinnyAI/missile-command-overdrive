@@ -96,7 +96,7 @@
 <body>
   <canvas id="game" width="1280" height="720"></canvas>
   <div id="hud"></div>
-  <div id="help">LMB Fire | H Hell Raiser | C Auto Defense | E EMP | M Mute | +/- Volume | ]/[ Skip Level | 1-5 Shop | R Restart</div>
+  <div id="help">LMB Fire | H Hell Raiser | C Auto Defense | E EMP | M Mute | +/- Volume | F8 Debug | F9/F10 Export | ]/[ Skip Level | 1-5 Shop | R Restart</div>
   <script>
     (() => {
       const canvas = document.getElementById('game');
@@ -204,11 +204,22 @@
           phalanxEff: 1.0
         },
         selectedBase: null,
-        floatingTexts: []
+        floatingTexts: [],
+        debug: {
+          enabled: false,
+          maxEventsPerWave: 120000,
+          sessionStartedAt: new Date().toISOString(),
+          currentWave: null,
+          waveSeq: 0,
+          waves: {},
+          sessionDrops: 0
+        }
       };
       const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
       const rand = (a, b) => a + Math.random() * (b - a);
       const lerp = (a, b, t) => a + (b - a) * t;
+      const round3 = v => Math.round((Number(v) || 0) * 1000) / 1000;
+      const angleDelta = (from, to) => Math.atan2(Math.sin(to - from), Math.cos(to - from));
       const easeOut = t => 1 - Math.pow(1 - clamp(t, 0, 1), 3);
       const easeIn = t => {
         t = clamp(t, 0, 1);
@@ -428,10 +439,208 @@
       function jumpLevel(delta) {
         if (S.intro || S.gameOver) resetGame();
         S.shop = false;
+        debugRecord('wave_jump', {
+          fromLevel: S.level,
+          delta
+        });
         S.level = Math.max(1, S.level + delta);
         startWave(.7);
         S.msg = `Jumped to Wave ${S.level}`;
         S.msgT = 1.2;
+      }
+
+      function targetSnapshot(t) {
+        if (!t) return null;
+        const base = {
+          type: t.type ?? 'unknown',
+          x: round3(t.x ?? 0),
+          y: round3(t.y ?? 0)
+        };
+        if (t.type === 'city') base.id = t.ref?.id ?? null;
+        else if (t.type === 'base') base.id = t.ref?.id ?? null;
+        else if (t.type === 'phalanx') base.id = 'PHALANX';
+        else if (t.type === 'hellRaiser') base.id = 'HELL_RAISER';
+        else base.id = t.ref?.id ?? null;
+        return base;
+      }
+
+      function debugCreateWave(level, meta = {}) {
+        const d = S.debug,
+          key = `W${++d.waveSeq}-L${level}`;
+        const wave = {
+          key,
+          seq: d.waveSeq,
+          level,
+          startTime: round3(S.time),
+          startIso: new Date().toISOString(),
+          endTime: null,
+          endIso: null,
+          endReason: null,
+          meta,
+          dropped: 0,
+          events: [],
+          stats: {
+            enemySpawn: {},
+            enemyVehicleSpawn: {},
+            enemyKilled: {},
+            enemyImpact: {},
+            enemyTargetType: {},
+            defenseShots: {
+              manual: 0,
+              auto: 0,
+              phalanx: 0,
+              hellRaiser: 0
+            },
+            defenseBursts: {
+              phalanx: 0,
+              hellRaiser: 0
+            },
+            assetsLost: {
+              cities: 0,
+              bases: 0,
+              phalanx: 0,
+              hellRaiser: 0
+            },
+            autoScan: {
+              cycles: 0,
+              enemy: {
+                covered: 0,
+                noIntercept: 0,
+                late: 0,
+                conflict: 0
+              },
+              ufo: {
+                noIntercept: 0,
+                conflict: 0
+              }
+            }
+          }
+        };
+        d.waves[key] = wave;
+        d.currentWave = key;
+        return wave;
+      }
+
+      function debugCurrentWave() {
+        const key = S.debug.currentWave;
+        return key ? S.debug.waves[key] ?? null : null;
+      }
+
+      function debugEnsureWave(level = S.level) {
+        if (!S.debug.enabled) return null;
+        let wave = debugCurrentWave();
+        if (!wave || wave.endReason || wave.level !== level) wave = debugCreateWave(level, {
+          trigger: 'implicit'
+        });
+        return wave;
+      }
+
+      function debugInc(map, key, delta = 1, wave = null) {
+        const w = wave ?? debugEnsureWave();
+        if (!w || !w.stats?.[map]) return;
+        w.stats[map][key] = (w.stats[map][key] ?? 0) + delta;
+      }
+
+      function debugRecord(type, payload = {}, wave = null) {
+        if (!S.debug.enabled) return;
+        const w = wave ?? debugEnsureWave();
+        if (!w) return;
+        if (w.events.length >= S.debug.maxEventsPerWave) {
+          w.dropped++;
+          S.debug.sessionDrops++;
+          return;
+        }
+        w.events.push({
+          t: round3(S.time),
+          type,
+          ...payload
+        });
+      }
+
+      function debugStartWave(level, meta = {}) {
+        if (!S.debug.enabled) return;
+        const cur = debugCurrentWave();
+        if (cur && !cur.endReason) {
+          cur.endTime = round3(S.time);
+          cur.endIso = new Date().toISOString();
+          cur.endReason = 'wave_transition';
+        }
+        const w = debugCreateWave(level, meta);
+        debugRecord('wave_start', {
+          level,
+          ...meta
+        }, w);
+      }
+
+      function debugFinalizeWave(reason = 'unknown', extra = {}) {
+        if (!S.debug.enabled) return;
+        const w = debugCurrentWave();
+        if (!w || w.endReason) return;
+        debugRecord('wave_end', {
+          reason,
+          ...extra
+        }, w);
+        w.endTime = round3(S.time);
+        w.endIso = new Date().toISOString();
+        w.endReason = reason;
+      }
+
+      function debugExport(scope = 'session') {
+        const d = S.debug,
+          all = Object.values(d.waves).sort((a, b) => a.seq - b.seq),
+          waves = scope === 'wave' ? (debugCurrentWave() ? [debugCurrentWave()] : all.slice(-1)) : all,
+          totalEvents = all.reduce((n, w) => n + (w.events?.length ?? 0), 0),
+          data = {
+            schema: 'mc-overdrive.debug.v1',
+            generatedAt: new Date().toISOString(),
+            session: {
+              startedAt: d.sessionStartedAt,
+              currentLevel: S.level,
+              gameTime: round3(S.time),
+              enabled: d.enabled,
+              waves: all.length,
+              totalEvents,
+              dropped: d.sessionDrops
+            },
+            scope,
+            waves
+          };
+        const blob = new Blob([JSON.stringify(data, null, 2)], {
+            type: 'application/json'
+          }),
+          a = document.createElement('a'),
+          stamp = new Date().toISOString().replace(/[:.]/g, '-');
+        a.href = URL.createObjectURL(blob);
+        a.download = `mc-overdrive-debug-${scope}-${stamp}.json`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(a.href);
+        note(scope === 'wave' ? 'Wave debug export ready' : 'Session debug export ready', 1.15);
+      }
+
+      function debugToggle(force = null) {
+        const d = S.debug,
+          next = force === null ? !d.enabled : !!force;
+        if (next === d.enabled) return;
+        if (!next) {
+          debugRecord('debug_disabled', {
+            level: S.level
+          });
+          d.enabled = false;
+          S.msg = 'Debug telemetry OFF';
+          S.msgT = 1.0;
+          return;
+        }
+        d.enabled = true;
+        debugStartWave(S.level, {
+          trigger: 'toggle_on'
+        });
+        debugRecord('debug_enabled', {
+          level: S.level
+        });
+        S.msg = 'Debug telemetry ON';
+        S.msgT = 1.0;
       }
 
       function interceptorSpeed(mult = 1) {
@@ -1354,6 +1563,13 @@
           heat: 0,
           fireMix: 0,
           target: null,
+          targetKind: null,
+          targetDist: 0,
+          lockKey: null,
+          aimAng: -Math.PI * .5,
+          aimX: px,
+          aimY: S.groundY - 180,
+          aimErr: Math.PI,
           destroyed: false
         };
         S.hellRaiser = {
@@ -1457,6 +1673,7 @@
       }
 
       function resetGame() {
+        const dbgEnabled = S.debug?.enabled ?? false;
         S.level = 1;
         S.score = 0;
         S.combo = 0;
@@ -1496,6 +1713,12 @@
         S.weather.mode = 'clear';
         S.weather.intensity = .15;
         S.weather.wind = rand(-40, 40);
+        S.debug.sessionStartedAt = new Date().toISOString();
+        S.debug.currentWave = null;
+        S.debug.waveSeq = 0;
+        S.debug.waves = {};
+        S.debug.sessionDrops = 0;
+        S.debug.enabled = dbgEnabled;
         buildWeather();
         buildWorld();
         startWave(2.5);
@@ -1592,6 +1815,13 @@
           S.phalanx.heat = 0;
           S.phalanx.fireMix = 0;
           S.phalanx.target = null;
+          S.phalanx.targetKind = null;
+          S.phalanx.targetDist = 0;
+          S.phalanx.lockKey = null;
+          S.phalanx.aimAng = -Math.PI * .5;
+          S.phalanx.aimX = S.phalanx.x;
+          S.phalanx.aimY = S.groundY - 180;
+          S.phalanx.aimErr = Math.PI;
         }
         if (S.hellRaiser) {
           const hr = S.hellRaiser;
@@ -1618,6 +1848,14 @@
         S.nextUfo = delay + rand(5.8, 10.6);
         S.raiderQuota = S.level >= 4 ? Math.min(2 + Math.floor(S.level / 6), 4) : 0;
         S.nextRaider = delay + rand(4.4, 8.2);
+        if (S.debug.enabled) debugStartWave(S.level, {
+          delay: round3(delay),
+          weather: S.weather.mode,
+          weatherIntensity: round3(S.weather.intensity),
+          plannedSpawns: S.wavePlan.length,
+          ufoQuota: S.ufoQuota,
+          raiderQuota: S.raiderQuota
+        });
         note(`Wave ${S.level} incoming | ${S.weather.mode.toUpperCase()} FRONT`, 2.1);
         audio.wave();
       }
@@ -1744,6 +1982,18 @@
           deployAt: 0,
           homing: 0
         });
+        debugInc('enemySpawn', 'ufoBomb');
+        debugInc('enemyTargetType', t.type ?? 'unknown');
+        debugRecord('enemy_spawn', {
+          id: S.id - 1,
+          enemyType: 'ufoBomb',
+          source: `ufo:${u.id}`,
+          from: {
+            x: round3(sx),
+            y: round3(sy)
+          },
+          target: targetSnapshot(t)
+        });
         audio.enemyLaunch(clamp(sx / S.w, 0, 1));
       }
 
@@ -1774,13 +2024,24 @@
           t: 0,
           autoReserve: 0
         });
+        debugInc('enemyVehicleSpawn', isBoss ? 'bossUfo' : 'ufo');
+        debugRecord('enemy_vehicle_spawn', {
+          vehicle: 'ufo',
+          id: S.id - 1,
+          boss: isBoss,
+          from: {
+            x: round3(x),
+            y: round3(baseY)
+          },
+          vx: round3(vx)
+        });
 
         note(isBoss ? 'WARNING: Boss UFO detected' : 'UFO intruder detected', 1.1);
         audio.incoming(.5, isBoss ? 1.2 : .95);
         return true;
       }
 
-      function spawnDroneAt(x, y, targetOverride = null) {
+      function spawnDroneAt(x, y, targetOverride = null, source = 'drone') {
         const t = targetOverride || chooseTarget('drone');
         if (!t) return;
         const sx = x,
@@ -1790,38 +2051,12 @@
           dist = Math.max(120, Math.hypot(dx, dy)),
           sp = vSpeed('drone'),
           dur = dist / sp;
-        S.enemy.push({
-          id: S.id++,
-          v: 'drone',
-          x: sx,
-          y: sy,
-          sx,
-          sy,
-          tx: t.x,
-          ty: t.y,
-          vx: dx / dur,
-          vy: dy / dur,
-          dur,
-          el: 0,
-          sp,
-          payload: t,
-          trail: [],
-          trailT: 0,
-          res: vRes('drone'),
-          val: vValue('drone'),
-          reserve: false,
-          warn: false,
-          near: false,
-          splitAt: 0,
-          split: false,
+        createEnemyProjectile('drone', sx, sy, t, {
           amp: rand(14, 38),
           fq: rand(1.8, 3.2),
-          ph: Math.random() * TAU,
           blast: rand(34, 52),
-          hp: 1,
-          deployed: false,
-          deployAt: 0,
-          homing: 0.2
+          homing: 0.2,
+          source
         });
         audio.enemyLaunch(clamp(sx / S.w, 0, 1));
       }
@@ -1831,9 +2066,14 @@
         for (let i = 0; i < count; i++) {
           const t = chooseTarget('drone');
           if (!t) continue;
-          spawnDroneAt(m.x + rand(-20, 20), m.y + rand(-8, 10), t);
+          spawnDroneAt(m.x + rand(-20, 20), m.y + rand(-8, 10), t, `carrier:${m.id}`);
         }
         m.deployed = true;
+        debugRecord('enemy_deploy', {
+          enemyType: 'carrier',
+          id: m.id,
+          deploy: 'drone_swarm'
+        });
         note('Carrier deployed drone swarm', .8);
       }
 
@@ -1875,9 +2115,26 @@
           hp: opt.hp ?? (v === 'carrier' ? 3 : 1),
           deployed: false,
           deployAt: v === 'carrier' ? rand(.35, .62) : 0,
-          homing: opt.homing ?? (v === 'cruise' ? rand(.62, .95) : v === 'drone' ? rand(.25, .5) : v === 'hell' ? rand(.35, .6) : 0)
+          homing: opt.homing ?? (v === 'cruise' ? rand(.62, .95) : v === 'drone' ? rand(.25, .5) : v === 'hell' ? rand(.35, .6) : 0),
+          src: opt.source ?? 'wave'
         };
         S.enemy.push(m);
+        debugInc('enemySpawn', v);
+        debugInc('enemyTargetType', t.type ?? 'unknown');
+        debugRecord('enemy_spawn', {
+          id: m.id,
+          enemyType: v,
+          source: m.src,
+          from: {
+            x: round3(sx),
+            y: round3(sy)
+          },
+          to: {
+            x: round3(m.tx),
+            y: round3(m.ty)
+          },
+          target: targetSnapshot(t)
+        });
         return m;
       }
 
@@ -1888,7 +2145,8 @@
           createEnemyProjectile('spit', r.x + rand(-20, 20), r.y + 10, t, {
             blast: rand(46, 78),
             amp: rand(10, 28),
-            fq: rand(1.2, 2.4)
+            fq: rand(1.2, 2.4),
+            source: `raider:${r.id}`
           });
         }
       }
@@ -1910,6 +2168,16 @@
           ang: 0,
           ph: Math.random() * TAU
         });
+        debugInc('enemyVehicleSpawn', 'raider');
+        debugRecord('enemy_vehicle_spawn', {
+          vehicle: 'raider',
+          id: S.id - 1,
+          from: {
+            x: round3(x),
+            y: round3(y)
+          },
+          vx: round3(dir * Math.abs(S.raiders[S.raiders.length - 1].vx))
+        });
         note('Stratospheric Raider detected', .95);
         audio.incoming(clamp((x < 0 ? 0 : 1), 0, 1), 1.05);
         return true;
@@ -1926,6 +2194,15 @@
           havocT: .9,
           ph: Math.random() * TAU
         };
+        debugInc('enemyVehicleSpawn', 'daemon');
+        debugRecord('enemy_vehicle_spawn', {
+          vehicle: 'daemon',
+          id: 'daemon',
+          from: {
+            x: round3(S.w * .5),
+            y: round3(S.horizonY * .22)
+          }
+        });
         note('EASTER EGG: DAEMON UNLEASHED', 1.8);
         S.flash = Math.max(S.flash, .28);
         S.shake = Math.max(S.shake, 11);
@@ -1942,7 +2219,9 @@
         const carrier = e.v === 'carrier';
         const sx = cruise ? (Math.random() < .5 ? -70 : S.w + 70) : clamp(S.w * .5 + e.lane * S.w * .44 + rand(-140, 140), 14, S.w - 14);
         const sy = cruise ? rand(S.horizonY * .66, S.groundY * .52) : carrier ? rand(-220, -120) : rand(-160, -40);
-        createEnemyProjectile(e.v, sx, sy, t);
+        createEnemyProjectile(e.v, sx, sy, t, {
+          source: 'wave_plan'
+        });
         audio.enemyLaunch(sx / S.w);
       }
 
@@ -1989,6 +2268,24 @@
           det: S.time + dur,
           emp: false
         });
+        debugInc('defenseShots', opt.auto ? 'auto' : 'manual');
+        debugRecord('defense_fire', {
+          defense: 'base',
+          mode: opt.auto ? 'auto' : 'manual',
+          baseId: c.id,
+          shotId: S.id - 1,
+          from: {
+            x: round3(c.x),
+            y: round3(c.y)
+          },
+          to: {
+            x: round3(tx),
+            y: round3(y)
+          },
+          eta: round3(dur),
+          ammoAfter: c.ammo,
+          cooldown: round3(c.cool)
+        });
         audio.launch(c.x / S.w);
         return true;
       }
@@ -2007,6 +2304,12 @@
         });
         S.shake = Math.max(S.shake, 20);
         S.flash = Math.max(S.flash, .32);
+        debugRecord('defense_emp', {
+          x: round3(S.mouse.x),
+          y: round3(S.mouse.y),
+          empAfter: S.emp,
+          cooldown: round3(S.empCd)
+        });
         note('EMP pulse deployed', 1.1);
         audio.emp();
         return true;
@@ -2014,6 +2317,14 @@
 
       function splitMissile(m) {
         m.split = true;
+        debugRecord('enemy_split', {
+          id: m.id,
+          enemyType: m.v,
+          at: {
+            x: round3(m.x),
+            y: round3(m.y)
+          }
+        });
         spawnExpl(m.x, m.y, {
           player: false,
           r: 42,
@@ -2223,6 +2534,15 @@
         spawnSmoke(x, y - 8, 14, 1.2);
         S.shake = Math.max(S.shake, 14);
         S.flash = Math.max(S.flash, .18);
+        debugInc('assetsLost', 'cities');
+        debugRecord('asset_destroyed', {
+          asset: 'city',
+          id: city.id,
+          at: {
+            x: round3(x),
+            y: round3(y)
+          }
+        });
         audio.city(city.x / S.w);
         note('City destroyed', .95);
       }
@@ -2235,6 +2555,15 @@
           if (!payload.ref.destroyed) {
             payload.ref.destroyed = true;
             payload.ref.ammo = 0;
+            debugInc('assetsLost', 'bases');
+            debugRecord('asset_destroyed', {
+              asset: 'base',
+              id: payload.ref.id,
+              at: {
+                x: round3(payload.ref.x),
+                y: round3(payload.ref.y)
+              }
+            });
             spawnExpl(payload.ref.x, payload.ref.y - 4, {
               player: false,
               r: 84,
@@ -2247,6 +2576,15 @@
           if (S.phalanx && !S.phalanx.destroyed) {
             S.phalanx.destroyed = true;
             S.phalanx.ammo = 0;
+            debugInc('assetsLost', 'phalanx');
+            debugRecord('asset_destroyed', {
+              asset: 'phalanx',
+              id: 'PHALANX',
+              at: {
+                x: round3(S.phalanx.x),
+                y: round3(S.phalanx.y)
+              }
+            });
             spawnExpl(S.phalanx.x, S.phalanx.y - 6, {
               player: false,
               r: 88,
@@ -2266,6 +2604,16 @@
             if (!b.destroyed && Math.abs(b.x - x) <= blast * .68) {
               b.destroyed = true;
               b.ammo = 0;
+              debugInc('assetsLost', 'bases');
+              debugRecord('asset_destroyed', {
+                asset: 'base',
+                id: b.id,
+                at: {
+                  x: round3(b.x),
+                  y: round3(b.y)
+                },
+                source: 'splash'
+              });
               spawnExpl(b.x, b.y - 8, {
                 player: false,
                 r: 78,
@@ -2278,6 +2626,16 @@
           if (S.phalanx && !S.phalanx.destroyed && Math.abs(S.phalanx.x - x) <= blast * .64) {
             S.phalanx.destroyed = true;
             S.phalanx.ammo = 0;
+            debugInc('assetsLost', 'phalanx');
+            debugRecord('asset_destroyed', {
+              asset: 'phalanx',
+              id: 'PHALANX',
+              at: {
+                x: round3(S.phalanx.x),
+                y: round3(S.phalanx.y)
+              },
+              source: 'splash'
+            });
             spawnExpl(S.phalanx.x, S.phalanx.y - 8, {
               player: false,
               r: 82,
@@ -2434,6 +2792,7 @@
         if (m.payload?.type === 'city' && m.payload.ref?.alive) tv = 120;
         if (m.payload?.type === 'base' && !m.payload.ref?.destroyed) tv = 100 + m.payload.ref.ammo * 1.2;
         if (m.payload?.type === 'hellRaiser' && hellRaiserVulnerable()) tv = 132;
+        if (m.payload?.type === 'phalanx' && S.phalanx && !S.phalanx.destroyed) tv = 172;
         const mul = m.v === 'heavy' ? 1.65 : m.v === 'split' ? 1.45 : m.v === 'zig' ? 1.35 : m.v === 'fast' ? 1.2 : m.v === 'ufoBomb' ? 1.42 : m.v === 'cruise' ? 1.58 : m.v === 'carrier' ? 1.9 : m.v === 'drone' ? 1.28 : m.v === 'spit' ? 1.24 : m.v === 'hell' ? 1.74 : 1;
         const hpBonus = Math.max(0, (m.hp ?? 1) - 1) * 42;
         return tv * mul + 128 / (ti + .75) + m.sp * .18 + hpBonus;
@@ -2447,6 +2806,106 @@
           if (d < S.w * .16) near = Math.max(near, 1 - d / (S.w * .16));
         }
         return 168 + near * 110 + Math.abs(u.vx) * .42 + (3 - u.hp) * 34;
+      }
+
+      function phalanxAcquireTarget(p, lockRange, fireRange) {
+        const originY = p.y - 52;
+        let best = null,
+          terminalBest = null;
+        const consider = (k, o, x, y, baseScore, eta = null, meta = null) => {
+          const dx = x - p.x,
+            dy = y - originY,
+            dist = Math.hypot(dx, dy);
+          if (dist > lockRange || y > S.groundY + 8) return;
+          const imminence = eta === null ? 0 : 180 / (eta + .35),
+            rangeBias = dist <= fireRange ? 54 : 0,
+            boost = meta?.boost ?? 0,
+            score = baseScore + imminence + rangeBias - dist * .14 + boost;
+          const entry = {
+            k,
+            o,
+            x,
+            y,
+            dist,
+            score,
+            eta,
+            payloadType: meta?.payloadType ?? null,
+            terminal: !!meta?.terminal
+          };
+          if (!best || score > best.score) {
+            best = entry;
+          }
+          if (entry.terminal) {
+            if (!terminalBest) terminalBest = entry;
+            else if ((entry.eta ?? 99) < (terminalBest.eta ?? 99) - .04) terminalBest = entry;
+            else if (entry.score > terminalBest.score) terminalBest = entry;
+          }
+        };
+        for (const m of S.enemy) {
+          if (m.y > S.groundY - 4) continue;
+          const payloadType = m.payload?.type ?? null,
+            eta = tImpact(m);
+          let base = threat(m) + (payloadType === 'city' ? 62 : 0) + (payloadType === 'base' ? 24 : 0) + (payloadType === 'hellRaiser' ? 32 : 0) + (payloadType === 'phalanx' && S.phalanx && !S.phalanx.destroyed ? 240 : 0) + (m.v === 'ufoBomb' ? 42 : 0);
+          if (payloadType === 'phalanx' && S.phalanx && !S.phalanx.destroyed && eta <= 2.2) base += 170;
+          const terminal = payloadType === 'phalanx' && S.phalanx && !S.phalanx.destroyed && eta <= 1.35,
+            boost = terminal ? 680 + (1.35 - eta) * 220 : 0;
+          consider('enemy', m, m.x, m.y, base, eta, {
+            payloadType,
+            terminal,
+            boost
+          });
+        }
+        for (const u of S.ufo) {
+          const base = threatUfo(u) + (u.isBoss ? 80 : 54);
+          consider('ufo', u, u.x, u.y, base, null);
+        }
+        for (const r of S.raiders) {
+          const hpLoss = 1 - clamp(r.hp / r.maxHp, 0, 1),
+            base = 250 + hpLoss * 110;
+          consider('raider', r, r.x, r.y, base, null);
+        }
+        if (S.demon) {
+          consider('demon', S.demon, S.demon.x, S.demon.y, 320, null);
+        }
+        if (terminalBest) return terminalBest;
+        return best;
+      }
+
+      function phalanxLeadSec(t) {
+        if (!t || !t.o) return .045;
+        if (t.k === 'enemy') {
+          const vx = t.o.cv ?? t.o.vx ?? 0,
+            vy = t.o.cy ?? t.o.vy ?? 0,
+            speed = Math.hypot(vx, vy),
+            dist = t.dist ?? Math.hypot((t.o.x ?? 0) - (S.phalanx?.x ?? 0), (t.o.y ?? 0) - ((S.phalanx?.y ?? 0) - 52)),
+            lead = .02 + dist / 9200 + speed / 18000;
+          return clamp(lead, .024, .082);
+        }
+        if (t.k === 'ufo') return .07;
+        if (t.k === 'raider') return .064;
+        if (t.k === 'demon') return .06;
+        return .05;
+      }
+
+      function phalanxTargetPoint(t, lead = .06) {
+        if (!t || !t.o) return null;
+        const o = t.o;
+        if (t.k === 'enemy') return {
+          x: o.x + (o.cv ?? o.vx ?? 0) * lead,
+          y: o.y + (o.cy ?? o.vy ?? 0) * lead
+        };
+        if (t.k === 'ufo') return {
+          x: o.x + (o.vx ?? 0) * lead,
+          y: o.baseY + Math.sin((S.time + lead) * o.bobSp + o.ph) * o.bobAmp
+        };
+        if (t.k === 'raider') return {
+          x: o.x + (o.vx ?? 0) * lead,
+          y: o.y + Math.sin((S.time + lead) * 2.7 + o.ph) * 9
+        };
+        return {
+          x: o.x + (o.vx ?? 0) * lead,
+          y: o.y
+        };
       }
 
       function intercept(base, m, speed = interceptorSpeed(1.06)) {
@@ -2499,22 +2958,50 @@
           cov = coverage(now),
           en = S.enemy.filter(m => !m.reserve),
           ufo = S.ufo.filter(u => (u.autoReserve ?? 0) <= now);
+        const scan = {
+          enemy: {
+            covered: 0,
+            noIntercept: 0,
+            late: 0,
+            conflict: 0
+          },
+          ufo: {
+            noIntercept: 0,
+            conflict: 0
+          }
+        };
         en.sort((a, b) => threat(b) - threat(a));
         ufo.sort((a, b) => threatUfo(b) - threatUfo(a));
         let shots = 0,
           reserveForUfo = ufo.length ? 1 : 0,
           enemyBudget = Math.max(1, maxShotsBudget - reserveForUfo);
+        const wave = S.debug.enabled ? debugEnsureWave() : null;
+        if (wave) wave.stats.autoScan.cycles++;
         while (bases.length && en.length && shots < enemyBudget) {
           let best = null,
             ei = -1,
             bi = -1;
           for (let i = 0; i < en.length; i++) {
             const m = en[i];
-            if (enemyCovered(m, cov, now)) continue;
+            if (enemyCovered(m, cov, now)) {
+              scan.enemy.covered++;
+              continue;
+            }
             for (let j = 0; j < bases.length; j++) {
               const b = bases[j],
                 intr = intercept(b, m, autoSpeed);
-              if (!intr || intr.t > tImpact(m) || hitConflict(intr, cov, now)) continue;
+              if (!intr) {
+                scan.enemy.noIntercept++;
+                continue;
+              }
+              if (intr.t > tImpact(m)) {
+                scan.enemy.late++;
+                continue;
+              }
+              if (hitConflict(intr, cov, now)) {
+                scan.enemy.conflict++;
+                continue;
+              }
               const s = threat(m) - intr.t * 42 - Math.abs(b.x - intr.x) * .045;
               if (!best || s > best.s) {
                 best = {
@@ -2531,9 +3018,22 @@
           if (!best) break;
           const fired = launchPlayer(best.intr.x, best.intr.y, best.b, {
             allowGround: true,
-            fast: true
+            fast: true,
+            auto: true
           });
           if (fired) {
+            debugRecord('auto_assignment', {
+              baseId: best.b.id,
+              targetType: 'enemy',
+              targetId: best.m.id,
+              enemyType: best.m.v,
+              intercept: {
+                x: round3(best.intr.x),
+                y: round3(best.intr.y),
+                t: round3(best.intr.t)
+              },
+              score: round3(best.s)
+            });
             best.m.reserve = true;
             shots++;
             const m = S.player[S.player.length - 1];
@@ -2557,7 +3057,14 @@
             for (let j = 0; j < bases.length; j++) {
               const b = bases[j],
                 intr = interceptUfo(b, u, autoSpeed);
-              if (!intr || hitConflict(intr, cov, now)) continue;
+              if (!intr) {
+                scan.ufo.noIntercept++;
+                continue;
+              }
+              if (hitConflict(intr, cov, now)) {
+                scan.ufo.conflict++;
+                continue;
+              }
               const s = threatUfo(u) - intr.t * 45 - Math.abs(b.x - intr.x) * .035;
               if (!best || s > best.s) {
                 best = {
@@ -2575,9 +3082,22 @@
           const fired = launchPlayer(best.intr.x, best.intr.y, best.b, {
             allowGround: true,
             fast: true,
-            blast: 114
+            blast: 114,
+            auto: true
           });
           if (fired) {
+            debugRecord('auto_assignment', {
+              baseId: best.b.id,
+              targetType: 'ufo',
+              targetId: best.u.id,
+              enemyType: best.u.isBoss ? 'bossUfo' : 'ufo',
+              intercept: {
+                x: round3(best.intr.x),
+                y: round3(best.intr.y),
+                t: round3(best.intr.t)
+              },
+              score: round3(best.s)
+            });
             shots++;
             const m = S.player[S.player.length - 1];
             if (m) {
@@ -2594,6 +3114,22 @@
           if (ui >= 0) ufo.splice(ui, 1);
           if (bi >= 0) bases.splice(bi, 1);
         }
+        if (wave) {
+          wave.stats.autoScan.enemy.covered += scan.enemy.covered;
+          wave.stats.autoScan.enemy.noIntercept += scan.enemy.noIntercept;
+          wave.stats.autoScan.enemy.late += scan.enemy.late;
+          wave.stats.autoScan.enemy.conflict += scan.enemy.conflict;
+          wave.stats.autoScan.ufo.noIntercept += scan.ufo.noIntercept;
+          wave.stats.autoScan.ufo.conflict += scan.ufo.conflict;
+        }
+        debugRecord('auto_cycle', {
+          baseCount: S.bases.filter(b => !b.destroyed).length,
+          enemyVisible: S.enemy.length,
+          ufoVisible: S.ufo.length,
+          shotsFired: shots,
+          shotBudget: maxShotsBudget,
+          reject: scan
+        });
       }
 
       function updateDanger() {
@@ -2722,6 +3258,10 @@
         if (!d) return;
         d.life -= dt;
         if (d.life <= 0) {
+          debugRecord('enemy_vehicle_despawn', {
+            vehicle: 'daemon',
+            reason: 'life_expired'
+          });
           S.demon = null;
           note('Daemon banished', 1.0);
           return;
@@ -2779,6 +3319,15 @@
           hx = x ?? top.x,
           hy = y ?? top.y;
         hr.hp -= dmg;
+        debugRecord('asset_damaged', {
+          asset: 'hellRaiser',
+          at: {
+            x: round3(hx),
+            y: round3(hy)
+          },
+          damage: round3(dmg),
+          hpAfter: round3(Math.max(0, hr.hp))
+        });
         spawnExpl(hx + rand(-4, 4), hy + rand(-4, 4), {
           player: false,
           r: 34 + dmg * 8,
@@ -2804,6 +3353,15 @@
           });
           spawnSmoke(top.x, top.y - 3, 16, 1.25);
           S.shake = Math.max(S.shake, 14);
+          debugInc('assetsLost', 'hellRaiser');
+          debugRecord('asset_destroyed', {
+            asset: 'hellRaiser',
+            id: 'HELL_RAISER',
+            at: {
+              x: round3(top.x),
+              y: round3(top.y)
+            }
+          });
           note('Hell Raiser destroyed', 1.1);
         }
         return true;
@@ -2824,12 +3382,20 @@
             return false;
           }
           hr.command = 'deploy';
+          debugRecord('defense_command', {
+            defense: 'hellRaiser',
+            command: 'deploy'
+          });
           S.msg = 'Hell Raiser deploying';
           S.msgT = 1.1;
           return true;
         }
         if (hr.state === 'opening' || hr.state === 'rising' || hr.state === 'active') {
           hr.command = 'retract';
+          debugRecord('defense_command', {
+            defense: 'hellRaiser',
+            command: 'retract'
+          });
           S.msg = 'Hell Raiser retracting';
           S.msgT = 1.0;
           return true;
@@ -2938,6 +3504,24 @@
           squiggleFreq: rand(3.1, 6.8),
           squigglePhase: Math.random() * TAU
         });
+        debugInc('defenseShots', 'hellRaiser');
+        debugRecord('defense_fire', {
+          defense: 'hellRaiser',
+          mode: 'auto',
+          shotId: S.id - 1,
+          from: {
+            x: round3(sx),
+            y: round3(sy)
+          },
+          to: {
+            x: round3(tx),
+            y: round3(ty)
+          },
+          target: target ? {
+            kind: target.k,
+            key: target.key
+          } : null
+        });
       }
 
       function updHellRaiser(dt) {
@@ -2953,6 +3537,10 @@
           if (hr.command === 'deploy' && hr.cool <= 0 && hr.ammo > 0) {
             hr.state = 'opening';
             hr.command = 'idle';
+            debugRecord('defense_state', {
+              defense: 'hellRaiser',
+              state: 'opening'
+            });
             note('Hell Raiser online', .85);
           }
           return;
@@ -2960,7 +3548,13 @@
 
         if (hr.state === 'opening') {
           hr.door = Math.min(1, hr.door + dt * 2.7);
-          if (hr.door >= 1) hr.state = 'rising';
+          if (hr.door >= 1) {
+            hr.state = 'rising';
+            debugRecord('defense_state', {
+              defense: 'hellRaiser',
+              state: 'rising'
+            });
+          }
           return;
         }
 
@@ -2971,6 +3565,10 @@
             hr.fireAcc = 0;
             hr.activeT = 6.4;
             hr.hp = hr.maxHp;
+            debugRecord('defense_state', {
+              defense: 'hellRaiser',
+              state: 'active'
+            });
             note('Hell Raiser barrage', .85);
           }
           return;
@@ -2981,6 +3579,10 @@
           if (hr.command === 'retract' || hr.activeT <= 0 || hr.ammo <= 0) {
             hr.state = 'lowering';
             hr.command = 'idle';
+            debugRecord('defense_state', {
+              defense: 'hellRaiser',
+              state: 'lowering'
+            });
             return;
           }
           const top = hellRaiserTop(hr),
@@ -2993,6 +3595,7 @@
           hr.fireAcc += dt * fireRate;
           let shots = 0;
           const pressure = new Map();
+          const burstTargets = {};
           while (hr.fireAcc >= 1 && hr.ammo > 0 && shots < 22) {
             hr.fireAcc -= 1;
             hr.ammo--;
@@ -3000,6 +3603,7 @@
             const shotTarget = pickHellRaiserShotTarget(top.x, top.y, pressure);
             if (!shotTarget) break;
             pressure.set(shotTarget.key, (pressure.get(shotTarget.key) ?? 0) + 1);
+            burstTargets[shotTarget.key] = (burstTargets[shotTarget.key] ?? 0) + 1;
             const aim = hellRaiserTargetPoint(shotTarget, rand(.05, .17));
             if (!aim) continue;
             let tx = aim.x + rand(-20, 20),
@@ -3012,12 +3616,27 @@
             audio.hellRaiser(clamp(hr.x / S.w, 0, 1), Math.min(1.3, .58 + shots / 16));
             hr.audioT = .04;
           }
+          if (shots > 0) {
+            debugInc('defenseBursts', 'hellRaiser');
+            debugRecord('defense_burst', {
+              defense: 'hellRaiser',
+              shots,
+              targets: burstTargets,
+              ammoAfter: hr.ammo
+            });
+          }
           return;
         }
 
         if (hr.state === 'lowering') {
           hr.lift = Math.max(0, hr.lift - dt * 2.15);
-          if (hr.lift <= 0) hr.state = 'closing';
+          if (hr.lift <= 0) {
+            hr.state = 'closing';
+            debugRecord('defense_state', {
+              defense: 'hellRaiser',
+              state: 'closing'
+            });
+          }
           return;
         }
 
@@ -3026,6 +3645,10 @@
           if (hr.door <= 0) {
             hr.state = 'cooldown';
             hr.cool = Math.max(1.4, 3.2 / Math.max(.6, S.upgrades?.reloadMult ?? 1));
+            debugRecord('defense_state', {
+              defense: 'hellRaiser',
+              state: 'cooldown'
+            });
           }
           return;
         }
@@ -3037,6 +3660,10 @@
             hr.ammo = hr.maxAmmo;
             hr.hp = hr.maxHp;
             hr.fireAcc = 0;
+            debugRecord('defense_state', {
+              defense: 'hellRaiser',
+              state: 'hidden'
+            });
           }
         }
       }
@@ -3051,76 +3678,103 @@
         if (p.heat > 0) p.heat = Math.max(0, p.heat - dt * 1.25 * phalanxCdMult);
         if (S.intro || S.gameOver || p.destroyed) {
           p.target = null;
+          p.targetKind = null;
+          p.targetDist = 0;
+          p.lockKey = null;
           p.fireAcc = 0;
           p.fireMix = 0;
           return;
         }
-        const range = 620 + Math.max(0, phEff - 1) * 110;
-        let best = null;
-        for (const m of S.enemy) {
-          if (m.y > S.groundY - 4) continue;
-          const dx = m.x - p.x,
-            dy = m.y - (p.y - 52),
-            dist = Math.hypot(dx, dy);
-          if (dist > range) continue;
-          const s = threat(m) + (m.payload?.type === 'city' ? 48 : 0) + (m.v === 'ufoBomb' ? 72 : 0) - dist * .16;
-          if (!best || s > best.s) best = {
-            k: 'enemy',
-            o: m,
-            s,
-            dist
-          };
-        }
-        for (const u of S.ufo) {
-          const dx = u.x - p.x,
-            dy = u.y - (p.y - 52),
-            dist = Math.hypot(dx, dy);
-          if (dist > range * 1.08) continue;
-          const s = threatUfo(u) + 72 - dist * .18;
-          if (!best || s > best.s) best = {
-            k: 'ufo',
-            o: u,
-            s,
-            dist
-          };
-        }
-        for (const r of S.raiders) {
-          const dx = r.x - p.x,
-            dy = r.y - (p.y - 52),
-            dist = Math.hypot(dx, dy);
-          if (dist > range * 1.12) continue;
-          const s = 242 + (1 - clamp(r.hp / r.maxHp, 0, 1)) * 110 - dist * .16;
-          if (!best || s > best.s) best = {
-            k: 'raider',
-            o: r,
-            s,
-            dist
-          };
-        }
+        const fireRange = 620 + Math.max(0, phEff - 1) * 110,
+          lockRange = Math.max(fireRange * 2.15, S.w * 1.08);
+        let best = phalanxAcquireTarget(p, lockRange, fireRange);
         p.target = best ? best.o : null;
-        if (!best || p.ammo <= 0) {
+        p.targetKind = best ? best.k : null;
+        p.targetDist = best ? best.dist : 0;
+        const lockKey = best ? `${best.k}:${best.k === 'demon' ? 'daemon' : best.o?.id}` : null;
+        if (lockKey !== p.lockKey) {
+          if (lockKey) {
+            debugRecord('defense_lock', {
+              defense: 'phalanx',
+              lock: lockKey,
+              dist: round3(best.dist),
+              score: round3(best.score),
+              payloadType: best.k === 'enemy' ? (best.payloadType ?? best.o?.payload?.type ?? null) : null,
+              timeToImpact: best.k === 'enemy' ? round3(best.eta ?? tImpact(best.o)) : null,
+              terminalPriority: !!best.terminal
+            });
+          }
+          p.lockKey = lockKey;
+        }
+        if (!isFinite(p.aimAng)) p.aimAng = -Math.PI * .5;
+        if (best) {
+          const aimLead = phalanxLeadSec(best),
+            predicted = phalanxTargetPoint(best, aimLead);
+          let aimX = predicted ? predicted.x : best.x,
+            aimY = predicted ? predicted.y : best.y;
+          p.aimX = aimX;
+          p.aimY = aimY;
+          const desired = Math.atan2(aimY - (p.y - 44), aimX - p.x),
+            turnRate = (2.8 + (1 - p.heat) * 2.4 + Math.min(1.3, S.level * .02)) * (1 + (phEff - 1) * .18),
+            diff = angleDelta(p.aimAng, desired),
+            step = turnRate * dt;
+          p.aimAng += clamp(diff, -step, step);
+          p.aimErr = Math.abs(diff);
+        } else {
+          p.aimX = p.x + Math.cos(p.aimAng) * 160;
+          p.aimY = (p.y - 44) + Math.sin(p.aimAng) * 160;
+          p.aimErr = Math.PI;
+          p.fireMix = Math.max(0, p.fireMix - dt * 4.2);
+          return;
+        }
+        const rangeMul = best.k === 'ufo' ? 1.08 : best.k === 'raider' ? 1.12 : best.k === 'demon' ? 1.18 : 1;
+        const inRange = best.dist <= fireRange * (best.terminal ? 1.18 : rangeMul);
+        const aligned = p.aimErr <= (best.k === 'ufo' ? .17 : best.terminal ? .22 : .14);
+        if (!inRange || !aligned || p.ammo <= 0 || p.cool > 0) {
           p.fireMix = Math.max(0, p.fireMix - dt * 4.2);
           return;
         }
         const fireRate = ((p.heat > .72 ? 56 : 94) + Math.min(28, S.level * 2.2)) * (1 + (phEff - 1) * .4);
         p.fireAcc += dt * fireRate;
-        let shots = 0;
+        let shots = 0,
+          burstHits = 0,
+          burstKills = 0,
+          hitRadiusPeak = 0,
+          missPeak = 0;
+        const initialTargetType = best.k,
+          initialTargetId = best.o?.id ?? (best.k === 'demon' ? 'daemon' : null),
+          initialPayloadType = best.k === 'enemy' ? (best.payloadType ?? best.o?.payload?.type ?? null) : null,
+          initialTimeToImpact = best.k === 'enemy' ? round3(best.eta ?? tImpact(best.o)) : null,
+          initialTerminalPriority = !!best.terminal;
+        const targetAlive = (k, o) => k === 'enemy' ? S.enemy.includes(o) : k === 'ufo' ? S.ufo.includes(o) : k === 'raider' ? S.raiders.includes(o) : k === 'demon' ? S.demon === o : false;
         while (p.fireAcc >= 1 && p.ammo > 0 && shots < 120) {
           p.fireAcc -= 1;
           p.ammo--;
           shots++;
-          const o = best.o;
-          if (!o) break;
-          const srcX = p.x,
-            srcY = p.y - 53;
+          if (!best || !targetAlive(best.k, best.o)) break;
+          const o = best.o,
+            srcX = p.x,
+            srcY = p.y - 53,
+            aimQuality = clamp(1 - p.aimErr / .18, 0, 1),
+            spread = best.k === 'enemy' ? (4 + (1 - aimQuality) * 8 + clamp(best.dist / fireRange - .55, 0, .9) * 5) : (5 + (1 - aimQuality) * 5),
+            tx = p.aimX + rand(-spread, spread),
+            ty = p.aimY + rand(-spread, spread);
+          spawnPhalanxTracer(srcX, srcY, tx, ty);
           if (best.k === 'enemy') {
-            const tx = o.x + (o.cv ?? o.vx) * rand(.03, .1),
-              ty = o.y + (o.cy ?? o.vy) * rand(.03, .1);
-            spawnPhalanxTracer(srcX, srcY, tx, ty);
-            const miss = Math.hypot(tx - o.x, ty - o.y),
-              hitChance = clamp((1 - best.dist / range) * .27 + .045, .04, .34) * (1 - o.res * .95) * (o.v === 'heavy' ? .56 : 1) * (1 + (phEff - 1) * .45);
-            if (miss < 24 && Math.random() < hitChance) {
+            const lead = phalanxLeadSec(best),
+              predicted = phalanxTargetPoint(best, lead),
+              px = predicted ? predicted.x : o.x,
+              py = predicted ? predicted.y : o.y,
+              speed = Math.hypot(o.cv ?? o.vx ?? 0, o.cy ?? o.vy ?? 0),
+              miss = Math.hypot(tx - px, ty - py),
+              missRadius = 24 + clamp(speed * .028, 0, 16) + (o.v === 'fast' ? 6 : o.v === 'zig' ? 8 : o.v === 'drone' ? 6 : o.v === 'cruise' ? 4 : 0) + Math.max(0, (best.dist / fireRange - .52) * 15),
+              hitChance = clamp((1 - best.dist / fireRange) * .37 + .09, .08, .56) * (1 - o.res * .9) * (o.v === 'heavy' ? .6 : 1) * (1 + (phEff - 1) * .45) * (.52 + aimQuality * .78);
+            hitRadiusPeak = Math.max(hitRadiusPeak, missRadius);
+            missPeak = Math.max(missPeak, miss);
+            if (miss < missRadius && Math.random() < hitChance) {
               const killed = damageEnemyUnit(o, o.x, o.y, o.v === 'carrier' ? .9 : 1);
+              burstHits++;
+              if (killed) burstKills++;
               audio.hit(o.x / S.w, killed ? .34 : .22);
               if (killed) {
                 const i = S.enemy.indexOf(o);
@@ -3130,11 +3784,10 @@
               }
             }
           } else if (best.k === 'ufo') {
-            const tx = o.x + o.vx * rand(.05, .1),
-              ty = o.y + rand(-5, 5);
-            spawnPhalanxTracer(srcX, srcY, tx, ty);
-            if (Math.random() < clamp((1 - best.dist / (range * 1.08)) * .34 + .06, .06, .34) * (1 + (phEff - 1) * .4)) {
+            const hitChance = clamp((1 - best.dist / (fireRange * 1.08)) * .42 + .08, .08, .44) * (1 + (phEff - 1) * .4) * (.48 + aimQuality * .82);
+            if (Math.random() < hitChance) {
               o.hp--;
+              burstHits++;
               spawnExpl(o.x + rand(-9, 9), o.y + rand(-5, 5), {
                 player: true,
                 r: 30,
@@ -3144,6 +3797,7 @@
                 noShake: true
               });
               if (o.hp <= 0) {
+                burstKills++;
                 const cityScoreMult = (S.cities[4] && S.cities[4].alive) ? 1.2 : 1.0;
                 const baseUfoVal = o.isBoss ? 1500 : 260;
                 const bonus = 1 + Math.min(2.2, S.combo * .09),
@@ -3164,6 +3818,16 @@
                 });
                 spawnSmoke(o.x, o.y, o.isBoss ? 20 : 10, o.isBoss ? 1.3 : 1.05);
                 audio.hit(o.x / S.w, o.isBoss ? 1.4 : 1.12);
+                debugInc('enemyKilled', o.isBoss ? 'bossUfo' : 'ufo');
+                debugRecord('enemy_killed', {
+                  id: o.id,
+                  enemyType: o.isBoss ? 'bossUfo' : 'ufo',
+                  at: {
+                    x: round3(o.x),
+                    y: round3(o.y)
+                  },
+                  gain
+                });
                 note(o.isBoss ? 'Boss UFO destroyed' : 'UFO destroyed', .9);
                 const i = S.ufo.indexOf(o);
                 if (i >= 0) S.ufo.splice(i, 1);
@@ -3172,11 +3836,11 @@
               }
             }
           } else {
-            const tx = o.x + o.vx * rand(.03, .08),
-              ty = o.y + rand(-4, 4);
-            spawnPhalanxTracer(srcX, srcY, tx, ty);
-            if (Math.random() < clamp((1 - best.dist / (range * 1.12)) * .42 + .08, .08, .44) * (1 + (phEff - 1) * .35)) {
-              o.hp -= 1;
+            const hitChance = clamp((1 - best.dist / (fireRange * rangeMul)) * .46 + .1, .1, .58) * (1 + (phEff - 1) * .35) * (.5 + aimQuality * .78);
+            if (Math.random() < hitChance) {
+              if (best.k === 'raider') o.hp -= 1;
+              else if (best.k === 'demon') o.life -= .45;
+              burstHits++;
               spawnExpl(o.x + rand(-8, 8), o.y + rand(-5, 5), {
                 player: true,
                 r: 38,
@@ -3185,7 +3849,8 @@
                 flash: .05,
                 noShake: true
               });
-              if (o.hp <= 0) {
+              if (best.k === 'raider' && o.hp <= 0) {
+                burstKills++;
                 const bonus = 1 + Math.min(2.2, S.combo * .09),
                   gain = Math.round(460 * bonus);
                 S.score += gain;
@@ -3200,6 +3865,16 @@
                   flash: .24
                 });
                 spawnSmoke(o.x, o.y, 12, 1.1);
+                debugInc('enemyKilled', 'raider');
+                debugRecord('enemy_killed', {
+                  id: o.id,
+                  enemyType: 'raider',
+                  at: {
+                    x: round3(o.x),
+                    y: round3(o.y)
+                  },
+                  gain
+                });
                 note('Stratospheric raider destroyed', .9);
                 const i = S.raiders.indexOf(o);
                 if (i >= 0) S.raiders.splice(i, 1);
@@ -3210,15 +3885,40 @@
           }
         }
         if (shots > 0) {
+          debugInc('defenseShots', 'phalanx', shots);
+          debugInc('defenseBursts', 'phalanx');
+          debugRecord('defense_burst', {
+            defense: 'phalanx',
+            shots,
+            hits: burstHits,
+            kills: burstKills,
+            targetType: initialTargetType,
+            targetId: initialTargetId,
+            payloadType: initialPayloadType,
+            timeToImpact: initialTimeToImpact,
+            terminalPriority: initialTerminalPriority,
+            ammoAfter: p.ammo,
+            aimErr: round3(p.aimErr),
+            targetDist: round3(best ? best.dist : p.targetDist),
+            hitRadiusPeak: round3(hitRadiusPeak),
+            missPeak: round3(missPeak)
+          });
           p.heat = Math.min(1, p.heat + shots * (.0036 / Math.max(1, phEff)));
           p.fireMix = Math.min(1, p.fireMix + shots * .03);
           if (p.audioT <= 0) {
             audio.phalanx(clamp(p.x / S.w, 0, 1), Math.min(1.1, shots / 16 + p.heat * .45));
             p.audioT = .03;
           }
-        } else p.fireMix = Math.max(0, p.fireMix - dt * 4.2);
+        } else {
+          p.fireMix = Math.max(0, p.fireMix - dt * 4.2);
+        }
         if (p.ammo <= 0 && p.cool <= 0) {
           p.cool = 2.1 / Math.max(1, phEff);
+          debugRecord('defense_state', {
+            defense: 'phalanx',
+            state: 'ammo_empty',
+            cooldown: round3(p.cool)
+          });
           note('Phalanx out of ammo', .75);
         }
       }
@@ -3236,6 +3936,17 @@
           return;
         }
         if (m.v === 'carrier' && !m.deployed) deployCarrierDrones(m);
+        debugInc('enemyImpact', m.v);
+        debugRecord('enemy_impact', {
+          id: m.id,
+          enemyType: m.v,
+          at: {
+            x: round3(x),
+            y: round3(y)
+          },
+          blast: round3(m.blast),
+          payload: targetSnapshot(m.payload)
+        });
         const inferHeavy = m.v === 'heavy' || m.v === 'carrier' || m.v === 'hell';
         spawnExpl(x, y, {
           player: false,
@@ -3257,12 +3968,25 @@
           if (m.hr) {
             m.hrRetarget = (m.hrRetarget ?? 0) - dt;
             if (m.hrRetarget <= 0 || !hellRaiserTargetAlive(m.hrTarget)) {
+              const prevKey = m.hrTarget?.key ?? null;
               const nextTarget = pickHellRaiserShotTarget(m.x, m.y);
               m.hrTarget = nextTarget ? {
                 k: nextTarget.k,
                 o: nextTarget.o,
                 key: nextTarget.key
               } : null;
+              if ((m.hrTarget?.key ?? null) !== prevKey) {
+                debugRecord('defense_retarget', {
+                  defense: 'hellRaiser_missile',
+                  shotId: m.id,
+                  from: prevKey,
+                  to: m.hrTarget?.key ?? null,
+                  at: {
+                    x: round3(m.x),
+                    y: round3(m.y)
+                  }
+                });
+              }
               m.hrRetarget = rand(.06, .18);
             }
             let ang = Math.atan2(m.vy, m.vx);
@@ -3465,6 +4189,17 @@
           S.emp++;
           note('EMP charge granted', 1.25);
         }
+        debugInc('enemyKilled', m.v);
+        debugRecord('enemy_killed', {
+          id: m.id,
+          enemyType: m.v,
+          at: {
+            x: round3(x),
+            y: round3(y)
+          },
+          gain,
+          combo: S.combo
+        });
         spawnExpl(x, y, {
           player: true,
           r: m.v === 'heavy' || m.v === 'carrier' ? 94 : m.v === 'cruise' ? 78 : 70,
@@ -3557,6 +4292,16 @@
             });
             spawnSmoke(u.x, u.y, u.isBoss ? 20 : 10, u.isBoss ? 1.3 : 1.05);
             audio.hit(u.x / S.w, u.isBoss ? 1.4 : 1.12);
+            debugInc('enemyKilled', u.isBoss ? 'bossUfo' : 'ufo');
+            debugRecord('enemy_killed', {
+              id: u.id,
+              enemyType: u.isBoss ? 'bossUfo' : 'ufo',
+              at: {
+                x: round3(u.x),
+                y: round3(u.y)
+              },
+              gain
+            });
             note(u.isBoss ? 'Boss UFO destroyed' : 'UFO destroyed', .9);
             S.ufo.splice(i, 1);
           }
@@ -3599,6 +4344,16 @@
               flash: .24
             });
             spawnSmoke(r.x, r.y, 12, 1.1);
+            debugInc('enemyKilled', 'raider');
+            debugRecord('enemy_killed', {
+              id: r.id,
+              enemyType: 'raider',
+              at: {
+                x: round3(r.x),
+                y: round3(r.y)
+              },
+              gain
+            });
             note('Stratospheric raider destroyed', .9);
             S.raiders.splice(i, 1);
           }
@@ -3695,6 +4450,15 @@
         if (!S.intro && !S.shop && S.spawnI >= S.wavePlan.length && S.enemy.length === 0 && S.ufo.length === 0 && S.raiders.length === 0 && S.expl.length === 0 && S.debris.length === 0 && S.shock.length === 0) {
           S.shop = true;
           S.shopTimer = 5.0;
+          debugRecord('wave_cleared', {
+            level: S.level,
+            score: S.score,
+            citiesAlive: S.cities.filter(c => c.alive).length
+          });
+          debugFinalizeWave('cleared', {
+            score: S.score,
+            citiesAlive: S.cities.filter(c => c.alive).length
+          });
         }
         if (S.shop) {
           S.shopTimer -= dt;
@@ -3707,6 +4471,9 @@
         const alive = S.cities.filter(c => c.alive).length;
         if (alive <= 0) {
           S.gameOver = true;
+          debugFinalizeWave('game_over', {
+            score: S.score
+          });
           if (!S.gameOverSfx) {
             S.gameOverSfx = true;
             audio.over();
@@ -4396,43 +5163,159 @@
           ctx.restore();
           return;
         }
-        const target = p.target ?? {
-          x: p.x + Math.sin(S.time * 1.6) * 45,
-          y: p.y - 110
-        };
-        const ang = Math.atan2(target.y - (p.y - 44), target.x - p.x),
-          core = .45 + .55 * Math.max(0, Math.sin(S.time * 8.5 + p.x * .01)),
-          heat = p.heat;
-        ctx.fillStyle = '#2a2a34';
-        ctx.beginPath();
-        ctx.ellipse(0, 0, 26, 10, 0, 0, TAU);
-        ctx.fill();
-        ctx.fillStyle = 'rgba(106,104,130,.55)';
-        ctx.fillRect(-12, -36, 24, 36);
-        ctx.fillStyle = 'rgba(146,150,184,.4)';
-        ctx.fillRect(-10, -34, 4, 30);
-        ctx.fillRect(6, -34, 4, 30);
+        const ang = isFinite(p.aimAng) ? p.aimAng : -Math.PI * .5,
+          heat = p.heat,
+          lock = p.target ? 1 : 0,
+          pulse = .38 + .62 * Math.max(0, Math.sin(S.time * 8.5 + p.x * .01));
+
         ctx.save();
-        ctx.translate(0, -44);
-        ctx.rotate(ang);
-        ctx.fillStyle = 'rgba(84,86,108,.98)';
-        ctx.fillRect(-14, -8, 28, 16);
-        ctx.fillStyle = 'rgba(140,148,182,.95)';
-        for (let i = 0; i < 4; i++) ctx.fillRect(2, -6 + i * 4, 30, 2.1);
-        ctx.fillStyle = 'rgba(165,240,255,.25)';
-        ctx.fillRect(-5, -6, 7, 12);
+        ctx.globalCompositeOperation = 'multiply';
+        ctx.fillStyle = 'rgba(0,0,0,.22)';
+        ctx.beginPath();
+        ctx.ellipse(0, 5, 40, 12, 0, 0, TAU);
+        ctx.fill();
         ctx.restore();
+
+        const deck = ctx.createLinearGradient(0, -10, 0, 12);
+        deck.addColorStop(0, 'rgba(118,126,138,.98)');
+        deck.addColorStop(1, 'rgba(64,70,80,.98)');
+        ctx.fillStyle = deck;
+        ctx.beginPath();
+        ctx.ellipse(0, 0, 36, 12, 0, 0, TAU);
+        ctx.fill();
+
+        ctx.strokeStyle = 'rgba(170,182,198,.55)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.ellipse(0, 0, 31, 9.6, 0, 0, TAU);
+        ctx.stroke();
+        for (let i = 0; i < 22; i++) {
+          const t = i / 22 * TAU,
+            r1 = 24.5,
+            r2 = 28.6;
+          ctx.strokeStyle = 'rgba(56,64,74,.66)';
+          ctx.beginPath();
+          ctx.moveTo(Math.cos(t) * r1, Math.sin(t) * r1 * .33);
+          ctx.lineTo(Math.cos(t) * r2, Math.sin(t) * r2 * .33);
+          ctx.stroke();
+        }
+
+        const pedestal = ctx.createLinearGradient(0, -64, 0, -6);
+        pedestal.addColorStop(0, 'rgba(170,178,192,.98)');
+        pedestal.addColorStop(.45, 'rgba(112,124,138,.98)');
+        pedestal.addColorStop(1, 'rgba(72,80,92,.98)');
+        ctx.fillStyle = pedestal;
+        ctx.beginPath();
+        ctx.moveTo(-16, -6);
+        ctx.lineTo(16, -6);
+        ctx.lineTo(12, -60);
+        ctx.lineTo(-12, -60);
+        ctx.closePath();
+        ctx.fill();
+
+        ctx.fillStyle = 'rgba(88,96,108,.92)';
+        ctx.fillRect(-10, -72, 20, 12);
+        ctx.fillStyle = 'rgba(190,204,220,.74)';
+        ctx.fillRect(-8, -72, 8, 2.2);
+
+        ctx.fillStyle = 'rgba(202,210,220,.95)';
+        ctx.beginPath();
+        ctx.ellipse(-2, -95, 14, 22, 0, 0, TAU);
+        ctx.fill();
+        ctx.fillStyle = 'rgba(152,162,176,.95)';
+        ctx.fillRect(-16, -95, 14, 22);
+        ctx.fillStyle = 'rgba(108,118,132,.95)';
+        ctx.fillRect(-16, -73, 14, 4);
+        for (let i = 0; i < 8; i++) {
+          ctx.fillStyle = 'rgba(122,134,148,.82)';
+          ctx.beginPath();
+          ctx.arc(-16 + (i % 2 ? 11 : 3), -92 + Math.floor(i / 2) * 6, .9, 0, TAU);
+          ctx.fill();
+        }
+
+        ctx.save();
+        ctx.translate(0, -52);
+        ctx.rotate(ang);
+        const cradle = ctx.createLinearGradient(-16, -10, 24, 10);
+        cradle.addColorStop(0, 'rgba(88,98,112,.98)');
+        cradle.addColorStop(.5, 'rgba(164,176,192,.98)');
+        cradle.addColorStop(1, 'rgba(74,82,96,.98)');
+        ctx.fillStyle = cradle;
+        ctx.fillRect(-16, -11, 33, 22);
+        ctx.fillStyle = 'rgba(58,66,78,.9)';
+        ctx.beginPath();
+        ctx.moveTo(-8, -7);
+        ctx.lineTo(2, 0);
+        ctx.lineTo(-8, 7);
+        ctx.moveTo(6, -7);
+        ctx.lineTo(16, 0);
+        ctx.lineTo(6, 7);
+        ctx.stroke();
+
+        const barrelBase = ctx.createLinearGradient(0, -6, 26, 6);
+        barrelBase.addColorStop(0, 'rgba(122,132,146,.98)');
+        barrelBase.addColorStop(1, 'rgba(58,66,78,.98)');
+        ctx.fillStyle = barrelBase;
+        ctx.fillRect(8, -5.2, 31, 10.4);
+        ctx.fillStyle = 'rgba(42,48,58,.95)';
+        ctx.beginPath();
+        ctx.arc(10, 0, 6.3, 0, TAU);
+        ctx.fill();
+
+        const spin = S.time * (4.8 + heat * 12);
+        for (let i = 0; i < 6; i++) {
+          const t = spin + i / 6 * TAU,
+            by = Math.sin(t) * 3.4;
+          ctx.strokeStyle = 'rgba(80,90,104,.95)';
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.moveTo(10, by);
+          ctx.lineTo(41, by * .92);
+          ctx.stroke();
+          ctx.fillStyle = 'rgba(136,146,162,.98)';
+          ctx.beginPath();
+          ctx.arc(41.5, by * .92, 1.25, 0, TAU);
+          ctx.fill();
+        }
+
+        ctx.fillStyle = 'rgba(36,42,50,.95)';
+        ctx.beginPath();
+        ctx.arc(42, 0, 4.6, 0, TAU);
+        ctx.fill();
+        ctx.fillStyle = 'rgba(188,198,210,.84)';
+        for (let i = 0; i < 6; i++) {
+          const t = spin + i / 6 * TAU;
+          ctx.beginPath();
+          ctx.arc(42 + Math.cos(t) * 2.3, Math.sin(t) * 2.3, .58, 0, TAU);
+          ctx.fill();
+        }
+
+        if (p.fireMix > .12) {
+          ctx.save();
+          ctx.globalCompositeOperation = 'lighter';
+          const muzzle = .12 + p.fireMix * (.32 + heat * .25);
+          ctx.fillStyle = `rgba(255,212,144,${muzzle})`;
+          ctx.beginPath();
+          ctx.ellipse(46, 0, 6 + p.fireMix * 5, 3.2 + p.fireMix * 2, 0, 0, TAU);
+          ctx.fill();
+          ctx.restore();
+        }
+        ctx.restore();
+
         ctx.save();
         ctx.globalCompositeOperation = 'lighter';
-        ctx.fillStyle = `rgba(255,224,154,${.16 + heat * .38})`;
+        ctx.fillStyle = `rgba(162,238,255,${(.22 + pulse * .4) * (1 - heat * .2)})`;
         ctx.beginPath();
-        ctx.arc(0, -24, 7 + heat * 5, 0, TAU);
+        ctx.arc(0, -66, 3.2, 0, TAU);
         ctx.fill();
+        if (lock > 0) {
+          ctx.fillStyle = `rgba(255,212,140,${.22 + lock * .22})`;
+          ctx.beginPath();
+          ctx.arc(0, -78, 2.3, 0, TAU);
+          ctx.fill();
+        }
         ctx.restore();
-        ctx.fillStyle = `rgba(255,236,168,${.35 + core * .5})`;
-        ctx.beginPath();
-        ctx.arc(0, -24, 3.2, 0, TAU);
-        ctx.fill();
+
         ctx.fillStyle = 'rgba(255,236,176,.95)';
         ctx.font = '700 12px "Orbitron","Trebuchet MS",sans-serif';
         ctx.textAlign = 'center';
@@ -5281,6 +6164,7 @@
           ph = S.phalanx ? S.phalanx.destroyed ? 'X' : S.phalanx.ammo : '--',
           hr = S.hellRaiser ? S.hellRaiser.destroyed ? 'X' : `${hellRaiserStatus()} ${Math.max(0, Math.floor(S.hellRaiser.ammo))}` : '--',
           hrHp = S.hellRaiser && hellRaiserVulnerable() ? `${Math.ceil(S.hellRaiser.hp)}/${S.hellRaiser.maxHp}` : '--',
+          dbg = S.debug.enabled ? `ON (${Object.keys(S.debug.waves).length}W)` : 'OFF',
           ammoLeft = S.bases.reduce((n, b) => n + (b.destroyed ? 0 : b.ammo), 0) + (S.phalanx && !S.phalanx.destroyed ? S.phalanx.ammo : 0),
           bars = 14,
           fill = Math.round(S.danger * bars),
@@ -5292,6 +6176,7 @@
           `<span class="dim">Cities</span> <strong>${alive}</strong>  |  <span class="dim">EMP</span> <strong>${S.emp}</strong>  |  <span class="dim">Ammo Left</span> <strong>${ammoLeft}</strong>  |  <span class="dim">Mode</span> <strong>${S.auto ? 'AUTO' : 'MANUAL'}</strong><br>` +
           `<span class="dim">Hostiles</span> <strong>${host}</strong>  |  <span class="dim">UFO</span> <strong>${ufoCount}</strong>  |  <span class="dim">Raider</span> <strong>${raiderCount}</strong>  |  <span class="dim">Pending</span> <strong>${pending}</strong>  |  <span class="dim">Bases</span> <strong>${ammo}</strong>  |  <span class="dim">Phalanx</span> <strong>${ph}</strong><br>` +
           `<span class="dim">Hell Raiser</span> <strong>${hr}</strong>  |  <span class="dim">HR HP</span> <strong>${hrHp}</strong><br>` +
+          `<span class="dim">Debug Telemetry</span> <strong>${dbg}</strong><br>` +
           `<span class="dim">Threat</span> <strong style="color:${S.danger > .66 ? '#ff9b66' : '#89f4ff'}">[${bar}]</strong> <span class="dim">${Math.round(S.danger * 100)}%</span>  |  <span class="dim">WX</span> <strong>${weather}</strong><br>` +
           `<span class="dim">Upgrades</span> <strong>${up}</strong>`;
       }
@@ -5579,6 +6464,24 @@
           e.preventDefault();
           return;
         }
+        if (k === 'f8') {
+          audio.unlock();
+          debugToggle();
+          e.preventDefault();
+          return;
+        }
+        if (k === 'f9') {
+          audio.unlock();
+          debugExport('wave');
+          e.preventDefault();
+          return;
+        }
+        if (k === 'f10') {
+          audio.unlock();
+          debugExport('session');
+          e.preventDefault();
+          return;
+        }
         if (k === 'h') {
           audio.unlock();
           toggleHellRaiser();
@@ -5588,6 +6491,9 @@
         if (k === 'c') {
           audio.unlock();
           S.auto = !S.auto;
+          debugRecord('defense_mode', {
+            auto: S.auto
+          });
           S.msg = S.auto ? 'Auto defense enabled' : 'Auto defense disabled';
           S.msgT = 1.7;
           e.preventDefault();
