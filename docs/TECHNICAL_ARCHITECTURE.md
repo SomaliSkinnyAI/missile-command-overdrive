@@ -69,7 +69,14 @@ Function `loop(ts)`:
 - Computes intercept opportunities from active bases.
 - Prioritizes by threat score and feasible intercept timing.
 - Uses coverage prediction to reduce wasted overlapping shots.
+- Uses timed target reservation (`reserveUntil`) instead of permanent single-shot reservation.
+- Supports retry engagement for city-targeted missiles that survive first intercept window.
+- Applies extra urgency for terminal city threats (especially fast/stealth classes).
 - Interceptor speed scales with level via `interceptorSpeed()`.
+- Base launcher sustain model:
+  - wave-start base ammo scales more aggressively at higher levels
+  - dynamic city-backed resupply trickles ammo to low launchers
+  - resupply rate increases under auto-defense and low-total-ammo emergency conditions
 
 ### Phalanx
 

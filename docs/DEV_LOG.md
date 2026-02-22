@@ -33,6 +33,24 @@ Purpose: maintain a running, chronological technical record to support future ma
   - `defense_burst`: `payloadType`, `timeToImpact`, `terminalPriority`,
     plus aim/dispersion metrics (`aimErr`, `targetDist`, `hitRadiusPeak`, `missPeak`)
 
+### Auto Defense Retry Intelligence
+
+- Identified leak pattern in wave telemetry: enemy targets could receive exactly one auto assignment
+  and then never be reconsidered if the first intercept failed.
+- Replaced one-way reservation behavior with timed reservation (`reserveUntil`).
+- Added city-protection retry logic:
+  - retry eligible for surviving city-targeted missiles
+  - stronger terminal weighting near city impact window
+  - added assignment telemetry (`attempt`, `retry`, `timeToImpact`, `reserveUntil`,
+    `predictedInterceptAt`, `payloadType`)
+
+### Launcher Ammo Sustain Tuning
+
+- Increased per-wave base launcher ammo scaling for high levels.
+- Added dynamic mid-wave resupply for low-ammo bases when city infrastructure is intact.
+- Resupply logic now reacts to threat and total-ammo pressure, with emergency boosts when
+  launcher inventory drops critically low.
+
 ### Deployment and GitHub
 
 - Initialized repository and pushed initial release.

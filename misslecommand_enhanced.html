@@ -1800,9 +1800,10 @@
         S.shock = [];
         S.lightBursts = [];
         setWaveWeather();
+        const waveBaseAmmo = Math.min(155, Math.round(20 + S.level * 2.7 + Math.max(0, S.level - 14) * 1.35));
         for (const b of S.bases) {
           if (b.destroyed && Math.random() < .33) b.destroyed = false;
-          b.ammo = b.destroyed ? 0 : 16 + Math.floor(S.level * 2.2);
+          b.ammo = b.destroyed ? 0 : waveBaseAmmo;
           b.cool = 0;
         }
         if (S.phalanx) {
@@ -2104,6 +2105,10 @@
           res: vRes(v),
           val: vValue(v),
           reserve: false,
+          reserveUntil: 0,
+          autoAttempts: 0,
+          autoLastAssignAt: -999,
+          autoPredictedInterceptAt: 0,
           warn: false,
           near: false,
           splitAt: v === 'split' ? rand(.4, .63) : 0,
@@ -2364,6 +2369,10 @@
             res: vRes('shard'),
             val: vValue('shard'),
             reserve: false,
+            reserveUntil: 0,
+            autoAttempts: 0,
+            autoLastAssignAt: -999,
+            autoPredictedInterceptAt: 0,
             warn: false,
             near: false,
             splitAt: 0,
@@ -2956,14 +2965,16 @@
           autoSpeed = interceptorSpeed(1.08),
           maxShotsBudget = Math.min(10, 3 + Math.floor(Math.max(0, S.level - 1) / 10)),
           cov = coverage(now),
-          en = S.enemy.filter(m => !m.reserve),
+          en = S.enemy.slice(),
           ufo = S.ufo.filter(u => (u.autoReserve ?? 0) <= now);
         const scan = {
           enemy: {
             covered: 0,
             noIntercept: 0,
             late: 0,
-            conflict: 0
+            conflict: 0,
+            reserve: 0,
+            retry: 0
           },
           ufo: {
             noIntercept: 0,
@@ -2983,7 +2994,21 @@
             bi = -1;
           for (let i = 0; i < en.length; i++) {
             const m = en[i];
-            if (enemyCovered(m, cov, now)) {
+            const etaImpact = tImpact(m),
+              payloadType = m.payload?.type ?? 'unknown',
+              cityTarget = payloadType === 'city',
+              retryEligible = cityTarget && (m.autoAttempts ?? 0) > 0 && etaImpact <= 1.55,
+              terminalCity = cityTarget && etaImpact <= 1.2,
+              reserveUntil = m.reserveUntil ?? 0,
+              reserveActive = reserveUntil > now || (m.reserve === true && reserveUntil <= 0),
+              reserveFresh = (now - (m.autoLastAssignAt ?? -999)) < .2;
+            if (reserveActive && !(retryEligible || terminalCity) || (reserveActive && reserveFresh)) {
+              scan.enemy.reserve++;
+              continue;
+            }
+            if (retryEligible || terminalCity) scan.enemy.retry++;
+            const covered = enemyCovered(m, cov, now);
+            if (covered && !(retryEligible || terminalCity)) {
               scan.enemy.covered++;
               continue;
             }
@@ -3002,13 +3027,21 @@
                 scan.enemy.conflict++;
                 continue;
               }
-              const s = threat(m) - intr.t * 42 - Math.abs(b.x - intr.x) * .045;
+              let s = threat(m) - intr.t * 42 - Math.abs(b.x - intr.x) * .045;
+              if (cityTarget) s += 58;
+              if (m.v === 'fast' || m.v === 'stealth') s += 36;
+              if (retryEligible) s += 145;
+              if (terminalCity) s += 260;
               if (!best || s > best.s) {
                 best = {
                   b,
                   m,
                   intr,
-                  s
+                  s,
+                  payloadType,
+                  etaImpact,
+                  retryEligible,
+                  terminalCity
                 };
                 ei = i;
                 bi = j;
@@ -3022,19 +3055,33 @@
             auto: true
           });
           if (fired) {
+            const attempt = (best.m.autoAttempts ?? 0) + 1,
+              reserveHold = clamp(best.intr.t * .9 + .24, .3, 1.28);
+            best.m.autoAttempts = attempt;
+            best.m.autoLastAssignAt = now;
+            best.m.autoPredictedInterceptAt = now + best.intr.t;
+            best.m.reserveUntil = now + reserveHold;
+            best.m.reserve = false;
             debugRecord('auto_assignment', {
               baseId: best.b.id,
               targetType: 'enemy',
               targetId: best.m.id,
               enemyType: best.m.v,
+              payloadType: best.payloadType,
+              cityTarget: best.payloadType === 'city',
+              attempt,
+              retry: attempt > 1,
+              terminalPriority: !!best.terminalCity,
+              timeToImpact: round3(best.etaImpact),
               intercept: {
                 x: round3(best.intr.x),
                 y: round3(best.intr.y),
                 t: round3(best.intr.t)
               },
+              predictedInterceptAt: round3(best.m.autoPredictedInterceptAt),
+              reserveUntil: round3(best.m.reserveUntil),
               score: round3(best.s)
             });
-            best.m.reserve = true;
             shots++;
             const m = S.player[S.player.length - 1];
             if (m) cov.push({
@@ -4407,9 +4454,20 @@
           return;
         }
         const city1Alive = S.cities[0]?.alive;
-        if (city1Alive && Math.random() < dt * 0.18) {
-          const bases = S.bases.filter(b => !b.destroyed && b.ammo >= 0 && b.ammo < 30);
-          if (bases.length > 0) pick(bases.map(b => ({ v: b, w: 1 }))).ammo++;
+        if (city1Alive) {
+          const liveBases = S.bases.filter(b => !b.destroyed);
+          if (liveBases.length > 0) {
+            const targetLow = S.auto ? 44 : 36,
+              lowBases = liveBases.filter(b => b.ammo >= 0 && b.ammo < targetLow),
+              totalAmmo = liveBases.reduce((n, b) => n + b.ammo, 0),
+              emergency = totalAmmo <= Math.max(24, 8 + S.level * .9),
+              supportRate = 0.18 + clamp((S.level - 12) * .012, 0, .28) + (S.auto ? .09 : 0) + S.danger * .16 + (emergency ? .32 : 0);
+            if (lowBases.length > 0 && Math.random() < dt * supportRate) {
+              const target = lowBases.reduce((p, n) => n.ammo < p.ammo ? n : p, lowBases[0]),
+                grant = emergency && Math.random() < .4 ? 2 : 1;
+              target.ammo = Math.min(180, target.ammo + grant);
+            }
+          }
         }
         for (const b of S.bases)
           if (b.cool > 0) b.cool = Math.max(0, b.cool - dt);
