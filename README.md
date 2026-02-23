@@ -11,6 +11,7 @@ A single-file HTML5 reimagining of Missile Command with enhanced visuals, audio,
 
 - `LMB`: Fire interceptor
 - `H`: Toggle Hell Raiser deploy/retract
+- `T`: Toggle visual theme (Modern/Xbox/Recharged)
 - `C`: Toggle auto defense
 - `F8`: Toggle debug telemetry
 - `F9`: Export current wave telemetry JSON
