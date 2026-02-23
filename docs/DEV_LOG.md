@@ -18,6 +18,13 @@ Purpose: maintain a running, chronological technical record to support future ma
 - Increased late-game defensive viability by scaling interceptor speed and auto-defense throughput.
 - Performed high-fidelity render pass for UFO/Boss UFO/Raider/Daemon/carrier/drone.
 
+### Visual Enhancements
+
+- Implemented a dynamic theme-switching system supporting 'Modern' (default cyberpunk), 'Xbox' (faux-3D desert), and 'Recharged' (neon vector) aesthetics.
+- Added 'T' key toggle to cycle visual themes during gameplay.
+- Synchronized theme state with CSS UI styling, environment color palettes, object geometry generation (bases/cities), and projectile particle effects.
+
+
 ### Phalanx Intercept and Telemetry Tuning
 
 - Resolved Level-20 Phalanx failure mode where sustained fire could produce zero hits.

@@ -13,7 +13,7 @@
 
 Global state object `S` stores all simulation data, including:
 
-- Meta/game flow: `intro`, `gameOver`, `level`, `shop`, timers.
+- Meta/game flow: `theme`, `intro`, `gameOver`, `level`, `shop`, timers.
 - World geometry: `w`, `h`, `groundY`, `horizonY`.
 - Defenders: `bases`, `phalanx`, `hellRaiser`, EMP counters.
 - Enemies: `enemy`, `ufo`, `raiders`, `demon`.

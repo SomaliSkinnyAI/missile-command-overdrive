@@ -29,6 +29,7 @@
 - `RMB` or `E`: EMP pulse
 - `C`: toggle auto defense
 - `H`: deploy/retract Hell Raiser
+- `T`: toggle visual theme (Modern/Xbox/Recharged)
 - `F8`: toggle debug telemetry
 - `F9`: export current wave debug JSON
 - `F10`: export full session debug JSON
@@ -123,7 +124,8 @@
 
 ## 9. Environmental and Presentation Systems
 
-- Dynamic sky cycle (day/night transitions).
+- Dynamic sky cycle (day/night transitions) with palette shifting.
+- Visual themes system dynamically repainting assets (Modern cyberpunk, Xbox low-poly desert, Recharged neon wireframe).
 - Stars/nebula/aurora/cloud layers.
 - Weather fronts (clear/ash/storm) affecting mood and some movement drift.
 - Terrain layers and city profiles/ruins.
