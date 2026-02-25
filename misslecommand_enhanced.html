@@ -1730,8 +1730,12 @@
         const mid = S.bases[Math.floor(S.bases.length / 2)] ?? {
             x: S.w * .5
           },
-          leftAnchor = (S.bases[0]?.x + mid.x) * .5 + 2,
-          rightAnchor = (mid.x + (S.bases[2]?.x ?? (S.w * .82))) * .5 - 2,
+          leftCityA = S.cities[1],
+          leftCityB = S.cities[2],
+          rightCityA = S.cities[3],
+          rightCityB = S.cities[4],
+          leftAnchor = (leftCityA && leftCityB) ? (leftCityA.x + leftCityB.x) * .5 : (S.bases[0]?.x + mid.x) * .5 + 2,
+          rightAnchor = (rightCityA && rightCityB) ? (rightCityA.x + rightCityB.x) * .5 : (mid.x + (S.bases[2]?.x ?? (S.w * .82))) * .5 - 2,
           makePhalanx = (id, x) => ({
             id,
             x: clamp(x, 26, S.w - 26),
