@@ -44,7 +44,7 @@ A single-file HTML5 game with:
 8. Defensive systems
 - Add base cooldown/ammo model.
 - Add auto-defense intercept solver.
-- Add Phalanx autonomous turret.
+- Add dual Phalanx autonomous turrets (`PHALANX_L`, `PHALANX_R`) flanking center.
 - Add Hell Raiser deploy/vulnerability/state machine.
 
 9. VFX and weather
@@ -70,7 +70,7 @@ A single-file HTML5 game with:
 - Auto-defense can meaningfully engage late-game waves.
 - Hell Raiser deploys, is vulnerable while surfaced, and retracts.
 - Hell Raiser swarm missiles retarget individual targets.
-- Phalanx uses predictive lead and can emergency-prioritize imminent threats to itself.
+- Phalanx pair uses predictive lead and can emergency-prioritize imminent threats to itself.
 - Debug exports include lock/burst telemetry rich enough for AI-assisted diagnostics.
 - Secret daemon trigger works.
 - GitHub Pages root URL launches game.
@@ -99,7 +99,7 @@ Then bundle into single-file release artifact for deployment parity.
 - enemy split/deploy events
 - mobile viewport scaling and HUD overlap
 - debug export correctness (`wave` vs `session` scope)
-- phalanx response time to `payload.type === "phalanx"` inbound threats
+- phalanx response time to `payload.type === "phalanx"` inbound threats (both units)
 
 ## 6. Telemetry Schema Essentials (for recreation parity)
 
@@ -114,6 +114,6 @@ Then bundle into single-file release artifact for deployment parity.
   - `enemy_spawn`, `enemy_impact`, `enemy_killed`, `enemy_split`
   - `defense_lock`, `defense_burst`, `defense_state`, `asset_destroyed`
 - Phalanx-specific fields to preserve:
-  - `defense_lock`: `payloadType`, `timeToImpact`, `terminalPriority`
+  - `defense_lock`: `phalanxId`, `payloadType`, `timeToImpact`, `terminalPriority`
   - `defense_burst`: `aimErr`, `targetDist`, `hitRadiusPeak`, `missPeak`,
-    `payloadType`, `timeToImpact`, `terminalPriority`
+    `phalanxId`, `payloadType`, `timeToImpact`, `terminalPriority`

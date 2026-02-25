@@ -15,7 +15,8 @@ Global state object `S` stores all simulation data, including:
 
 - Meta/game flow: `theme`, `intro`, `gameOver`, `level`, `shop`, timers.
 - World geometry: `w`, `h`, `groundY`, `horizonY`.
-- Defenders: `bases`, `phalanx`, `hellRaiser`, EMP counters.
+- Defenders: `bases`, `phalanxes[]`, `hellRaiser`, EMP counters.
+  - Compatibility alias: `phalanx` may point to `phalanxes[0]` for legacy call paths.
 - Enemies: `enemy`, `ufo`, `raiders`, `demon`.
 - Player ordnance: `player`.
 - FX arrays: `expl`, `smoke`, `sparks`, `trails`, `debris`, `shock`, `lightBursts`.
@@ -45,7 +46,7 @@ Function `loop(ts)`:
 1. Sky + celestials
 2. Deep atmosphere (nebula/aurora/clouds/stars/weather back)
 3. Mountains + ground
-4. World objects (cities, bases, Hell Raiser, Phalanx)
+4. World objects (cities, bases, Hell Raiser, Phalanx batteries)
 5. Vehicles/entities (UFO/Raider/Daemon)
 6. Trails, weather front, smoke
 7. Projectiles and explosions
@@ -80,14 +81,14 @@ Function `loop(ts)`:
 
 ### Phalanx
 
-- Autonomous turret with threat targeting and high fire rate.
-- Tracks heat, ammo, cooldown, and audio mix.
+- Dual autonomous turret battery (`PHALANX_L`, `PHALANX_R`) flanking the center lane.
+- Each unit tracks its own heat, ammo, cooldown, lock state, and audio mix.
 - Uses predictive lead (`phalanxLeadSec` + `phalanxTargetPoint`) for moving targets.
 - Target score blends threat, ETA, and range with explicit payload awareness:
   - city/base/hellRaiser pressure
-  - elevated priority for threats targeting `PHALANX`
+  - elevated priority for threats targeting `PHALANX_*`
 - Terminal override path preempts normal score ordering when an inbound
-  `PHALANX` threat is inside short ETA window.
+  `PHALANX_*` threat is inside short ETA window.
 - Engagement gate has emergency widening for terminal-priority targets.
 - Hit model is probabilistic with velocity-aware miss envelope and per-target resistance.
 
@@ -111,6 +112,7 @@ Function `loop(ts)`:
   - procedural oscillators/noise sources
 - Public API includes launch/hit/impact/wave/emp/nearMiss/phalanx/thunder/hellRaiser.
 - `audio.update()` receives game telemetry (`danger`, `weather`, `phalanxLevel`, etc.).
+- Phalanx telemetry values are aggregated across live Phalanx units.
 
 ## 9. Debug Telemetry Architecture
 
@@ -129,9 +131,9 @@ Function `loop(ts)`:
   - `enemy_spawn`, `enemy_impact`, `enemy_split`, `enemy_killed`
   - `defense_lock`, `defense_burst`, `defense_state`, `asset_destroyed`
 - Phalanx instrumentation (current):
-  - `defense_lock`: `dist`, `score`, `payloadType`, `timeToImpact`, `terminalPriority`
+  - `defense_lock`: `phalanxId`, `dist`, `score`, `payloadType`, `timeToImpact`, `terminalPriority`
   - `defense_burst`: `shots`, `hits`, `kills`, `aimErr`, `targetDist`,
-    `hitRadiusPeak`, `missPeak`, plus `payloadType`, `timeToImpact`, `terminalPriority`
+    `hitRadiusPeak`, `missPeak`, plus `phalanxId`, `payloadType`, `timeToImpact`, `terminalPriority`
 
 ## 10. Performance Notes
 

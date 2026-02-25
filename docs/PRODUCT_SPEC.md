@@ -75,12 +75,12 @@
 
 ### 6.3 Phalanx
 
-- Automated high-rate turret near center defense line.
-- Has its own ammo pool, targeting logic, and heat/cool behavior.
+- Dual automated high-rate turrets (`PHALANX_L`, `PHALANX_R`) placed left/right of center.
+- Each turret has its own ammo pool, targeting logic, and heat/cool behavior.
 - Uses predictive lead to engage high-velocity targets.
 - Prioritizes high-threat inbound missiles and applies emergency terminal priority
   to protect itself when under imminent attack.
-- Emits detailed per-lock and per-burst telemetry for AI-assisted tuning.
+- Emits detailed per-lock and per-burst telemetry (with `phalanxId`) for AI-assisted tuning.
 
 ### 6.4 Hell Raiser
 
@@ -142,6 +142,7 @@
 
 - HUD includes wave/score/combo/cities/EMP/ammo/threat/weather/upgrades.
 - Status panel intentionally moved to bottom center to reduce top-left obstruction.
+- Phalanx readout displays both turret ammo states (left/right).
 - Help overlay lists controls and test shortcuts.
 
 ## 12. Non-Functional Constraints

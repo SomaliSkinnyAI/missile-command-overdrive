@@ -202,6 +202,7 @@
         raiderQuota: 0,
         nextRaider: 0,
         phalanx: null,
+        phalanxes: [],
         hellRaiser: null,
         starsA: [],
         starsB: [],
@@ -551,10 +552,91 @@
         };
         if (t.type === 'city') base.id = t.ref?.id ?? null;
         else if (t.type === 'base') base.id = t.ref?.id ?? null;
-        else if (t.type === 'phalanx') base.id = 'PHALANX';
+        else if (t.type === 'phalanx') base.id = t.ref?.id ?? 'PHALANX';
         else if (t.type === 'hellRaiser') base.id = 'HELL_RAISER';
         else base.id = t.ref?.id ?? null;
         return base;
+      }
+
+      function allPhalanxes() {
+        if (Array.isArray(S.phalanxes) && S.phalanxes.length) return S.phalanxes;
+        return S.phalanx ? [S.phalanx] : [];
+      }
+
+      function alivePhalanxes() {
+        return allPhalanxes().filter(p => p && !p.destroyed);
+      }
+
+      function getPhalanxById(id) {
+        if (!id) return null;
+        return allPhalanxes().find(p => p.id === id) ?? null;
+      }
+
+      function resetPhalanxForWave(p, perUnitMaxAmmo) {
+        if (!p) return;
+        if (p.destroyed && Math.random() < .42) p.destroyed = false;
+        p.maxAmmo = p.destroyed ? 0 : perUnitMaxAmmo;
+        p.ammo = p.maxAmmo;
+        p.cool = 0;
+        p.fireAcc = 0;
+        p.audioT = 0;
+        p.heat = 0;
+        p.fireMix = 0;
+        p.target = null;
+        p.targetKind = null;
+        p.targetDist = 0;
+        p.lockKey = null;
+        p.aimAng = -Math.PI * .5;
+        p.aimX = p.x;
+        p.aimY = S.groundY - 180;
+        p.aimErr = Math.PI;
+      }
+
+      function destroyPhalanxUnit(p, source = 'direct') {
+        if (!p || p.destroyed) return false;
+        p.destroyed = true;
+        p.ammo = 0;
+        debugInc('assetsLost', 'phalanx');
+        debugRecord('asset_destroyed', {
+          asset: 'phalanx',
+          id: p.id ?? 'PHALANX',
+          at: {
+            x: round3(p.x),
+            y: round3(p.y)
+          },
+          source
+        });
+        spawnExpl(p.x, p.y - 6, {
+          player: false,
+          r: source === 'splash' ? 82 : 88,
+          life: source === 'splash' ? .96 : 1.05,
+          sh: .28,
+          flash: .2,
+          noShake: source === 'splash'
+        });
+        note('Phalanx destroyed', 1.1);
+        return true;
+      }
+
+      function phalanxAudioTelemetry() {
+        const live = alivePhalanxes();
+        if (!live.length) return {
+          level: 0,
+          pan: .5
+        };
+        const level = clamp(live.reduce((n, p) => n + (p.fireMix ?? 0), 0) / live.length, 0, 1);
+        const pan = clamp(live.reduce((n, p) => n + clamp(p.x / S.w, 0, 1), 0) / live.length, 0, 1);
+        return {
+          level,
+          pan
+        };
+      }
+
+      function totalDefenseAmmo() {
+        const baseAmmo = S.bases.reduce((n, b) => n + (b.destroyed ? 0 : b.ammo), 0);
+        const phAmmo = allPhalanxes().reduce((n, p) => n + (!p.destroyed ? p.ammo : 0), 0);
+        const hrAmmo = S.hellRaiser && !S.hellRaiser.destroyed ? S.hellRaiser.ammo : 0;
+        return baseAmmo + phAmmo + hrAmmo;
       }
 
       function debugCreateWave(level, meta = {}) {
@@ -1646,29 +1728,36 @@
           });
         }
         const mid = S.bases[Math.floor(S.bases.length / 2)] ?? {
-          x: S.w * .5
-        };
-        const px = clamp(mid.x + 62, 26, S.w - 26);
-        S.phalanx = {
-          x: px,
-          y: S.groundY,
-          ammo: 0,
-          maxAmmo: 0,
-          cool: 0,
-          fireAcc: 0,
-          audioT: 0,
-          heat: 0,
-          fireMix: 0,
-          target: null,
-          targetKind: null,
-          targetDist: 0,
-          lockKey: null,
-          aimAng: -Math.PI * .5,
-          aimX: px,
-          aimY: S.groundY - 180,
-          aimErr: Math.PI,
-          destroyed: false
-        };
+            x: S.w * .5
+          },
+          leftAnchor = (S.bases[0]?.x + mid.x) * .5 + 2,
+          rightAnchor = (mid.x + (S.bases[2]?.x ?? (S.w * .82))) * .5 - 2,
+          makePhalanx = (id, x) => ({
+            id,
+            x: clamp(x, 26, S.w - 26),
+            y: S.groundY,
+            ammo: 0,
+            maxAmmo: 0,
+            cool: 0,
+            fireAcc: 0,
+            audioT: 0,
+            heat: 0,
+            fireMix: 0,
+            target: null,
+            targetKind: null,
+            targetDist: 0,
+            lockKey: null,
+            aimAng: -Math.PI * .5,
+            aimX: clamp(x, 26, S.w - 26),
+            aimY: S.groundY - 180,
+            aimErr: Math.PI,
+            destroyed: false
+          });
+        S.phalanxes = [
+          makePhalanx('PHALANX_L', leftAnchor),
+          makePhalanx('PHALANX_R', rightAnchor)
+        ];
+        S.phalanx = S.phalanxes[0] ?? null;
         S.hellRaiser = {
           x: S.w * .5,
           y: S.groundY + Math.max(18, (S.h - S.groundY) * .22),
@@ -1951,24 +2040,10 @@
           b.ammo = b.destroyed ? 0 : waveBaseAmmo;
           b.cool = 0;
         }
-        if (S.phalanx) {
-          if (S.phalanx.destroyed && Math.random() < .42) S.phalanx.destroyed = false;
-          S.phalanx.maxAmmo = S.phalanx.destroyed ? 0 : Math.min(1300, Math.round((620 + S.level * 90) * (1 + (S.upgrades.phalanxEff - 1) * .55)));
-          S.phalanx.ammo = S.phalanx.maxAmmo;
-          S.phalanx.cool = 0;
-          S.phalanx.fireAcc = 0;
-          S.phalanx.audioT = 0;
-          S.phalanx.heat = 0;
-          S.phalanx.fireMix = 0;
-          S.phalanx.target = null;
-          S.phalanx.targetKind = null;
-          S.phalanx.targetDist = 0;
-          S.phalanx.lockKey = null;
-          S.phalanx.aimAng = -Math.PI * .5;
-          S.phalanx.aimX = S.phalanx.x;
-          S.phalanx.aimY = S.groundY - 180;
-          S.phalanx.aimErr = Math.PI;
-        }
+        const oldPhalanxMax = Math.min(1300, Math.round((620 + S.level * 90) * (1 + (S.upgrades.phalanxEff - 1) * .55))),
+          perUnitPhalanxMax = Math.max(340, Math.round(oldPhalanxMax * 0.62));
+        for (const p of allPhalanxes()) resetPhalanxForWave(p, perUnitPhalanxMax);
+        S.phalanx = allPhalanxes()[0] ?? null;
         if (S.hellRaiser) {
           const hr = S.hellRaiser;
           if (hr.destroyed && Math.random() < .58) hr.destroyed = false;
@@ -2050,18 +2125,18 @@
             }
           });
         }
-        if (S.phalanx && !S.phalanx.destroyed) {
-          let w = 36 + S.phalanx.ammo * .015 + rand(0, 9);
-          if (v === 'fast' || v === 'heavy') w += 12;
-          if (v === 'drone') w += 18;
-          if (v === 'cruise') w += 16;
+        for (const p of alivePhalanxes()) {
+          let w = 28 + p.ammo * .012 + rand(0, 8);
+          if (v === 'fast' || v === 'heavy') w += 10;
+          if (v === 'drone') w += 14;
+          if (v === 'cruise') w += 13;
           if (v === 'hell') w += 10;
           c.push({
             w,
             v: {
               type: 'phalanx',
-              ref: S.phalanx,
-              x: S.phalanx.x,
+              ref: p,
+              x: p.x,
               y: S.groundY - 18
             }
           });
@@ -2727,27 +2802,8 @@
             });
           }
         } else if (payload.type === 'phalanx') {
-          if (S.phalanx && !S.phalanx.destroyed) {
-            S.phalanx.destroyed = true;
-            S.phalanx.ammo = 0;
-            debugInc('assetsLost', 'phalanx');
-            debugRecord('asset_destroyed', {
-              asset: 'phalanx',
-              id: 'PHALANX',
-              at: {
-                x: round3(S.phalanx.x),
-                y: round3(S.phalanx.y)
-              }
-            });
-            spawnExpl(S.phalanx.x, S.phalanx.y - 6, {
-              player: false,
-              r: 88,
-              life: 1.05,
-              sh: .28,
-              flash: .2
-            });
-            note('Phalanx destroyed', 1.1);
-          }
+          const targetPh = payload.ref && payload.ref.id ? payload.ref : getPhalanxById(payload.id);
+          if (targetPh) destroyPhalanxUnit(targetPh, 'direct');
         } else if (payload.type === 'hellRaiser') {
           damageHellRaiser(1.9 + blast * .008, x, y);
         }
@@ -2777,27 +2833,8 @@
                 noShake: true
               });
             }
-          if (S.phalanx && !S.phalanx.destroyed && Math.abs(S.phalanx.x - x) <= blast * .64) {
-            S.phalanx.destroyed = true;
-            S.phalanx.ammo = 0;
-            debugInc('assetsLost', 'phalanx');
-            debugRecord('asset_destroyed', {
-              asset: 'phalanx',
-              id: 'PHALANX',
-              at: {
-                x: round3(S.phalanx.x),
-                y: round3(S.phalanx.y)
-              },
-              source: 'splash'
-            });
-            spawnExpl(S.phalanx.x, S.phalanx.y - 8, {
-              player: false,
-              r: 82,
-              life: .96,
-              sh: .3,
-              flash: .14,
-              noShake: true
-            });
+          for (const p of alivePhalanxes()) {
+            if (Math.abs(p.x - x) <= blast * .64) destroyPhalanxUnit(p, 'splash');
           }
           splashHellRaiser(x, y, blast, .72);
         }
@@ -2946,7 +2983,7 @@
         if (m.payload?.type === 'city' && m.payload.ref?.alive) tv = 120;
         if (m.payload?.type === 'base' && !m.payload.ref?.destroyed) tv = 100 + m.payload.ref.ammo * 1.2;
         if (m.payload?.type === 'hellRaiser' && hellRaiserVulnerable()) tv = 132;
-        if (m.payload?.type === 'phalanx' && S.phalanx && !S.phalanx.destroyed) tv = 172;
+        if (m.payload?.type === 'phalanx' && alivePhalanxes().length) tv = 172;
         const mul = m.v === 'heavy' ? 1.65 : m.v === 'split' ? 1.45 : m.v === 'zig' ? 1.35 : m.v === 'fast' ? 1.2 : m.v === 'ufoBomb' ? 1.42 : m.v === 'cruise' ? 1.58 : m.v === 'carrier' ? 1.9 : m.v === 'drone' ? 1.28 : m.v === 'spit' ? 1.24 : m.v === 'hell' ? 1.74 : 1;
         const hpBonus = Math.max(0, (m.hp ?? 1) - 1) * 42;
         return tv * mul + 128 / (ti + .75) + m.sp * .18 + hpBonus;
@@ -2999,9 +3036,9 @@
           if (m.y > S.groundY - 4) continue;
           const payloadType = m.payload?.type ?? null,
             eta = tImpact(m);
-          let base = threat(m) + (payloadType === 'city' ? 62 : 0) + (payloadType === 'base' ? 24 : 0) + (payloadType === 'hellRaiser' ? 32 : 0) + (payloadType === 'phalanx' && S.phalanx && !S.phalanx.destroyed ? 240 : 0) + (m.v === 'ufoBomb' ? 42 : 0);
-          if (payloadType === 'phalanx' && S.phalanx && !S.phalanx.destroyed && eta <= 2.2) base += 170;
-          const terminal = payloadType === 'phalanx' && S.phalanx && !S.phalanx.destroyed && eta <= 1.35,
+          let base = threat(m) + (payloadType === 'city' ? 62 : 0) + (payloadType === 'base' ? 24 : 0) + (payloadType === 'hellRaiser' ? 32 : 0) + (payloadType === 'phalanx' && alivePhalanxes().length ? 240 : 0) + (m.v === 'ufoBomb' ? 42 : 0);
+          if (payloadType === 'phalanx' && alivePhalanxes().length && eta <= 2.2) base += 170;
+          const terminal = payloadType === 'phalanx' && alivePhalanxes().length && eta <= 1.35,
             boost = terminal ? 680 + (1.35 - eta) * 220 : 0;
           consider('enemy', m, m.x, m.y, base, eta, {
             payloadType,
@@ -3025,13 +3062,15 @@
         return best;
       }
 
-      function phalanxLeadSec(t) {
+      function phalanxLeadSec(t, pRef = null) {
         if (!t || !t.o) return .045;
         if (t.k === 'enemy') {
           const vx = t.o.cv ?? t.o.vx ?? 0,
             vy = t.o.cy ?? t.o.vy ?? 0,
             speed = Math.hypot(vx, vy),
-            dist = t.dist ?? Math.hypot((t.o.x ?? 0) - (S.phalanx?.x ?? 0), (t.o.y ?? 0) - ((S.phalanx?.y ?? 0) - 52)),
+            px = pRef?.x ?? S.phalanx?.x ?? (S.w * .5),
+            py = pRef?.y ?? S.phalanx?.y ?? S.groundY,
+            dist = t.dist ?? Math.hypot((t.o.x ?? 0) - px, (t.o.y ?? 0) - (py - 52)),
             lead = .02 + dist / 9200 + speed / 18000;
           return clamp(lead, .024, .082);
         }
@@ -3860,8 +3899,8 @@
         }
       }
 
-      function updPhalanx(dt) {
-        const p = S.phalanx;
+      function updPhalanx(dt, pRef = null) {
+        const p = pRef ?? S.phalanx;
         if (!p) return;
         const phEff = S.upgrades?.phalanxEff ?? 1.0;
         const phalanxCdMult = ((S.cities[2] && S.cities[2].alive) ? 2.2 : 1.0) * (1 + (phEff - 1) * .55);
@@ -3888,6 +3927,7 @@
           if (lockKey) {
             debugRecord('defense_lock', {
               defense: 'phalanx',
+              phalanxId: p.id ?? 'PHALANX',
               lock: lockKey,
               dist: round3(best.dist),
               score: round3(best.score),
@@ -3900,7 +3940,7 @@
         }
         if (!isFinite(p.aimAng)) p.aimAng = -Math.PI * .5;
         if (best) {
-          const aimLead = phalanxLeadSec(best),
+          const aimLead = phalanxLeadSec(best, p),
             predicted = phalanxTargetPoint(best, aimLead);
           let aimX = predicted ? predicted.x : best.x,
             aimY = predicted ? predicted.y : best.y;
@@ -3953,7 +3993,7 @@
             ty = p.aimY + rand(-spread, spread);
           spawnPhalanxTracer(srcX, srcY, tx, ty);
           if (best.k === 'enemy') {
-            const lead = phalanxLeadSec(best),
+            const lead = phalanxLeadSec(best, p),
               predicted = phalanxTargetPoint(best, lead),
               px = predicted ? predicted.x : o.x,
               py = predicted ? predicted.y : o.y,
@@ -4081,6 +4121,7 @@
           debugInc('defenseBursts', 'phalanx');
           debugRecord('defense_burst', {
             defense: 'phalanx',
+            phalanxId: p.id ?? 'PHALANX',
             shots,
             hits: burstHits,
             kills: burstKills,
@@ -4108,11 +4149,19 @@
           p.cool = 2.1 / Math.max(1, phEff);
           debugRecord('defense_state', {
             defense: 'phalanx',
+            phalanxId: p.id ?? 'PHALANX',
             state: 'ammo_empty',
             cooldown: round3(p.cool)
           });
           note('Phalanx out of ammo', .75);
         }
+      }
+
+      function updPhalanxes(dt) {
+        const phalanxes = allPhalanxes();
+        if (!phalanxes.length) return;
+        for (const p of phalanxes) updPhalanx(dt, p);
+        S.phalanx = phalanxes[0] ?? null;
       }
 
       function impactEnemy(m, x, y) {
@@ -4578,7 +4627,7 @@
           updRaiders(dt);
           updDemon(dt);
           updHellRaiser(dt);
-          updPhalanx(dt);
+          updPhalanxes(dt);
           updExpl(dt);
           updSmoke(dt);
           updSparks(dt);
@@ -4587,6 +4636,7 @@
           updShock(dt);
           updLightBursts(dt);
           collisions();
+          const phAudio = phalanxAudioTelemetry();
           audio.update({
             level: S.level,
             danger: S.danger,
@@ -4594,7 +4644,7 @@
             lowAmmo: false,
             weather: S.weather.intensity,
             phalanxLevel: 0,
-            phalanxPan: S.phalanx ? clamp(S.phalanx.x / S.w, 0, 1) : .5
+            phalanxPan: phAudio.pan
           });
           return;
         }
@@ -4639,7 +4689,7 @@
         updRaiders(dt);
         updDemon(dt);
         updHellRaiser(dt);
-        updPhalanx(dt);
+        updPhalanxes(dt);
         updPlayer(dt);
         updExpl(dt);
         updSmoke(dt);
@@ -4684,14 +4734,15 @@
           note('Defense grid collapsed', 2.2);
         }
         updateDanger();
+        const phAudio = phalanxAudioTelemetry();
         audio.update({
           level: S.level,
           danger: S.danger,
           gameOver: S.gameOver,
           weather: S.weather.intensity,
-          lowAmmo: S.bases.reduce((n, b) => n + (b.destroyed ? 0 : b.ammo), 0) + (S.phalanx && !S.phalanx.destroyed ? S.phalanx.ammo : 0) + (S.hellRaiser && !S.hellRaiser.destroyed ? S.hellRaiser.ammo : 0) <= 18,
-          phalanxLevel: S.phalanx && !S.phalanx.destroyed ? (S.phalanx.fireMix ?? 0) : 0,
-          phalanxPan: S.phalanx ? clamp(S.phalanx.x / S.w, 0, 1) : .5
+          lowAmmo: totalDefenseAmmo() <= 18,
+          phalanxLevel: phAudio.level,
+          phalanxPan: phAudio.pan
         });
       }
 
@@ -5746,8 +5797,8 @@
         ctx.restore();
       }
 
-      function drawPhalanx() {
-        const p = S.phalanx;
+      function drawPhalanx(pRef = null) {
+        const p = pRef ?? S.phalanx;
         if (!p) return;
         ctx.save();
         ctx.translate(p.x, p.y);
@@ -5990,6 +6041,13 @@
         ctx.shadowBlur = 0;
 
         ctx.restore(); // End Phalanx drawing
+      }
+
+      function drawPhalanxes() {
+        const phalanxes = allPhalanxes();
+        if (!phalanxes.length) return;
+        for (const p of phalanxes) drawPhalanx(p);
+        S.phalanx = phalanxes[0] ?? null;
       }
 
       function drawPlasmaBarrel(ctx, heat, ox, oy) {
@@ -7209,17 +7267,20 @@
       }
 
       function drawHud() {
+        const phalanxUnits = allPhalanxes(),
+          phalanxAmmo = phalanxUnits.reduce((n, p) => n + (!p.destroyed ? p.ammo : 0), 0),
+          phalanxLabel = p => p.id === 'PHALANX_L' ? 'L' : p.id === 'PHALANX_R' ? 'R' : p.id ?? 'P';
         const alive = S.cities.filter(c => c.alive).length,
           pending = Math.max(0, S.wavePlan.length - S.spawnI),
           ufoCount = S.ufo.length,
           raiderCount = S.raiders.length,
           host = S.enemy.length + ufoCount + raiderCount + (S.demon ? 1 : 0),
           ammo = S.bases.map(b => `${b.id}:${b.destroyed ? 'X' : b.ammo}`).join('  '),
-          ph = S.phalanx ? S.phalanx.destroyed ? 'X' : S.phalanx.ammo : '--',
+          ph = phalanxUnits.length ? phalanxUnits.map(p => `${phalanxLabel(p)}:${p.destroyed ? 'X' : Math.max(0, Math.floor(p.ammo))}`).join('  ') : '--',
           hr = S.hellRaiser ? S.hellRaiser.destroyed ? 'X' : `${hellRaiserStatus()} ${Math.max(0, Math.floor(S.hellRaiser.ammo))}` : '--',
           hrHp = S.hellRaiser && hellRaiserVulnerable() ? `${Math.ceil(S.hellRaiser.hp)}/${S.hellRaiser.maxHp}` : '--',
           dbg = S.debug.enabled ? `ON (${Object.keys(S.debug.waves).length}W)` : 'OFF',
-          ammoLeft = S.bases.reduce((n, b) => n + (b.destroyed ? 0 : b.ammo), 0) + (S.phalanx && !S.phalanx.destroyed ? S.phalanx.ammo : 0),
+          ammoLeft = S.bases.reduce((n, b) => n + (b.destroyed ? 0 : b.ammo), 0) + phalanxAmmo,
           bars = 14,
           fill = Math.round(S.danger * bars),
           bar = '#'.repeat(fill) + '-'.repeat(bars - fill),
@@ -7423,7 +7484,7 @@
         drawCities();
         drawBases();
         drawHellRaiser();
-        drawPhalanx();
+        drawPhalanxes();
         drawDemon();
         drawUfo();
         drawRaiders();

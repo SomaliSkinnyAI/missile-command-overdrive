@@ -66,6 +66,26 @@ Purpose: maintain a running, chronological technical record to support future ma
 - Published live URL:
   - `https://somaliskinnyai.github.io/missile-command-overdrive/`
 
+## 2026-02-25
+
+### Phalanx Topology Refactor
+
+- Replaced single center Phalanx with dual units:
+  - `PHALANX_L` between base lanes B1/B2
+  - `PHALANX_R` between base lanes B2/B3
+- Removed center-map Phalanx placement to clear visual space around Hell Raiser and HUD.
+- Updated enemy targeting so either Phalanx can be selected/damaged independently.
+- Updated splash-damage resolution to destroy impacted Phalanx units independently.
+- Updated wave reset logic to rearm both Phalanx units with per-unit balancing.
+- Updated Phalanx update/render loops to process both units each frame.
+
+### HUD, Audio, and Telemetry Alignment
+
+- HUD now reports left/right Phalanx ammo independently.
+- `Ammo Left` now includes total ammo from both Phalanx units (plus base launchers).
+- Audio telemetry now aggregates Phalanx fire mix/pan across live units.
+- Debug records now include `phalanxId` in lock/burst/state events for per-unit analysis.
+
 ## Logging Standard (for future updates)
 
 For each new session, add:
