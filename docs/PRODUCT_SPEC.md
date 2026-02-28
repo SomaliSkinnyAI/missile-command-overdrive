@@ -66,6 +66,8 @@
 ### 6.1 Base Interceptors
 
 - 3 main bases with ammo and cooldown.
+- Left and right launchers positioned between the two outermost city pairs.
+- Center launcher at original spacing position.
 - Player-fired missiles detonate at target to form blast zones.
 
 ### 6.2 EMP
@@ -127,9 +129,16 @@
 - Dynamic sky cycle (day/night transitions) with palette shifting.
 - Visual themes system dynamically repainting assets (Modern cyberpunk, Xbox low-poly desert, Recharged neon wireframe).
 - Stars/nebula/aurora/cloud layers.
+- Background shooting stars (random streaks during night sky).
 - Weather fronts (clear/ash/storm) affecting mood and some movement drift.
+- Lightning bolt rendering during storms (procedural jagged paths).
 - Terrain layers and city profiles/ruins.
-- Post-processing: bloom, grain, vignettes, flash overlays, threat tint.
+- Ground scorch marks at missile impact sites (fade over time, capped at 40).
+- Muzzle flash effects on player missile launches (directional radial gradients).
+- Floating combo/score text with pop scale animation.
+- Overlay fade transitions between game states.
+- Post-processing: bloom, grain, vignettes, flash overlays, threat tint, chromatic aberration.
+- Phalanx CIWS rendered as rotating 6-barrel Gatling assembly with visible spin, alternating barrel colors, and rotating hub disc.
 
 ## 10. Audio Experience
 

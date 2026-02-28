@@ -36,6 +36,7 @@ A single-file HTML5 reimagining of Missile Command with enhanced visuals, audio,
 - `docs/RECREATION_GUIDE.md`
 - `docs/GITHUB_OPERATIONS.md`
 - `docs/DEV_LOG.md`
+- `docs/CPP_MIGRATION_PLAN.md`
 
 ## Notes
 

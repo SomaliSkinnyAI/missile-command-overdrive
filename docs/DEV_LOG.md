@@ -86,6 +86,56 @@ Purpose: maintain a running, chronological technical record to support future ma
 - Audio telemetry now aggregates Phalanx fire mix/pan across live units.
 - Debug records now include `phalanxId` in lock/burst/state events for per-unit analysis.
 
+## 2026-02-27
+
+### Visual Effects Overhaul
+
+- Added 11 new visual effects systems:
+  - Muzzle flashes with directional radial gradients on player missile launches
+  - Ground scorch marks at impact sites (capped at 40, fade over time)
+  - Chromatic aberration post-FX (RGB channel offset on screen shake)
+  - Lightning bolt rendering during storms (jagged procedural paths)
+  - Xbox theme window strobing fix (deterministic hash replacing random flicker)
+  - Theme-specific explosion color palettes (modern=blue/cyan, xbox=orange/brown, recharged=neon)
+  - Theme-specific crosshair variants (modern=detailed, xbox=minimal, recharged=neon ring)
+  - Background shooting stars (random streaks in night sky)
+  - Floating combo/score text with pop animation
+  - Overlay fade transitions between game states
+
+### Radar Dish Improvements
+
+- Rewrote missile launcher radar dishes across all themes:
+  - Parabolic dish shape replacing flat ellipse (bowed rim path helper)
+  - Horizontal oscillating rotation with front/back face distinction
+  - Tracking indicator light on dish face
+  - Feed horn with fade gradient
+  - Rim highlight differentiating front vs back of dish rotation
+  - Xbox theme: smaller scale variant with same features
+
+### Phalanx CIWS Gatling Conversion
+
+- Replaced dual-barrel Phalanx rendering with 6-barrel rotating Gatling assembly:
+  - New `drawGatlingAssembly()` function for all 3 themes
+  - Barrel spin state (`spinAngle`, `spinSpeed`) added to Phalanx objects
+  - Idle rotation at 1.5 rad/sec, ramping to 10-28 rad/sec when firing
+  - Alternating dark/light barrel colors for visible rotation tracking
+  - Rotating hub disc with spoke marks at breech end
+  - Barrel clamp bands at midpoint for rotation reference
+  - Theme variants: modern (gradient barrels + shroud), xbox (desert green), recharged (neon wireframe)
+- Fixed muzzle flash visibility: draw heat now uses `max(heat, fireMix)` so flash actually triggers when firing
+- Fixed tracer origin: per-theme pivot height (modern=y-78, xbox=y-45, recharged=y-55) with correct muzzle distance projection along aim angle
+
+### Base Launcher Repositioning
+
+- Moved left-most launcher (B1) to midpoint between cities C1 and C2
+- Moved right-most launcher (B3) to midpoint between cities C5 and C6
+- Center launcher (B2) remains at original position
+
+### Documentation
+
+- Updated all docs to reflect visual and mechanical changes
+- Created C++ migration plan document (`docs/CPP_MIGRATION_PLAN.md`)
+
 ## Logging Standard (for future updates)
 
 For each new session, add:

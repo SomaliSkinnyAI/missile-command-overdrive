@@ -49,6 +49,8 @@ A single-file HTML5 game with:
 
 9. VFX and weather
 - Add sky layers, weather particles, shockwaves, bloom, grain.
+- Add muzzle flash, scorch marks, shooting stars, floating text, chromatic aberration.
+- Implement Phalanx as rotating Gatling with alternating barrel colors and hub disc.
 
 10. Audio system
 - Add WebAudio graph and event SFX APIs.
@@ -73,6 +75,11 @@ A single-file HTML5 game with:
 - Phalanx pair uses predictive lead and can emergency-prioritize imminent threats to itself.
 - Debug exports include lock/burst telemetry rich enough for AI-assisted diagnostics.
 - Secret daemon trigger works.
+- Phalanx barrels visibly rotate at idle and speed up when firing.
+- Muzzle flash appears at barrel tips when Phalanx fires.
+- Tracers originate from barrel tips aligned to aim angle.
+- Ground scorch marks appear at missile impact locations.
+- Left/right launchers sit between the two outermost city pairs.
 - GitHub Pages root URL launches game.
 
 ## 4. Suggested Modular Decomposition (if moving off single-file)

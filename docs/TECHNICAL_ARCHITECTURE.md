@@ -135,6 +135,30 @@ Function `loop(ts)`:
   - `defense_burst`: `shots`, `hits`, `kills`, `aimErr`, `targetDist`,
     `hitRadiusPeak`, `missPeak`, plus `phalanxId`, `payloadType`, `timeToImpact`, `terminalPriority`
 
+## 9.5 Phalanx Gatling Rendering System
+
+- `drawGatlingAssembly(ctx, heat, ox, oy, spinAngle, numBarrels)` renders a rotating multi-barrel cluster.
+- Barrel assembly uses `assemblyR = 10` (cluster radius) with 6 barrels at `TAU/6` spacing.
+- Spin driven by `spinAngle` state updated in `updPhalanx()`:
+  - Idle: 1.5 rad/sec continuous rotation
+  - Firing: 10 + fireMix * 18 rad/sec (ramps via interpolation factor)
+- Visual rotation cues:
+  - Alternating barrel brightness (even=dark, odd=light) for individual tracking
+  - Rotating hub disc at breech with alternating bright/dim spoke marks
+  - Barrel clamp bands at midpoint providing rotation reference points
+- `heat` parameter for draw is `max(p.heat, p.fireMix)` to ensure muzzle flash triggers during fire bursts.
+- Tracer spawn origin is per-theme: pivot at (p.x, p.y - pivotOffset) projected along `aimAng` by `muzzleDist`.
+  - Modern: pivotOffset=78, muzzleDist=48
+  - Xbox: pivotOffset=45, muzzleDist=49
+  - Recharged: pivotOffset=55, muzzleDist=46
+
+## 9.6 Base Launcher Placement
+
+- Left launcher (B1) positioned at midpoint of cities C1 and C2.
+- Right launcher (B3) positioned at midpoint of cities C5 and C6.
+- Center launcher (B2) uses original equal-spacing formula.
+- Repositioning occurs in `buildWorld()` after city positions are established.
+
 ## 10. Performance Notes
 
 - Frequent object arrays are manually updated and pruned each frame.

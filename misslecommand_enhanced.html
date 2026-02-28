@@ -187,6 +187,7 @@
         intro: true,
         gameOver: false,
         gameOverSfx: false,
+        gameOverTime: 0,
         level: 1,
         score: 0,
         combo: 0,
@@ -226,6 +227,10 @@
         debris: [],
         shock: [],
         lightBursts: [],
+        muzzleFlashes: [],
+        scorches: [],
+        shootingStars: [],
+        chromatic: 0,
         weather: {
           mode: 'clear',
           intensity: 0,
@@ -233,7 +238,8 @@
           particles: [],
           fogBands: [],
           lightningT: 0,
-          thunderCd: 0
+          thunderCd: 0,
+          bolts: []
         },
         mouse: {
           x: 0,
@@ -581,6 +587,8 @@
         p.fireAcc = 0;
         p.audioT = 0;
         p.heat = 0;
+        p.spinAngle = 0;
+        p.spinSpeed = 0;
         p.fireMix = 0;
         p.target = null;
         p.targetKind = null;
@@ -1727,6 +1735,11 @@
             ruin: null
           });
         }
+        // Reposition left-most and right-most launchers between the outer city pairs
+        if (S.cities.length >= 6 && S.bases.length >= 3) {
+          S.bases[0].x = (S.cities[0].x + S.cities[1].x) * 0.5;
+          S.bases[2].x = (S.cities[4].x + S.cities[5].x) * 0.5;
+        }
         const mid = S.bases[Math.floor(S.bases.length / 2)] ?? {
             x: S.w * .5
           },
@@ -1934,6 +1947,10 @@
         S.debris = [];
         S.shock = [];
         S.lightBursts = [];
+        S.muzzleFlashes = [];
+        S.scorches = [];
+        S.shootingStars = [];
+        S.chromatic = 0;
         S.emp = 1;
         S.empCd = 0;
         S.shake = 0;
@@ -1951,6 +1968,8 @@
         S.weather.mode = 'clear';
         S.weather.intensity = .15;
         S.weather.wind = rand(-40, 40);
+        S.weather.bolts = [];
+        S.gameOverTime = 0;
         S.debug.sessionStartedAt = new Date().toISOString();
         S.debug.currentWave = null;
         S.debug.waveSeq = 0;
@@ -2516,6 +2535,8 @@
           cooldown: round3(c.cool)
         });
         audio.launch(c.x / S.w);
+        const launchAngle = Math.atan2(y - c.y, tx - c.x);
+        spawnMuzzleFlash(c.x, c.y, launchAngle);
         return true;
       }
 
@@ -2533,6 +2554,7 @@
         });
         S.shake = Math.max(S.shake, 20);
         S.flash = Math.max(S.flash, .32);
+        S.chromatic = Math.max(S.chromatic, 0.8);
         debugRecord('defense_emp', {
           x: round3(S.mouse.x),
           y: round3(S.mouse.y),
@@ -2733,6 +2755,41 @@
         });
       }
 
+      function spawnMuzzleFlash(x, y, angle) {
+        S.muzzleFlashes.push({
+          x, y,
+          angle: angle ?? -Math.PI / 2,
+          life: 0.18,
+          el: 0,
+          size: rand(18, 32),
+          bright: rand(0.7, 1.0)
+        });
+        // small smoke puff at launch point
+        for (let i = 0; i < 3; i++) {
+          S.smoke.push({
+            x: x + rand(-6, 6),
+            y: y + rand(-4, 4),
+            br: rand(6, 14),
+            dr: rand(-12, 12),
+            rise: rand(12, 28),
+            life: rand(0.8, 1.6),
+            el: 0,
+            a: rand(0.12, 0.28)
+          });
+        }
+      }
+
+      function spawnScorch(x, y) {
+        S.scorches.push({
+          x, y,
+          r: rand(12, 28),
+          life: rand(6, 12),
+          el: 0,
+          alpha: rand(0.3, 0.55)
+        });
+        if (S.scorches.length > 40) S.scorches.shift();
+      }
+
       function spawnPhalanxTracer(x, y, tx, ty) {
         const a = Math.atan2(ty - y, tx - x) + rand(-.035, .035),
           sp = rand(980, 1320),
@@ -2765,8 +2822,10 @@
           flash: .22
         });
         spawnSmoke(x, y - 8, 14, 1.2);
+        spawnScorch(x, S.groundY);
         S.shake = Math.max(S.shake, 14);
         S.flash = Math.max(S.flash, .18);
+        S.chromatic = Math.max(S.chromatic, 0.4);
         debugInc('assetsLost', 'cities');
         debugRecord('asset_destroyed', {
           asset: 'city',
@@ -3911,6 +3970,14 @@
         if (p.audioT > 0) p.audioT = Math.max(0, p.audioT - dt);
         if (p.cool > 0) p.cool = Math.max(0, p.cool - dt * phalanxCdMult);
         if (p.heat > 0) p.heat = Math.max(0, p.heat - dt * 1.25 * phalanxCdMult);
+        // Barrel spin: slow idle rotation, fast spin when firing
+        if (p.spinSpeed == null) p.spinSpeed = 1.5;
+        if (p.spinAngle == null) p.spinAngle = 0;
+        const firing = (p.fireMix || 0) > 0.01 || p.heat > 0.01;
+        const targetSpin = firing ? (10 + (p.fireMix || 0) * 18) : 1.5; // rad/sec — always spinning
+        const ramp = firing ? 10 : 1.8;
+        p.spinSpeed += (targetSpin - p.spinSpeed) * Math.min(1, dt * ramp);
+        p.spinAngle = (p.spinAngle + p.spinSpeed * dt) % TAU;
         if (S.intro || S.gameOver || p.destroyed) {
           p.target = null;
           p.targetKind = null;
@@ -3989,8 +4056,10 @@
           shots++;
           if (!best || !targetAlive(best.k, best.o)) break;
           const o = best.o,
-            srcX = p.x,
-            srcY = p.y - 53,
+            pivotY = p.y - (S.theme === 'modern' ? 78 : S.theme === 'recharged' ? 55 : 45),
+            muzzleDist = (S.theme === 'modern' ? 48 : S.theme === 'recharged' ? 46 : 49),
+            srcX = p.x + Math.cos(p.aimAng) * muzzleDist,
+            srcY = pivotY + Math.sin(p.aimAng) * muzzleDist,
             aimQuality = clamp(1 - p.aimErr / .18, 0, 1),
             spread = best.k === 'enemy' ? (4 + (1 - aimQuality) * 8 + clamp(best.dist / fireRange - .55, 0, .9) * 5) : (5 + (1 - aimQuality) * 5),
             tx = p.aimX + rand(-spread, spread),
@@ -4202,6 +4271,7 @@
           heavy: inferHeavy
         });
         spawnSmoke(x, y - 6, inferHeavy ? 18 : m.v === 'drone' ? 7 : 10, inferHeavy ? 1.35 : m.v === 'drone' ? .75 : 1);
+        if (y >= S.groundY - 20) spawnScorch(x, S.groundY);
         destroyTarget(m.payload, x, y, m.blast);
         splashHellRaiser(x, y, m.blast, m.v === 'drone' ? .45 : .62);
       }
@@ -4391,6 +4461,55 @@
         }
       }
 
+      function updMuzzleFlashes(dt) {
+        for (let i = S.muzzleFlashes.length - 1; i >= 0; i--) {
+          const m = S.muzzleFlashes[i];
+          m.el += dt;
+          if (m.el >= m.life) {
+            S.muzzleFlashes.splice(i, 1);
+          }
+        }
+      }
+
+      function updScorches(dt) {
+        for (let i = S.scorches.length - 1; i >= 0; i--) {
+          const s = S.scorches[i];
+          s.el += dt;
+          if (s.el >= s.life) {
+            S.scorches.splice(i, 1);
+          }
+        }
+      }
+
+      function updShootingStars(dt) {
+        for (let i = S.shootingStars.length - 1; i >= 0; i--) {
+          const s = S.shootingStars[i];
+          s.el += dt;
+          s.x += s.vx * dt;
+          s.y += s.vy * dt;
+          if (s.el >= s.life || s.y > S.horizonY) {
+            S.shootingStars.splice(i, 1);
+          }
+        }
+        // spawn new shooting stars at night
+        const light = skyCycle();
+        if (light.day < 0.3 && S.shootingStars.length < 2 && Math.random() < dt * 0.04) {
+          const sx = rand(S.w * 0.1, S.w * 0.9);
+          const sy = rand(20, S.horizonY * 0.4);
+          const ang = rand(0.2, 0.8);
+          const speed = rand(400, 800);
+          S.shootingStars.push({
+            x: sx, y: sy,
+            vx: Math.cos(ang) * speed,
+            vy: Math.sin(ang) * speed,
+            life: rand(0.4, 0.9),
+            el: 0,
+            bright: rand(0.5, 1.0),
+            trail: []
+          });
+        }
+      }
+
       function updWeather(dt) {
         const w = S.weather;
         if (!w || !w.particles) return;
@@ -4410,12 +4529,44 @@
           if (w.lightningT <= 0) {
             S.flash = Math.max(S.flash, .08 + w.intensity * .18);
             w.lightningT = rand(2.4, 6.6) - w.intensity * 1.9;
+            // Spawn a visible lightning bolt
+            const bx = rand(S.w * 0.05, S.w * 0.95);
+            const segments = [];
+            let cx = bx, cy = 0;
+            const endY = S.horizonY + rand(-20, 40);
+            while (cy < endY) {
+              const nx = cx + rand(-28, 28);
+              const ny = cy + rand(18, 50);
+              segments.push({ x1: cx, y1: cy, x2: nx, y2: Math.min(ny, endY) });
+              cx = nx; cy = ny;
+            }
+            // add 1-2 branch forks
+            const branchCount = Math.floor(rand(1, 3));
+            for (let b = 0; b < branchCount && segments.length > 2; b++) {
+              const si = Math.floor(rand(1, segments.length - 1));
+              const src = segments[si];
+              let bx2 = src.x1, by2 = src.y1;
+              const bsegs = [];
+              for (let j = 0; j < Math.floor(rand(2, 5)); j++) {
+                const nx = bx2 + rand(-35, 35);
+                const ny = by2 + rand(14, 40);
+                bsegs.push({ x1: bx2, y1: by2, x2: nx, y2: ny, branch: true });
+                bx2 = nx; by2 = ny;
+              }
+              segments.push(...bsegs);
+            }
+            w.bolts.push({ segments, life: rand(0.12, 0.25), el: 0, bright: rand(0.7, 1.0) });
             if (audio.thunder && w.thunderCd <= 0) {
               audio.thunder(rand(.15, .85), .45 + w.intensity * .55);
               w.thunderCd = rand(1.3, 2.7);
             }
           }
           if (w.thunderCd > 0) w.thunderCd = Math.max(0, w.thunderCd - dt);
+          // update bolt lifetimes
+          for (let i = w.bolts.length - 1; i >= 0; i--) {
+            w.bolts[i].el += dt;
+            if (w.bolts[i].el >= w.bolts[i].life) w.bolts.splice(i, 1);
+          }
         }
       }
 
@@ -4610,7 +4761,7 @@
         if (S.floatingTexts && S.floatingTexts.length) {
           for (let i = S.floatingTexts.length - 1; i >= 0; i--) {
             S.floatingTexts[i].life -= dt;
-            S.floatingTexts[i].y -= dt * 25;
+            S.floatingTexts[i].y -= dt * 38;
             if (S.floatingTexts[i].life <= 0) S.floatingTexts.splice(i, 1);
           }
         }
@@ -4702,6 +4853,10 @@
         updDebris(dt);
         updShock(dt);
         updLightBursts(dt);
+        updMuzzleFlashes(dt);
+        updScorches(dt);
+        updShootingStars(dt);
+        if (S.chromatic > 0) S.chromatic = Math.max(0, S.chromatic - dt * 1.8);
         collisions();
         if (S.auto && !S.intro && !S.shop) runAuto();
         if (!S.intro && !S.shop && S.spawnI >= S.wavePlan.length && S.enemy.length === 0 && S.ufo.length === 0 && S.raiders.length === 0 && S.expl.length === 0 && S.debris.length === 0 && S.shock.length === 0) {
@@ -4727,6 +4882,7 @@
         }
         const alive = S.cities.filter(c => c.alive).length;
         if (alive <= 0) {
+          if (!S.gameOver) S.gameOverTime = 0;
           S.gameOver = true;
           debugFinalizeWave('game_over', {
             score: S.score
@@ -4737,6 +4893,7 @@
           }
           note('Defense grid collapsed', 2.2);
         }
+        if (S.gameOver && S.gameOverTime !== undefined) S.gameOverTime += dt;
         updateDanger();
         const phAudio = phalanxAudioTelemetry();
         audio.update({
@@ -5273,10 +5430,15 @@
             ctx.lineTo(b.w, -b.h);
             ctx.fill();
 
-            // Simplified Windows
+            // Simplified Windows (stable - no per-frame random)
             ctx.fillStyle = '#ffcc00';
-            for (const w of b.wins) {
-              if (Math.random() > 0.3) {
+            for (let wi = 0; wi < b.wins.length; wi++) {
+              const w = b.wins[wi];
+              // Use window index to create stable on/off pattern
+              const hash = ((b.x0 * 7 + wi * 13 + w.x * 3 + w.y * 11) & 0xff) / 255;
+              // Slowly cycle some windows using time, but smoothly
+              const cycle = Math.sin(S.time * 0.3 + hash * TAU);
+              if (hash > 0.3 || cycle > 0.6) {
                 ctx.fillRect(w.x, -b.h + w.y, w.w, w.h);
               }
             }
@@ -5586,6 +5748,127 @@
                 ctx.fillRect(-10 + (i % 2) * 12, -15 + Math.floor(i / 2) * 8, 8, 4);
               }
             }
+
+            // Xbox radar dish (horizontal spinning)
+            ctx.save();
+            ctx.translate(22, -32);
+            const xRot = (S.time * 2.2 + b.x) % TAU;
+            const xrc = Math.cos(xRot);
+            const xrs = Math.sin(xRot);
+            const xR = 10;
+            const xD = 5;
+            const xPN = 16;
+            // short mast
+            ctx.fillStyle = '#5a6a5a';
+            ctx.fillRect(-1.5, -10, 3, 10);
+            // pivot
+            ctx.fillStyle = '#7a8a7a';
+            ctx.beginPath();
+            ctx.ellipse(0, -10, 3, 2.2, 0, 0, TAU);
+            ctx.fill();
+            // dish assembly
+            ctx.save();
+            ctx.translate(0, -11);
+            const xEffRim = Math.max(1.5, Math.abs(xrc) * xR);
+            const xFront = xrc > 0;
+            const xBow = xrs * xD * 0.45;
+            // Helper: bowed rim for xbox
+            function xBowedRim(w, h, bow) {
+              ctx.beginPath();
+              for (let i = 0; i <= xPN; i++) {
+                const a = TAU * i / xPN;
+                const ca = Math.cos(a), sa = Math.sin(a);
+                const x = ca * w + bow * ca * ca;
+                const y = sa * h;
+                if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+              }
+              ctx.closePath();
+            }
+            // Body: bowed rim front + parabolic back
+            ctx.beginPath();
+            for (let i = 0; i <= xPN; i++) {
+              const a = -Math.PI / 2 + Math.PI * i / xPN;
+              const ca = Math.cos(a), sa = Math.sin(a);
+              const x = ca * xEffRim + xBow * ca * ca;
+              const y = sa * xR;
+              if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+            }
+            for (let i = xPN; i >= 0; i--) {
+              const f = -1 + 2 * i / xPN;
+              const y = f * xR;
+              const x = -xrs * xD * (1 - f * f);
+              ctx.lineTo(x, y);
+            }
+            ctx.closePath();
+            ctx.fillStyle = xFront ? '#3a4a3a' : '#282e28';
+            ctx.fill();
+            // Rim face (bowed)
+            ctx.fillStyle = xFront ? 'rgba(100,120,100,.74)' : 'rgba(55,65,55,.8)';
+            xBowedRim(xEffRim, xR, xBow);
+            ctx.fill();
+            // Front: concave face
+            if (xFront && xrc > 0.15) {
+              ctx.fillStyle = `rgba(140,165,140,${xrc * 0.24})`;
+              xBowedRim(xEffRim - 1, xR - 1.5, xBow * 0.8);
+              ctx.fill();
+            }
+            // Back: X-brace
+            if (!xFront && Math.abs(xrc) > 0.15) {
+              const xbv = Math.abs(xrc);
+              ctx.strokeStyle = `rgba(80,95,80,${xbv * 0.5})`;
+              ctx.lineWidth = 1.2;
+              ctx.beginPath();
+              ctx.moveTo(-xEffRim * 0.45 + xBow * 0.1, -xR * 0.45);
+              ctx.lineTo(xEffRim * 0.45 + xBow * 0.1, xR * 0.45);
+              ctx.moveTo(-xEffRim * 0.45 + xBow * 0.1, xR * 0.45);
+              ctx.lineTo(xEffRim * 0.45 + xBow * 0.1, -xR * 0.45);
+              ctx.stroke();
+            }
+            // Rim stroke (bowed) — bright front, dark back
+            if (xFront) {
+              ctx.strokeStyle = `rgba(138,154,138,${0.45 + xrc * 0.5})`;
+              ctx.lineWidth = 1.8;
+            } else {
+              ctx.strokeStyle = `rgba(60,70,60,${0.35 + Math.abs(xrc) * 0.3})`;
+              ctx.lineWidth = 1.4;
+            }
+            xBowedRim(xEffRim, xR, xBow);
+            ctx.stroke();
+            // Tracking indicator light
+            const xiA = Math.PI * 0.3;
+            const xiCa = Math.cos(xiA);
+            const xiY = xR * Math.sin(xiA);
+            const xiX = xiCa * xEffRim + xBow * xiCa * xiCa;
+            if (Math.sin(xiA) * xrs < 0) {
+              ctx.fillStyle = 'rgba(255,80,50,.8)';
+              ctx.beginPath();
+              ctx.arc(xiX, xiY, 1.0, 0, TAU);
+              ctx.fill();
+            }
+            // Feed horn — foreshortens and hides behind dish
+            {
+              const xhVis = Math.max(0, Math.min(1, (xrc + 0.15) / 0.5));
+              if (xhVis > 0.01) {
+                const xArmExt = Math.abs(xrs);
+                const xhX = xrs * (xD * 1.3 + 2);
+                const xhR = 0.8 + xArmExt * 1.2;
+                ctx.strokeStyle = `rgba(100,120,100,${(0.2 + xArmExt * 0.3) * xhVis})`;
+                ctx.lineWidth = 0.8;
+                ctx.beginPath();
+                ctx.moveTo(0, -xR * 0.5);
+                ctx.lineTo(xhX, 0);
+                ctx.moveTo(0, xR * 0.5);
+                ctx.lineTo(xhX, 0);
+                ctx.stroke();
+                ctx.fillStyle = `rgba(138,154,138,${(0.5 + xArmExt * 0.5) * xhVis})`;
+                ctx.beginPath();
+                ctx.arc(xhX, 0, xhR, 0, TAU);
+                ctx.fill();
+              }
+            }
+            ctx.restore(); // dish
+            ctx.restore(); // radar
+
             ctx.restore();
             continue;
           }
@@ -5694,22 +5977,207 @@
             ctx.fillRect(i, -59, 2, 6);
           }
 
-          // Spinning Radar Dish on side
+          // Spinning Radar Dish on side (horizontal rotation)
           ctx.save();
-          ctx.translate(28, -6);
+          ctx.translate(30, -16);
           const rRot = (S.time * 2.5 + b.x) % TAU;
-          ctx.fillStyle = 'rgba(60,70,85,.98)';
-          ctx.fillRect(-2, -18, 4, 18);
-          ctx.rotate(rRot);
-          ctx.fillStyle = 'rgba(140,160,190,.9)';
+          const rc = Math.cos(rRot);
+          const rs = Math.sin(rRot);
+          const R = 14;           // dish vertical radius
+          const D = 7;            // parabolic bowl depth
+          const mastH = 22;
+          const PN = 20;          // path resolution
+
+          // --- Mast / pole ---
+          ctx.fillStyle = 'rgba(60,72,95,.98)';
+          ctx.fillRect(-2, -mastH, 4, mastH);
+          ctx.fillStyle = 'rgba(100,120,155,.45)';
+          ctx.fillRect(-2, -mastH + 4, 4, 1.2);
+          ctx.fillRect(-2, -mastH + 10, 4, 1.2);
+
+          // --- Pivot hub ---
+          ctx.fillStyle = 'rgba(90,100,125,.95)';
           ctx.beginPath();
-          ctx.arc(0, 0, 8, Math.PI, TAU);
+          ctx.ellipse(0, -mastH, 4, 3, 0, 0, TAU);
           ctx.fill();
-          ctx.fillStyle = 'rgba(40,45,60,.9)';
+          ctx.strokeStyle = 'rgba(140,155,185,.45)';
+          ctx.lineWidth = 0.8;
+          ctx.stroke();
+
+          // --- Dish assembly ---
+          ctx.save();
+          ctx.translate(0, -mastH - 1);
+
+          // Projected rim width (always positive)
+          const effRim = Math.max(1.8, Math.abs(rc) * R);
+          const facingFront = rc > 0;
+          // Rim bow: parabolic concavity visible especially when edge-on
+          const rimBow = rs * D * 0.45;
+
+          // Helper: draw a bowed rim path (closed loop)
+          // Each point's x = cos(a)*w + rimBow*(1 - sin²(a)) = cos(a)*w + rimBow*cos²(a)
+          // This makes the rim curve inward on the concave side
+          function bowedRimPath(w, h, bow) {
+            ctx.beginPath();
+            for (let i = 0; i <= PN; i++) {
+              const a = TAU * i / PN;
+              const ca = Math.cos(a), sa = Math.sin(a);
+              const x = ca * w + bow * ca * ca;
+              const y = sa * h;
+              if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+            }
+            ctx.closePath();
+          }
+
+          // A) Dish body: bowed rim front edge + parabolic back curve
           ctx.beginPath();
-          ctx.ellipse(0, 0, 8, 3, 0, 0, TAU);
+          // Front edge: bowed rim from top to bottom
+          for (let i = 0; i <= PN; i++) {
+            const a = -Math.PI / 2 + Math.PI * i / PN; // -PI/2 to PI/2
+            const ca = Math.cos(a), sa = Math.sin(a);
+            const x = ca * effRim + rimBow * ca * ca;
+            const y = sa * R;
+            if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+          }
+          // Back edge: parabolic curve from bottom back to top
+          for (let i = PN; i >= 0; i--) {
+            const f = -1 + 2 * i / PN;
+            const y = f * R;
+            const x = -rs * D * (1 - f * f);
+            ctx.lineTo(x, y);
+          }
+          ctx.closePath();
+          ctx.fillStyle = facingFront ? 'rgba(45,55,75,.9)' : 'rgba(30,35,50,.95)';
           ctx.fill();
-          ctx.restore();
+
+          // Back curve highlight stroke
+          if (Math.abs(rs) > 0.25) {
+            ctx.strokeStyle = 'rgba(95,110,140,.45)';
+            ctx.lineWidth = 0.8;
+            ctx.beginPath();
+            for (let i = 0; i <= PN; i++) {
+              const f = -1 + 2 * i / PN;
+              const y = f * R;
+              const x = -rs * D * (1 - f * f);
+              if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+            }
+            ctx.stroke();
+          }
+
+          // B) Rim face fill (bowed) — front vs back colors
+          ctx.fillStyle = facingFront ? 'rgba(95,115,150,.82)' : 'rgba(50,55,68,.85)';
+          bowedRimPath(effRim, R, rimBow);
+          ctx.fill();
+
+          // C) Front: concave gradient + rings
+          if (facingFront && rc > 0.15) {
+            const fg = ctx.createRadialGradient(rimBow * 0.3, 0, 0, 0, 0, R * 0.9);
+            fg.addColorStop(0, `rgba(160,200,245,${0.1 + rc * 0.22})`);
+            fg.addColorStop(0.5, `rgba(110,145,195,${0.05 + rc * 0.12})`);
+            fg.addColorStop(1, 'rgba(70,90,130,0)');
+            ctx.fillStyle = fg;
+            bowedRimPath(effRim - 1, R - 1.5, rimBow * 0.8);
+            ctx.fill();
+            ctx.strokeStyle = `rgba(150,180,220,${rc * 0.16})`;
+            ctx.lineWidth = 0.5;
+            for (let ring = 1; ring <= 2; ring++) {
+              const s = ring / 3;
+              bowedRimPath(effRim * s, R * s, rimBow * s);
+              ctx.stroke();
+            }
+          }
+
+          // D) Back: structural X-brace + center hub
+          if (!facingFront && Math.abs(rc) > 0.15) {
+            const bv = Math.abs(rc);
+            ctx.strokeStyle = `rgba(90,100,125,${bv * 0.55})`;
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            ctx.moveTo(-effRim * 0.5 + rimBow * 0.12, -R * 0.5);
+            ctx.lineTo(effRim * 0.5 + rimBow * 0.12, R * 0.5);
+            ctx.moveTo(-effRim * 0.5 + rimBow * 0.12, R * 0.5);
+            ctx.lineTo(effRim * 0.5 + rimBow * 0.12, -R * 0.5);
+            ctx.stroke();
+            ctx.fillStyle = `rgba(75,85,110,${bv * 0.6})`;
+            ctx.beginPath();
+            ctx.ellipse(rimBow * 0.15, 0, effRim * 0.14 + 1, R * 0.14 + 1, 0, 0, TAU);
+            ctx.fill();
+          }
+
+          // E) Rim stroke (bowed) — bright when facing, dark when showing back
+          if (facingFront) {
+            ctx.strokeStyle = `rgba(170,185,215,${0.45 + rc * 0.5})`;
+            ctx.lineWidth = 2.0;
+            bowedRimPath(effRim, R, rimBow);
+            ctx.stroke();
+            // Outer glow only when front-facing
+            ctx.strokeStyle = `rgba(210,225,245,${rc * 0.22})`;
+            ctx.lineWidth = 0.7;
+            bowedRimPath(effRim + 0.8, R + 0.8, rimBow);
+            ctx.stroke();
+          } else {
+            ctx.strokeStyle = `rgba(70,80,100,${0.35 + Math.abs(rc) * 0.3})`;
+            ctx.lineWidth = 1.6;
+            bowedRimPath(effRim, R, rimBow);
+            ctx.stroke();
+          }
+
+          // F) Tracking indicator light on rim
+          const indAlpha = Math.PI * 0.3;
+          const indCa = Math.cos(indAlpha);
+          const indRimY = R * Math.sin(indAlpha);
+          const indRimX = indCa * effRim + rimBow * indCa * indCa;
+          const indDepth = Math.sin(indAlpha) * rs;
+          if (indDepth < 0) {
+            const ip = 0.6 + 0.4 * Math.sin(S.time * 6);
+            ctx.fillStyle = `rgba(255,60,60,${ip * 0.85})`;
+            ctx.beginPath();
+            ctx.arc(indRimX, indRimY, 1.3, 0, TAU);
+            ctx.fill();
+            ctx.fillStyle = `rgba(255,100,100,${ip * 0.18})`;
+            ctx.beginPath();
+            ctx.arc(indRimX, indRimY, 3.5, 0, TAU);
+            ctx.fill();
+          }
+
+          // G) Feed horn + support struts — foreshortens and hides behind dish
+          {
+            // hornVis: 1 when fully in front, fades to 0 as it goes behind
+            const hornVis = Math.max(0, Math.min(1, (rc + 0.15) / 0.5));
+            if (hornVis > 0.01) {
+              const hornDist = D * 1.4 + 3;
+              const hornX = rs * hornDist;
+              const armExt = Math.abs(rs);
+              const hornR = 1.2 + armExt * 1.8;
+              // Struts
+              ctx.strokeStyle = `rgba(130,145,175,${(0.25 + armExt * 0.35) * hornVis})`;
+              ctx.lineWidth = 1.0;
+              ctx.beginPath();
+              ctx.moveTo(0, -R * 0.55);
+              ctx.lineTo(hornX, 0);
+              ctx.moveTo(0, R * 0.55);
+              ctx.lineTo(hornX, 0);
+              ctx.stroke();
+              // Horn housing
+              ctx.fillStyle = `rgba(110,130,165,${(0.55 + armExt * 0.4) * hornVis})`;
+              ctx.beginPath();
+              ctx.arc(hornX, 0, hornR, 0, TAU);
+              ctx.fill();
+              // Signal pulse
+              const radarPulse = 0.4 + Math.sin(S.time * 8 + b.x * 0.1) * 0.4;
+              ctx.fillStyle = `rgba(100,200,255,${(0.4 + radarPulse * 0.3) * hornVis})`;
+              ctx.beginPath();
+              ctx.arc(hornX, 0, hornR * 0.55, 0, TAU);
+              ctx.fill();
+              ctx.fillStyle = `rgba(100,200,255,${radarPulse * 0.12 * hornVis})`;
+              ctx.beginPath();
+              ctx.arc(hornX, 0, hornR + 3, 0, TAU);
+              ctx.fill();
+            }
+          }
+
+          ctx.restore(); // dish assembly
+          ctx.restore(); // radar position
 
           // Ammo Counter floating UI
           ctx.fillStyle = `rgba(100,220,255,${.3 + pulse * .5})`;
@@ -5833,7 +6301,8 @@
         }
 
         const ang = isFinite(p.aimAng) ? p.aimAng : -Math.PI * .5,
-          heat = p.heat || 0,
+          heat = Math.max(p.heat || 0, p.fireMix || 0),
+          spin = p.spinAngle || 0,
           lock = p.target ? 1 : 0,
           pulse = .38 + .62 * Math.max(0, Math.sin(S.time * 8.5 + p.x * .01));
 
@@ -5858,11 +6327,10 @@
           ctx.rotate(ang);
 
           ctx.fillStyle = '#000';
-          ctx.fillRect(-12, -10, 24, 20);
-          ctx.strokeRect(-12, -10, 24, 20);
+          ctx.fillRect(-12, -12, 24, 24);
+          ctx.strokeRect(-12, -12, 24, 24);
 
-          drawPlasmaBarrel(ctx, heat, 12, -4);
-          drawPlasmaBarrel(ctx, heat, 12, 4);
+          drawGatlingAssembly(ctx, heat, 12, 0, spin, 6);
 
           ctx.fillStyle = lock ? '#ff4040' : '#40ffff';
           ctx.shadowBlur = 10;
@@ -5900,8 +6368,7 @@
           ctx.fillStyle = '#4a5a4a';
           ctx.fillRect(-15, -15, 30, 30);
 
-          drawPlasmaBarrel(ctx, heat, 15, -6);
-          drawPlasmaBarrel(ctx, heat, 15, 6);
+          drawGatlingAssembly(ctx, heat, 15, 0, spin, 6);
 
           ctx.restore();
 
@@ -6007,7 +6474,7 @@
         ctx.translate(0, -78);
         ctx.rotate(ang);
 
-        // Cradle holding the barrels
+        // Cradle holding the barrel assembly
         const cradle = ctx.createLinearGradient(-20, -15, 20, 15);
         cradle.addColorStop(0, 'rgba(60,75,95,.98)');
         cradle.addColorStop(.5, 'rgba(140,160,185,.98)');
@@ -6016,11 +6483,15 @@
         ctx.fillRect(-18, -14, 38, 28);
 
         ctx.fillStyle = 'rgba(30,40,50,.9)';
-        ctx.fillRect(-10, -10, 26, 20); // Inner recess
+        ctx.fillRect(-10, -12, 26, 24); // Inner recess (round opening)
+        // Circular barrel port
+        ctx.fillStyle = 'rgba(20,25,35,.95)';
+        ctx.beginPath();
+        ctx.ellipse(4, 0, 11, 11, 0, 0, TAU);
+        ctx.fill();
 
-        // Dual Plasma Barrels
-        drawPlasmaBarrel(ctx, heat, 14, -7); // Top barrel
-        drawPlasmaBarrel(ctx, heat, 14, 7);  // Bottom barrel
+        // Gatling barrel assembly
+        drawGatlingAssembly(ctx, heat, 14, 0, spin, 6);
 
         // Targeting Optics Lens
         ctx.fillStyle = 'rgba(20,30,40,.9)';
@@ -6054,66 +6525,256 @@
         S.phalanx = phalanxes[0] ?? null;
       }
 
-      function drawPlasmaBarrel(ctx, heat, ox, oy) {
-        // Recoil logic based on heat/firing
-        const recoil = heat > 0 ? (Math.random() * 4 * heat) : 0;
-        const x = ox - recoil;
+      // Draw a rotating Gatling barrel assembly (like a real Phalanx CIWS)
+      // ox,oy = mount point offset, spinAngle = current barrel rotation, numBarrels = barrel count
+      function drawGatlingAssembly(ctx, heat, ox, oy, spinAngle, numBarrels) {
+        numBarrels = numBarrels || 6;
+        spinAngle = spinAngle || 0;
+        const recoil = heat > 0.05 ? (Math.random() * 3 * heat) : 0;
+        const bx = ox - recoil;             // barrel assembly origin X
+        const barrelLen = 34;               // barrel length
+        const assemblyR = 10;              // cluster radius — big enough to see rotation
+        // Alternating barrel tint indices for tracking rotation
+        const barrelTints = [0, 1, 0, 1, 0, 1]; // even=dark, odd=light
 
         if (S.theme === 'recharged') {
+          // Neon wireframe Gatling
+          // Barrel shroud outline
           ctx.strokeStyle = '#00ffff';
           ctx.lineWidth = 1;
-          ctx.strokeRect(x, oy - 4, 30, 8);
+          ctx.strokeRect(bx - 2, oy - 12, barrelLen + 6, 24);
 
+          // Rotating hub disc at breech end — visible spin indicator
+          ctx.save();
+          ctx.translate(bx, oy);
+          ctx.strokeStyle = 'rgba(0,255,255,0.8)';
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.arc(0, 0, assemblyR * 0.7, 0, TAU);
+          ctx.stroke();
+          // Hub spokes — rotate with barrels
+          for (let i = 0; i < numBarrels; i++) {
+            const a = spinAngle + i * TAU / numBarrels;
+            const bright = (i % 2 === 0) ? 1.0 : 0.45;
+            ctx.strokeStyle = `rgba(0,255,255,${bright})`;
+            ctx.lineWidth = (i % 2 === 0) ? 1.5 : 0.8;
+            ctx.beginPath();
+            ctx.moveTo(0, 0);
+            ctx.lineTo(Math.cos(a) * assemblyR * 0.7 * 0.3, Math.sin(a) * assemblyR * 0.7);
+            ctx.stroke();
+          }
+          ctx.restore();
+
+          // Individual barrels as lines — alternating brightness
+          for (let i = 0; i < numBarrels; i++) {
+            const a = spinAngle + i * TAU / numBarrels;
+            const by = oy + Math.sin(a) * assemblyR * 0.7;
+            const depth = Math.cos(a);
+            const tint = (i % 2 === 0) ? 255 : 120;
+            ctx.strokeStyle = `rgba(0,${tint},${tint},${0.25 + depth * 0.45})`;
+            ctx.lineWidth = depth > 0 ? 2.0 : 0.7;
+            ctx.beginPath();
+            ctx.moveTo(bx + 2, by);
+            ctx.lineTo(bx + barrelLen, by);
+            ctx.stroke();
+            // Band mark at barrel midpoint for tracking
+            if (depth > -0.3) {
+              ctx.strokeStyle = (i % 2 === 0) ? 'rgba(255,255,0,0.7)' : 'rgba(0,255,255,0.5)';
+              ctx.lineWidth = 2;
+              ctx.beginPath();
+              ctx.moveTo(bx + barrelLen * 0.55, by - 1.5);
+              ctx.lineTo(bx + barrelLen * 0.55, by + 1.5);
+              ctx.stroke();
+            }
+          }
           if (heat > 0.05) {
-            ctx.fillStyle = `rgba(0,255,255,${heat})`;
-            ctx.fillRect(x + 4, oy - 2, 26, 4);
-            ctx.shadowBlur = 10 * heat;
+            ctx.fillStyle = `rgba(0,255,255,${heat * 0.7})`;
+            ctx.shadowBlur = 12 * heat;
             ctx.shadowColor = '#00ffff';
-            ctx.fillRect(x + 20, oy - 1, 10, 2);
+            ctx.beginPath();
+            ctx.arc(bx + barrelLen + 2, oy, 3 + heat * 3, 0, TAU);
+            ctx.fill();
             ctx.shadowBlur = 0;
           }
           return;
         }
 
         if (S.theme === 'xbox') {
+          // Boxy desert military Gatling
+          // Outer shroud
+          ctx.fillStyle = '#4a5a4a';
+          ctx.fillRect(bx - 3, oy - 11, barrelLen + 8, 22);
           ctx.fillStyle = '#3a4a3a';
-          ctx.fillRect(x, oy - 5, 30, 10);
-          ctx.fillStyle = '#2a3a2a';
-          ctx.fillRect(x + 4, oy - 3, 26, 6);
+          ctx.fillRect(bx, oy - 9, barrelLen + 2, 18);
 
+          // Rotating hub disc at breech — shows spin clearly
+          ctx.save();
+          ctx.translate(bx + 1, oy);
+          const hubR = assemblyR * 0.6;
+          ctx.fillStyle = '#2a3a2a';
+          ctx.beginPath();
+          ctx.arc(0, 0, hubR, 0, TAU);
+          ctx.fill();
+          ctx.strokeStyle = '#5a6a5a';
+          ctx.lineWidth = 0.8;
+          ctx.beginPath();
+          ctx.arc(0, 0, hubR, 0, TAU);
+          ctx.stroke();
+          // Spokes
+          for (let i = 0; i < numBarrels; i++) {
+            const a = spinAngle + i * TAU / numBarrels;
+            ctx.strokeStyle = (i % 2 === 0) ? '#7a8a6a' : '#3a4a3a';
+            ctx.lineWidth = (i % 2 === 0) ? 1.5 : 0.8;
+            ctx.beginPath();
+            ctx.moveTo(0, 0);
+            ctx.lineTo(Math.cos(a) * hubR * 0.3, Math.sin(a) * hubR);
+            ctx.stroke();
+          }
+          ctx.restore();
+
+          // Barrels — alternating dark/light for rotation visibility
+          const xBarrels = [];
+          for (let i = 0; i < numBarrels; i++) {
+            const a = spinAngle + i * TAU / numBarrels;
+            xBarrels.push({ i, a, depth: Math.cos(a), by: oy + Math.sin(a) * assemblyR * 0.7 });
+          }
+          xBarrels.sort((a, b) => a.depth - b.depth);
+          for (const b of xBarrels) {
+            const dark = (b.i % 2 === 0);
+            const baseR = dark ? 30 : 50;
+            const baseG = dark ? 40 : 60;
+            const baseB = dark ? 30 : 45;
+            const bright = 0.7 + (b.depth + 1) * 0.15;
+            ctx.fillStyle = `rgba(${baseR * bright | 0},${baseG * bright | 0},${baseB * bright | 0},.95)`;
+            const bw = b.depth > 0 ? 3.2 : 1.8;
+            ctx.fillRect(bx + 4, b.by - bw / 2, barrelLen - 2, bw);
+            // Barrel band (clamp ring) at midpoint
+            if (b.depth > -0.4) {
+              ctx.fillStyle = dark ? '#6a7a5a' : '#4a5a4a';
+              ctx.fillRect(bx + barrelLen * 0.5, b.by - bw / 2 - 0.5, 3, bw + 1);
+            }
+          }
           if (heat > 0.05) {
-            ctx.fillStyle = `rgba(255,100,0,${heat})`;
-            ctx.fillRect(x + 4, oy - 2, 26, 4);
+            ctx.fillStyle = `rgba(255,120,30,${heat * 0.6})`;
+            ctx.beginPath();
+            ctx.arc(bx + barrelLen + 1, oy, 2 + heat * 3, 0, TAU);
+            ctx.fill();
           }
           return;
         }
 
-        // Outer Barrel Shielding
-        const shield = ctx.createLinearGradient(x, oy - 5, x, oy + 5);
-        shield.addColorStop(0, 'rgba(110,130,150,.98)');
-        shield.addColorStop(1, 'rgba(40,50,65,.98)');
-        ctx.fillStyle = shield;
-        ctx.fillRect(x, oy - 4.5, 28, 9);
+        // ── Modern detailed Gatling ──
 
-        // Inner Rail / Accelerator Plasma
-        ctx.fillStyle = 'rgba(20,25,35,.98)';
-        ctx.fillRect(x + 4, oy - 2.5, 26, 5);
+        // Barrel shroud (cylindrical housing) — tapered
+        const shroud = ctx.createLinearGradient(bx, oy - 12, bx, oy + 12);
+        shroud.addColorStop(0, 'rgba(100,115,135,.95)');
+        shroud.addColorStop(0.3, 'rgba(70,85,100,.98)');
+        shroud.addColorStop(0.7, 'rgba(50,60,75,.98)');
+        shroud.addColorStop(1, 'rgba(35,42,55,.95)');
+        ctx.fillStyle = shroud;
+        ctx.beginPath();
+        ctx.moveTo(bx - 4, oy - 13);
+        ctx.lineTo(bx + 8, oy - 11);
+        ctx.lineTo(bx + 8, oy + 11);
+        ctx.lineTo(bx - 4, oy + 13);
+        ctx.closePath();
+        ctx.fill();
 
-        // Plasma Glow
-        if (heat > 0.05) {
-          ctx.globalCompositeOperation = 'lighter';
-          ctx.fillStyle = `rgba(140,230,255,${heat * 0.8})`;
-          ctx.fillRect(x + 5, oy - 1.5, 25, 3);
-          ctx.shadowBlur = 12 * heat;
-          ctx.shadowColor = 'rgba(120,220,255,1)';
-          ctx.fillRect(x + 8, oy - 1, 20, 2);
-          ctx.shadowBlur = 0;
-          ctx.globalCompositeOperation = 'source-over';
+        // Rotating hub disc at shroud face — the clearest spin indicator
+        ctx.save();
+        ctx.translate(bx + 7, oy);
+        const mHubR = assemblyR * 0.85;
+        // Hub ring
+        ctx.fillStyle = 'rgba(55,65,80,.97)';
+        ctx.beginPath();
+        ctx.ellipse(0, 0, 3, mHubR, 0, 0, TAU);
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(130,145,170,.5)';
+        ctx.lineWidth = 0.6;
+        ctx.beginPath();
+        ctx.ellipse(0, 0, 3, mHubR, 0, 0, TAU);
+        ctx.stroke();
+        // Spoke lines — alternate thick/bright for easy tracking
+        for (let i = 0; i < numBarrels; i++) {
+          const a = spinAngle + i * TAU / numBarrels;
+          const sy = Math.sin(a) * mHubR;
+          const sx = Math.cos(a) * 2.5; // foreshorten X for side view
+          const bright = (i % 2 === 0) ? 'rgba(180,195,220,.85)' : 'rgba(60,70,85,.7)';
+          ctx.strokeStyle = bright;
+          ctx.lineWidth = (i % 2 === 0) ? 1.6 : 0.7;
+          ctx.beginPath();
+          ctx.moveTo(0, 0);
+          ctx.lineTo(sx, sy);
+          ctx.stroke();
+        }
+        // Center dot
+        ctx.fillStyle = 'rgba(150,165,185,.9)';
+        ctx.beginPath();
+        ctx.arc(0, 0, 1.2, 0, TAU);
+        ctx.fill();
+        ctx.restore();
+
+        // Individual barrel tubes — depth-sorted, alternating colors
+        const barrels = [];
+        for (let i = 0; i < numBarrels; i++) {
+          const a = spinAngle + i * TAU / numBarrels;
+          barrels.push({ i, a, depth: Math.cos(a), by: oy + Math.sin(a) * assemblyR });
+        }
+        barrels.sort((a, b) => a.depth - b.depth); // back to front
+
+        for (const b of barrels) {
+          const bw = 1.4 + (b.depth + 1) * 1.0; // thinner when behind
+          const dark = (b.i % 2 === 0);
+          const base = dark ? 45 : 75;
+          const brightness = base + (b.depth + 1) * 35;
+          // Barrel tube — alternating tint so rotation is visible
+          ctx.fillStyle = `rgba(${brightness | 0},${(brightness + 8) | 0},${(brightness + 18) | 0},.95)`;
+          ctx.fillRect(bx + 8, b.by - bw / 2, barrelLen - 6, bw);
+          // Dark bore line
+          ctx.fillStyle = `rgba(15,20,30,${0.25 + (b.depth + 1) * 0.2})`;
+          ctx.fillRect(bx + 8, b.by - 0.3, barrelLen - 6, 0.6);
+          // Barrel clamp band at midpoint — gives rotation tracking reference
+          if (b.depth > -0.3) {
+            ctx.fillStyle = dark ? 'rgba(100,115,140,.8)' : 'rgba(60,70,90,.7)';
+            ctx.fillRect(bx + barrelLen * 0.48, b.by - bw / 2 - 0.4, 3, bw + 0.8);
+          }
         }
 
-        // Muzzle Break
-        ctx.fillStyle = 'rgba(60,75,90,.98)';
-        ctx.fillRect(x + 28, oy - 5.5, 6, 11);
+        // Muzzle ring
+        ctx.fillStyle = 'rgba(50,60,75,.96)';
+        ctx.beginPath();
+        ctx.ellipse(bx + barrelLen + 2, oy, 3, assemblyR + 2, 0, 0, TAU);
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(130,145,170,.6)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.ellipse(bx + barrelLen + 2, oy, 3, assemblyR + 2, 0, 0, TAU);
+        ctx.stroke();
+
+        // Muzzle flash when firing
+        if (heat > 0.05) {
+          ctx.save();
+          ctx.globalCompositeOperation = 'lighter';
+          const flashSize = 4 + heat * 8;
+          const fg = ctx.createRadialGradient(bx + barrelLen + 4, oy, 0, bx + barrelLen + 4, oy, flashSize);
+          fg.addColorStop(0, `rgba(200,240,255,${heat * 0.7})`);
+          fg.addColorStop(0.4, `rgba(120,200,255,${heat * 0.4})`);
+          fg.addColorStop(1, 'rgba(60,120,200,0)');
+          ctx.fillStyle = fg;
+          ctx.beginPath();
+          ctx.arc(bx + barrelLen + 4, oy, flashSize, 0, TAU);
+          ctx.fill();
+          ctx.restore();
+        }
+
+        // Heat glow on barrels
+        if (heat > 0.15) {
+          ctx.save();
+          ctx.globalCompositeOperation = 'lighter';
+          ctx.fillStyle = `rgba(140,200,255,${heat * 0.15})`;
+          ctx.fillRect(bx + 6, oy - assemblyR - 1, barrelLen - 4, assemblyR * 2 + 2);
+          ctx.restore();
+        }
       }
 
       function drawUfo() {
@@ -6952,15 +7613,33 @@
               g.addColorStop(.35, 'rgba(126,244,255,.7)');
               g.addColorStop(.75, 'rgba(70,175,255,.4)');
               g.addColorStop(1, 'rgba(32,78,152,0)');
+            } else if (S.theme === 'recharged') {
+              g.addColorStop(0, 'rgba(0,255,200,.98)');
+              g.addColorStop(.4, 'rgba(0,200,255,.65)');
+              g.addColorStop(1, 'rgba(0,60,80,0)');
+            } else if (S.theme === 'xbox') {
+              g.addColorStop(0, 'rgba(255,240,200,.98)');
+              g.addColorStop(.4, 'rgba(200,160,80,.65)');
+              g.addColorStop(1, 'rgba(120,60,20,0)');
             } else {
               g.addColorStop(0, 'rgba(196,255,255,.98)');
               g.addColorStop(.4, 'rgba(92,240,255,.65)');
               g.addColorStop(1, 'rgba(42,88,150,0)');
             }
           } else {
-            g.addColorStop(0, 'rgba(255,224,172,.98)');
-            g.addColorStop(.42, 'rgba(255,128,64,.65)');
-            g.addColorStop(1, 'rgba(90,25,15,0)');
+            if (S.theme === 'recharged') {
+              g.addColorStop(0, 'rgba(255,60,20,.98)');
+              g.addColorStop(.42, 'rgba(255,30,0,.65)');
+              g.addColorStop(1, 'rgba(80,0,0,0)');
+            } else if (S.theme === 'xbox') {
+              g.addColorStop(0, 'rgba(255,200,120,.98)');
+              g.addColorStop(.42, 'rgba(255,140,40,.65)');
+              g.addColorStop(1, 'rgba(100,40,10,0)');
+            } else {
+              g.addColorStop(0, 'rgba(255,224,172,.98)');
+              g.addColorStop(.42, 'rgba(255,128,64,.65)');
+              g.addColorStop(1, 'rgba(90,25,15,0)');
+            }
           }
           ctx.fillStyle = g;
           ctx.beginPath();
@@ -6969,8 +7648,11 @@
           const ringA = (1 - p) * .65;
           if (ringA > .02) {
             ctx.shadowBlur = 10;
-            ctx.shadowColor = e.emp ? 'rgba(132,240,255,1)' : e.player ? 'rgba(172,248,255,1)' : 'rgba(255,182,120,1)';
-            ctx.strokeStyle = e.emp ? `rgba(132,240,255,${ringA})` : e.player ? `rgba(172,248,255,${ringA})` : `rgba(255,182,120,${ringA})`;
+            const ringCol = e.emp ? 'rgba(132,240,255' :
+              e.player ? (S.theme === 'recharged' ? 'rgba(0,255,200' : S.theme === 'xbox' ? 'rgba(255,220,140' : 'rgba(172,248,255') :
+              (S.theme === 'recharged' ? 'rgba(255,60,20' : S.theme === 'xbox' ? 'rgba(255,180,80' : 'rgba(255,182,120');
+            ctx.shadowColor = ringCol + ',1)';
+            ctx.strokeStyle = ringCol + `,${ringA})`;
             ctx.lineWidth = e.emp ? 2.8 : 2.2;
             ctx.beginPath();
             ctx.arc(e.x, e.y, e.r * (1.05 + p * .35), 0, TAU);
@@ -7252,21 +7934,69 @@
         }
         ctx.save();
         ctx.translate(x, y);
-        ctx.strokeStyle = hot ? 'rgba(255,156,96,.82)' : 'rgba(130,236,255,.8)';
-        ctx.lineWidth = hot ? 1.8 : 1.4;
-        ctx.beginPath();
-        ctx.arc(0, 0, 14, 0, TAU);
-        ctx.stroke();
-        ctx.beginPath();
-        ctx.moveTo(-21, 0);
-        ctx.lineTo(-8, 0);
-        ctx.moveTo(8, 0);
-        ctx.lineTo(21, 0);
-        ctx.moveTo(0, -21);
-        ctx.lineTo(0, -8);
-        ctx.moveTo(0, 8);
-        ctx.lineTo(0, 21);
-        ctx.stroke();
+
+        if (S.theme === 'recharged') {
+          // Neon diamond crosshair
+          const pulse = 0.7 + Math.sin(S.time * 6) * 0.3;
+          ctx.strokeStyle = hot ? `rgba(255,0,100,${0.82 * pulse})` : `rgba(0,255,180,${0.8 * pulse})`;
+          ctx.lineWidth = hot ? 2.0 : 1.6;
+          ctx.shadowBlur = 8;
+          ctx.shadowColor = hot ? '#ff0064' : '#00ffb4';
+          ctx.beginPath();
+          ctx.moveTo(0, -16); ctx.lineTo(16, 0); ctx.lineTo(0, 16); ctx.lineTo(-16, 0); ctx.closePath();
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.moveTo(-22, 0); ctx.lineTo(-10, 0);
+          ctx.moveTo(10, 0); ctx.lineTo(22, 0);
+          ctx.moveTo(0, -22); ctx.lineTo(0, -10);
+          ctx.moveTo(0, 10); ctx.lineTo(0, 22);
+          ctx.stroke();
+          // center dot
+          ctx.fillStyle = hot ? '#ff0064' : '#00ffb4';
+          ctx.beginPath(); ctx.arc(0, 0, 1.5, 0, TAU); ctx.fill();
+          ctx.shadowBlur = 0;
+        } else if (S.theme === 'xbox') {
+          // Military bracket crosshair
+          ctx.strokeStyle = hot ? 'rgba(255,180,80,.85)' : 'rgba(180,220,140,.8)';
+          ctx.lineWidth = hot ? 2.0 : 1.6;
+          const sz = 16;
+          ctx.beginPath();
+          // corner brackets
+          ctx.moveTo(-sz, -sz + 5); ctx.lineTo(-sz, -sz); ctx.lineTo(-sz + 5, -sz);
+          ctx.moveTo(sz - 5, -sz); ctx.lineTo(sz, -sz); ctx.lineTo(sz, -sz + 5);
+          ctx.moveTo(sz, sz - 5); ctx.lineTo(sz, sz); ctx.lineTo(sz - 5, sz);
+          ctx.moveTo(-sz + 5, sz); ctx.lineTo(-sz, sz); ctx.lineTo(-sz, sz - 5);
+          ctx.stroke();
+          // thin cross
+          ctx.lineWidth = 1.0;
+          ctx.beginPath();
+          ctx.moveTo(-22, 0); ctx.lineTo(-6, 0);
+          ctx.moveTo(6, 0); ctx.lineTo(22, 0);
+          ctx.moveTo(0, -22); ctx.lineTo(0, -6);
+          ctx.moveTo(0, 6); ctx.lineTo(0, 22);
+          ctx.stroke();
+          // center pip
+          ctx.fillStyle = hot ? '#ffb450' : '#b4dc8c';
+          ctx.beginPath(); ctx.arc(0, 0, 1.8, 0, TAU); ctx.fill();
+        } else {
+          // Modern (default) crosshair
+          ctx.strokeStyle = hot ? 'rgba(255,156,96,.82)' : 'rgba(130,236,255,.8)';
+          ctx.lineWidth = hot ? 1.8 : 1.4;
+          ctx.beginPath();
+          ctx.arc(0, 0, 14, 0, TAU);
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.moveTo(-21, 0);
+          ctx.lineTo(-8, 0);
+          ctx.moveTo(8, 0);
+          ctx.lineTo(21, 0);
+          ctx.moveTo(0, -21);
+          ctx.lineTo(0, -8);
+          ctx.moveTo(0, 8);
+          ctx.lineTo(0, 21);
+          ctx.stroke();
+        }
+
         ctx.restore();
       }
 
@@ -7323,10 +8053,12 @@
           ctx.fillText(S.note, S.w * .5, S.h * .16);
         }
         if (S.intro) {
+          const fadeIn = clamp(S.time * 0.8, 0, 1); // smooth fade in
           const w = Math.min(S.w * .84, 860),
             h = Math.min(S.h * .44, 360),
             x = S.w * .5 - w * .5,
             y = S.h * .33;
+          ctx.globalAlpha = fadeIn;
           ctx.fillStyle = 'rgba(2,8,18,.72)';
           ctx.fillRect(x, y, w, h);
           ctx.strokeStyle = 'rgba(110,190,255,.45)';
@@ -7339,13 +8071,19 @@
           ctx.fillText('Use interceptors and EMP pulses to hold the line.', S.w * .5, y + 160);
           ctx.font = '600 17px "Orbitron","Trebuchet MS",sans-serif';
           ctx.fillText('LMB Fire   |   H Hell Raiser   |   C Toggle Auto Defense   |   E EMP Pulse   |   T Theme', S.w * .5, y + 222);
+          // pulsing "click to begin" text
+          const pulse = 0.5 + Math.sin(S.time * 3) * 0.5;
+          ctx.fillStyle = `rgba(214,239,255,${0.5 + pulse * 0.5})`;
           ctx.fillText('Click anywhere to begin', S.w * .5, y + 272);
+          ctx.globalAlpha = 1;
         }
         if (S.gameOver) {
+          const fadeIn = clamp(S.gameOverTime * 1.2, 0, 1);
           const w = Math.min(S.w * .62, 720),
             h = 220,
             x = S.w * .5 - w * .5,
             y = S.h * .37;
+          ctx.globalAlpha = fadeIn;
           ctx.fillStyle = 'rgba(8,5,9,.72)';
           ctx.fillRect(x, y, w, h);
           ctx.strokeStyle = 'rgba(255,128,106,.4)';
@@ -7357,7 +8095,10 @@
           ctx.fillText(`Final Score: ${S.score}`, S.w * .5, y + 112);
           ctx.font = '500 18px "Orbitron","Trebuchet MS",sans-serif';
           ctx.fillText(`Best Combo: x${Math.max(1, S.maxCombo)}`, S.w * .5, y + 146);
+          const pulse2 = 0.5 + Math.sin(S.time * 3) * 0.5;
+          ctx.fillStyle = `rgba(245,245,255,${0.5 + pulse2 * 0.5})`;
           ctx.fillText('Click to restart', S.w * .5, y + 182);
+          ctx.globalAlpha = 1;
         }
 
         if (S.shop && !S.gameOver) {
@@ -7424,6 +8165,137 @@
         ctx.restore();
       }
 
+      function drawMuzzleFlashes() {
+        if (!S.muzzleFlashes.length) return;
+        ctx.save();
+        ctx.globalCompositeOperation = 'lighter';
+        for (const m of S.muzzleFlashes) {
+          const p = m.el / m.life;
+          const a = (1 - p) * m.bright;
+          if (a <= 0.01) continue;
+          const sz = m.size * (0.5 + p * 0.5);
+          // bright core flash
+          const g = ctx.createRadialGradient(m.x, m.y, 0, m.x, m.y, sz);
+          if (S.theme === 'recharged') {
+            g.addColorStop(0, `rgba(0,255,200,${a})`);
+            g.addColorStop(0.4, `rgba(0,180,255,${a * 0.6})`);
+            g.addColorStop(1, 'rgba(0,60,120,0)');
+          } else {
+            g.addColorStop(0, `rgba(255,240,200,${a})`);
+            g.addColorStop(0.4, `rgba(255,180,100,${a * 0.6})`);
+            g.addColorStop(1, 'rgba(180,80,40,0)');
+          }
+          ctx.fillStyle = g;
+          ctx.beginPath();
+          ctx.arc(m.x, m.y, sz, 0, TAU);
+          ctx.fill();
+          // directional flare
+          ctx.save();
+          ctx.translate(m.x, m.y);
+          ctx.rotate(m.angle);
+          ctx.fillStyle = S.theme === 'recharged' ? `rgba(0,255,220,${a * 0.5})` : `rgba(255,220,160,${a * 0.5})`;
+          ctx.beginPath();
+          ctx.moveTo(0, -sz * 0.3);
+          ctx.lineTo(sz * 1.5, 0);
+          ctx.lineTo(0, sz * 0.3);
+          ctx.closePath();
+          ctx.fill();
+          ctx.restore();
+        }
+        ctx.restore();
+      }
+
+      function drawScorches() {
+        if (!S.scorches.length) return;
+        ctx.save();
+        for (const s of S.scorches) {
+          const p = s.el / s.life;
+          const a = s.alpha * (1 - p * 0.8); // slow fade
+          if (a <= 0.01) continue;
+          const g = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, s.r);
+          g.addColorStop(0, `rgba(20,15,10,${a})`);
+          g.addColorStop(0.5, `rgba(40,25,15,${a * 0.6})`);
+          g.addColorStop(1, 'rgba(30,20,10,0)');
+          ctx.fillStyle = g;
+          ctx.beginPath();
+          ctx.ellipse(s.x, s.y, s.r, s.r * 0.35, 0, 0, TAU);
+          ctx.fill();
+        }
+        ctx.restore();
+      }
+
+      function drawLightningBolts() {
+        const w = S.weather;
+        if (!w || !w.bolts || !w.bolts.length) return;
+        ctx.save();
+        ctx.globalCompositeOperation = 'lighter';
+        for (const bolt of w.bolts) {
+          const p = bolt.el / bolt.life;
+          const a = (1 - p) * bolt.bright;
+          if (a <= 0.02) continue;
+          // glow layer
+          ctx.strokeStyle = `rgba(180,200,255,${a * 0.3})`;
+          ctx.lineWidth = 6;
+          ctx.beginPath();
+          for (const seg of bolt.segments) {
+            ctx.moveTo(seg.x1, seg.y1);
+            ctx.lineTo(seg.x2, seg.y2);
+          }
+          ctx.stroke();
+          // main bolt - per-segment style
+          for (const seg of bolt.segments) {
+            ctx.lineWidth = seg.branch ? 1.2 : 2.5;
+            ctx.strokeStyle = seg.branch ? `rgba(180,200,255,${a * 0.5})` : `rgba(240,245,255,${a * 0.85})`;
+            ctx.beginPath();
+            ctx.moveTo(seg.x1, seg.y1);
+            ctx.lineTo(seg.x2, seg.y2);
+            ctx.stroke();
+          }
+          // bright core
+          ctx.strokeStyle = `rgba(255,255,255,${a * 0.9})`;
+          ctx.lineWidth = 1.0;
+          ctx.beginPath();
+          for (const seg of bolt.segments) {
+            if (seg.branch) continue;
+            ctx.moveTo(seg.x1, seg.y1);
+            ctx.lineTo(seg.x2, seg.y2);
+          }
+          ctx.stroke();
+        }
+        ctx.restore();
+      }
+
+      function drawShootingStars() {
+        if (!S.shootingStars.length) return;
+        ctx.save();
+        ctx.globalCompositeOperation = 'lighter';
+        for (const s of S.shootingStars) {
+          const p = s.el / s.life;
+          const a = s.bright * (p < 0.2 ? p / 0.2 : 1 - (p - 0.2) / 0.8);
+          if (a <= 0.01) continue;
+          // trail
+          const tailLen = 40 + s.bright * 30;
+          const ang = Math.atan2(s.vy, s.vx);
+          const tx = s.x - Math.cos(ang) * tailLen;
+          const ty = s.y - Math.sin(ang) * tailLen;
+          const g = ctx.createLinearGradient(tx, ty, s.x, s.y);
+          g.addColorStop(0, 'rgba(200,220,255,0)');
+          g.addColorStop(1, `rgba(220,240,255,${a * 0.7})`);
+          ctx.strokeStyle = g;
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.moveTo(tx, ty);
+          ctx.lineTo(s.x, s.y);
+          ctx.stroke();
+          // head
+          ctx.fillStyle = `rgba(255,255,255,${a})`;
+          ctx.beginPath();
+          ctx.arc(s.x, s.y, 1.5, 0, TAU);
+          ctx.fill();
+        }
+        ctx.restore();
+      }
+
       function postFx() {
         const v = ctx.createRadialGradient(S.w * .5, S.h * .5, S.h * .15, S.w * .5, S.h * .5, S.h * .85);
         v.addColorStop(0, 'rgba(0,0,0,0)');
@@ -7469,6 +8341,18 @@
           ctx.fillRect(-16, -16, S.w + 32, S.h + 32);
           ctx.restore();
         }
+        // Chromatic aberration on EMP / heavy impacts
+        if (S.chromatic > 0.02) {
+          const offset = Math.round(S.chromatic * 4);
+          if (offset >= 1) {
+            ctx.save();
+            ctx.globalCompositeOperation = 'lighter';
+            ctx.globalAlpha = S.chromatic * 0.15;
+            ctx.drawImage(canvas, -offset, 0);
+            ctx.drawImage(canvas, offset, 0);
+            ctx.restore();
+          }
+        }
       }
 
       function draw() {
@@ -7481,9 +8365,11 @@
         drawAur();
         drawClouds();
         drawStars();
+        drawShootingStars();
         drawWeatherBack();
         drawMount();
         drawGround();
+        drawScorches();
         drawLightBursts();
         drawCities();
         drawBases();
@@ -7494,9 +8380,11 @@
         drawRaiders();
         drawTrails();
         drawWeatherFront();
+        drawLightningBolts();
         drawSmoke();
         drawMissiles(S.enemy, true);
         drawMissiles(S.player, false);
+        drawMuzzleFlashes();
         drawExpl();
         drawSparks();
         drawDebris();
@@ -7505,10 +8393,28 @@
         if (S.floatingTexts && S.floatingTexts.length) {
           for (const t of S.floatingTexts) {
             const a = clamp(t.life / 0.5, 0, 1);
-            ctx.fillStyle = `rgba(255,255,255,${a})`;
-            ctx.font = '700 22px "Orbitron","Trebuchet MS",sans-serif';
+            const scale = 1 + (1 - Math.min(1, t.life / 0.3)) * 0.2; // pop-in scale
+            const isCombo = t.text.includes('COMBO');
+            ctx.save();
+            ctx.translate(t.x, t.y);
+            ctx.scale(scale, scale);
             ctx.textAlign = 'center';
-            ctx.fillText(t.text, t.x, t.y);
+            const sz = isCombo ? 26 : 22;
+            ctx.font = `700 ${sz}px "Orbitron","Trebuchet MS",sans-serif`;
+            // outline/shadow
+            ctx.strokeStyle = `rgba(0,0,0,${a * 0.7})`;
+            ctx.lineWidth = 3;
+            ctx.strokeText(t.text, 0, 0);
+            // theme-colored text
+            if (S.theme === 'recharged') {
+              ctx.fillStyle = isCombo ? `rgba(255,0,180,${a})` : `rgba(0,255,200,${a})`;
+            } else if (S.theme === 'xbox') {
+              ctx.fillStyle = isCombo ? `rgba(255,200,80,${a})` : `rgba(200,255,160,${a})`;
+            } else {
+              ctx.fillStyle = isCombo ? `rgba(255,200,100,${a})` : `rgba(255,255,255,${a})`;
+            }
+            ctx.fillText(t.text, 0, 0);
+            ctx.restore();
           }
         }
 
