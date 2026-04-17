@@ -70,6 +70,87 @@ static void Resize(GameState s)
 
 static void HandleInput(GameState s)
 {
+    // ----- SECRET CODE BUFFER (666 -> summon demon) -----
+    // Accept digits 0-9 and letters a-z, keep last 8 chars
+    int keyCh = Raylib.GetCharPressed();
+    while (keyCh > 0)
+    {
+        if ((keyCh >= '0' && keyCh <= '9') || (keyCh >= 'a' && keyCh <= 'z') || (keyCh >= 'A' && keyCh <= 'Z'))
+        {
+            SecretCode.Buffer += char.ToLowerInvariant((char)keyCh);
+            if (SecretCode.Buffer.Length > 8) SecretCode.Buffer = SecretCode.Buffer.Substring(SecretCode.Buffer.Length - 8);
+            if (SecretCode.Buffer.EndsWith("666"))
+            {
+                DemonSystem.Summon(s);
+                SecretCode.Buffer = "";
+            }
+            else if (SecretCode.Buffer.EndsWith("777"))
+            {
+                MothershipSystem.Summon(s);
+                SecretCode.Buffer = "";
+            }
+        }
+        keyCh = Raylib.GetCharPressed();
+    }
+
+    // ----- SHOP INPUT (between waves) -----
+    if (s.Shop)
+    {
+        if (Raylib.IsKeyPressed(KeyboardKey.One) && s.Score >= 5000)
+        {
+            var dead = s.Cities.Where(c => c.Destroyed).ToList();
+            if (dead.Count > 0)
+            {
+                s.Score -= 5000;
+                var c = dead[Random.Shared.Next(dead.Count)];
+                c.Destroyed = false;
+                SynthAudio.Thunder(0.5f, 0.4f);
+                s.Msg = "City rebuilt"; s.MsgT = 1.2f;
+            }
+            else { s.Msg = "All cities intact"; s.MsgT = 1.0f; }
+        }
+        else if (Raylib.IsKeyPressed(KeyboardKey.Two) && s.Score >= 2500)
+        {
+            if (s.Emp < s.EmpMax)
+            {
+                s.Score -= 2500;
+                s.Emp++;
+                SynthAudio.Launch(0.5f);
+                s.Msg = "EMP +1"; s.MsgT = 1.0f;
+            }
+            else { s.Msg = "EMP at maximum capacity"; s.MsgT = 1.0f; }
+        }
+        else if (Raylib.IsKeyPressed(KeyboardKey.Three) && s.Score >= 4000 && s.Upgrades.BlastScale < 2.8f - 0.001f)
+        {
+            s.Score -= 4000;
+            s.Upgrades.BlastScale = MathF.Min(2.8f, s.Upgrades.BlastScale + 0.2f);
+            SynthAudio.Impact(0.5f, false);
+            s.Msg = $"Warhead Yield x{s.Upgrades.BlastScale:F1}"; s.MsgT = 1.2f;
+        }
+        else if (Raylib.IsKeyPressed(KeyboardKey.Four) && s.Score >= 3500 && s.Upgrades.ReloadMult < 2.2f - 0.001f)
+        {
+            s.Score -= 3500;
+            s.Upgrades.ReloadMult = MathF.Min(2.2f, s.Upgrades.ReloadMult + 0.12f);
+            SynthAudio.Launch(0.5f);
+            s.Msg = $"Reload Boost x{s.Upgrades.ReloadMult:F2}"; s.MsgT = 1.2f;
+        }
+        else if (Raylib.IsKeyPressed(KeyboardKey.Five) && s.Score >= 3600 && s.Upgrades.EmpScale < 2.4f - 0.001f)
+        {
+            s.Score -= 3600;
+            s.Upgrades.EmpScale = MathF.Min(2.4f, s.Upgrades.EmpScale + 0.14f);
+            s.Upgrades.PhalanxEff = MathF.Min(2.0f, s.Upgrades.PhalanxEff + 0.08f);
+            SynthAudio.Thunder(0.5f, 0.5f);
+            s.Msg = "EMP/Phalanx Boost"; s.MsgT = 1.2f;
+        }
+        else if (Raylib.IsKeyPressed(KeyboardKey.Space))
+        {
+            s.Shop = false;
+            s.Level++;
+            WaveSystem.StartWave(s, 2.9f);
+        }
+        return; // while shop open, suppress other gameplay inputs
+    }
+
     // Fire interceptor
     if (Raylib.IsMouseButtonPressed(MouseButton.Left) && !s.Intro && !s.GameOver && !s.Shop)
     {

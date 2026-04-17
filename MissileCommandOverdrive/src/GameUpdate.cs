@@ -70,8 +70,8 @@ public static class GameUpdate
         foreach (var b in s.Bases)
             if (b.Cooldown > 0) b.Cooldown = MathF.Max(0, b.Cooldown - dt);
 
-        // Wave spawning
-        if (!s.Intro && !s.Shop)
+        // Wave spawning (suppressed while mothership is active — cinematic pause)
+        if (!s.Intro && !s.Shop && !MothershipSystem.HoldSpawning(s))
         {
             if (s.WavePause > 0)
             {
@@ -103,6 +103,9 @@ public static class GameUpdate
         UpdEnemies(s, dt);
         UpdUfo(s, dt);
         UpdRaiders(s, dt);
+        DemonSystem.Update(s, dt);
+        MothershipSystem.Update(s, dt);
+        MothershipSystem.UpdateFighters(s, dt);
         UpdPlayer(s, dt);
         UpdExplosions(s, dt);
         UpdParticles(s, dt);
@@ -127,7 +130,7 @@ public static class GameUpdate
             && s.Explosions.Count == 0 && s.DebrisParts.Count == 0 && s.Shockwaves.Count == 0)
         {
             s.Shop = true;
-            s.ShopTimer = 5.0f;
+            s.ShopTimer = 18.0f;
             Audio.SynthAudio.WaveCleared();
         }
 

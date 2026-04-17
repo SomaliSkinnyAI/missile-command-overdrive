@@ -43,6 +43,8 @@ public class GameState
     public List<UFO> UFOs = [];
     public List<Raider> Raiders = [];
     public Daemon? Demon;
+    public Mothership? Mothership;
+    public List<Fighter> Fighters = [];
 
     // Defenses
     public List<Base> Bases = [];

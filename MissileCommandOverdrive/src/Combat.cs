@@ -541,5 +541,140 @@ public static class Combat
                 s.Raiders.RemoveAt(i);
             }
         }
+
+        // Mothership vs player explosions (easter egg — tanky, huge scoring)
+        if (s.Mothership != null)
+        {
+            var ms = s.Mothership;
+            float hullHalf = ms.W * 0.5f;
+            float hullRx = hullHalf * 0.92f;
+            float hullRy = 42f;
+            // Snapshot — SpawnExpl calls below mutate s.Explosions, which would throw on foreach
+            var exps = s.Explosions.ToArray();
+            foreach (var e in exps)
+            {
+                if (!e.Player) continue;
+                // Each explosion damages the mothership at most once
+                if (ms.HitBy.Contains(e)) continue;
+
+                float dx = (ms.X - e.X) / hullRx;
+                float dy = (ms.Y - e.Y) / hullRy;
+                float blastR = MathF.Max(24, e.Radius * 0.75f);
+                float gx = e.X - ms.X, gy = e.Y - ms.Y;
+                bool inHull = dx * dx + dy * dy <= 1.25f;
+                bool inBlast = gx * gx + gy * gy <= (hullRx + blastR) * (hullRx + blastR);
+                if (!(inHull || inBlast)) continue;
+
+                ms.HitBy.Add(e);
+
+                // Deflector shield absorbs damage when active — only ripple + minor spark
+                if (ms.ShieldActive)
+                {
+                    ms.ShieldRippleT = 1f;
+                    ms.ShieldFlash = MathF.Max(ms.ShieldFlash, 0.7f);
+                    SpawnExpl(s, e.X, e.Y, 20, 0.28f, 0f, player: false, flash: 0f, noShake: true);
+                    continue;
+                }
+
+                int dmg = e.Emp ? 2 : 1;
+                ms.Hp -= dmg;
+                ms.ShieldFlash = 1f;
+                // Visual-only spark at impact — NOT a player explosion (avoids cascading re-damage).
+                SpawnExpl(s, e.X, e.Y, 24, 0.32f, 0.22f, player: false, flash: 0f, noShake: true);
+
+                if (ms.Hp <= 0)
+                {
+                    float bonus = 1 + MathF.Min(2.2f, s.Combo * 0.09f);
+                    int gain = (int)MathF.Round(18000 * bonus);
+                    s.Score += gain;
+                    s.Combo++;
+                    s.ComboTimer = 4;
+                    s.MaxCombo = Math.Max(s.MaxCombo, s.Combo);
+
+                    for (int k = 0; k < 14; k++)
+                    {
+                        float kt = k / 13f;
+                        float ex = ms.X - hullHalf + kt * ms.W;
+                        float ey = ms.Y + MathH.Rand(-16, 12);
+                        SpawnExpl(s, ex, ey, MathH.Rand(82, 136),
+                            MathH.Rand(1.1f, 1.7f), 0.4f, player: true,
+                            flash: 0.12f + kt * 0.18f, heavy: true);
+                    }
+                    SpawnSmoke(s, ms.X, ms.Y, 46, 1.8f);
+                    s.Flash = MathF.Max(s.Flash, 0.6f);
+                    s.Shake = MathF.Max(s.Shake, 28);
+                    s.Note = "MOTHERSHIP DESTROYED";
+                    s.NoteT = 2.4f;
+                    s.Mothership = null;
+                    break;
+                }
+                // Don't break — let multiple explosions all register damage this frame if they haven't before
+            }
+        }
+
+        // Fighters (mothership-deployed) vs player explosions
+        for (int i = s.Fighters.Count - 1; i >= 0; i--)
+        {
+            var f = s.Fighters[i];
+            bool dead = false;
+            foreach (var e in s.Explosions)
+            {
+                if (!e.Player) continue;
+                float dx = f.X - e.X, dy = f.Y - e.Y;
+                float r = MathF.Max(18, e.Radius * 0.55f);
+                if (dx * dx + dy * dy <= r * r)
+                {
+                    f.Hp -= 1;
+                    SpawnExpl(s, f.X + MathH.Rand(-4, 4), f.Y, 28, 0.42f, 0.22f,
+                        player: true, noShake: true);
+                    if (f.Hp <= 0)
+                    {
+                        float bonus = 1 + MathF.Min(2.2f, s.Combo * 0.09f);
+                        s.Score += (int)MathF.Round(180 * bonus);
+                        s.Combo++;
+                        s.ComboTimer = 4;
+                        s.MaxCombo = Math.Max(s.MaxCombo, s.Combo);
+                        SpawnExpl(s, f.X, f.Y, 62, 0.72f, 0.28f, player: true, flash: 0.08f);
+                        SpawnSmoke(s, f.X, f.Y, 6, 0.8f);
+                        dead = true;
+                    }
+                    break;
+                }
+            }
+            if (dead) s.Fighters.RemoveAt(i);
+        }
+
+        // Demon vs player explosions (easter egg — damage + banish)
+        if (s.Demon != null)
+        {
+            var dm = s.Demon;
+            foreach (var e in s.Explosions)
+            {
+                if (!e.Player) continue;
+                float dx = dm.X - e.X, dy = dm.Y - e.Y;
+                float r = MathF.Max(30, e.Radius * 0.55f);
+                if (dx * dx + dy * dy <= r * r)
+                {
+                    dm.Hp -= 1;
+                    SpawnExpl(s, dm.X + MathH.Rand(-10, 10), dm.Y + MathH.Rand(-6, 6),
+                        40, 0.55f, 0.32f, player: true, flash: 0.06f, noShake: true);
+                    if (dm.Hp <= 0)
+                    {
+                        float bonus = 1 + MathF.Min(2.2f, s.Combo * 0.09f);
+                        int gain = (int)MathF.Round(3200 * bonus);
+                        s.Score += gain;
+                        s.Combo++;
+                        s.ComboTimer = 4;
+                        s.MaxCombo = Math.Max(s.MaxCombo, s.Combo);
+                        SpawnExpl(s, dm.X, dm.Y, 170, 1.6f, 0.5f, player: true, flash: 0.44f, heavy: true);
+                        SpawnSmoke(s, dm.X, dm.Y, 30, 1.5f);
+                        s.Note = "DAEMON BANISHED";
+                        s.NoteT = 1.8f;
+                        s.Demon = null;
+                    }
+                    break;
+                }
+            }
+        }
     }
 }

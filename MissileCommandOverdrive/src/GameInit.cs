@@ -268,6 +268,8 @@ public static class GameInit
         s.UFOs.Clear();
         s.Raiders.Clear();
         s.Demon = null;
+        s.Mothership = null;
+        s.Fighters.Clear();
         s.Enemies.Clear();
         s.PlayerMissiles.Clear();
         s.Explosions.Clear();

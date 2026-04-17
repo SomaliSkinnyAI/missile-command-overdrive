@@ -26,6 +26,7 @@ public class UFO
     public bool Boss;
     public int Hp;
     public bool Dead;
+    public float ReserveUntil; // auto-defense reservation timer
 }
 
 public class Raider
@@ -50,4 +51,41 @@ public class Daemon
     public float Phase;
     public int Hp;
     public bool Active;
+}
+
+public class Mothership
+{
+    public float X, Y;
+    public float Vx;
+    public float W;           // hull length (pixels)
+    public int Hp;
+    public int MaxHp;
+    public float Phase;
+    public float SpawnCd;
+    public float ShieldFlash; // 0..1, decays over time after each hit
+    public float AppearTime;  // time since summoned (used for slow fade-in)
+    public bool Active;
+    public bool ReachedMid;   // has center crossed screen-mid yet?
+    public bool Dead;
+    // Each explosion damages the mothership at most once (prevents per-frame re-damage bug).
+    public HashSet<Explosion> HitBy = new();
+    // Deflector-shield state: toggles on/off with random intervals; blocks all damage while active.
+    public bool ShieldActive;
+    public float ShieldStateTimer; // time until next on/off toggle
+    public float ShieldRippleT;    // 0..1 visual ripple timer after a deflected hit
+}
+
+public class Fighter
+{
+    public int Id;
+    public float X, Y;
+    public float Vx, Vy;
+    public float Phase;
+    public float Roll;       // wing-panel oscillation
+    public int Hp = 1;
+    public float FireCd;
+    public float Life = 1f;
+    public bool Dead;
+    public float TargetX, TargetY;
+    public float StrafeT;    // timer for target re-pick
 }

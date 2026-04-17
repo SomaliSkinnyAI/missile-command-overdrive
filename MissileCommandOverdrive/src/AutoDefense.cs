@@ -19,6 +19,9 @@ public static class AutoDefense
         var enemies = s.Enemies.OrderByDescending(m => Threat(s, m)).ToList();
         int shots = 0;
 
+        // HIGHEST PRIORITY: hammer the mothership if present (spawning paused while it's alive anyway)
+        TargetMothership(s, bases, ref shots, maxShots, autoSpeed);
+
         foreach (var m in enemies)
         {
             if (shots >= maxShots || bases.Count == 0) break;
@@ -46,23 +49,36 @@ public static class AutoDefense
 
             if (best == null) continue;
 
+            // Don't over-commit: skip if a player missile is already inbound to this intercept point.
+            // Multi-HP enemies still allow one extra (to chip).
+            int needed = Math.Max(1, m.Hp);
+            int inbound = CountInboundAt(s, best.Value.ix, best.Value.iy, 62f);
+            if (inbound >= needed) continue;
+
             bool fired = Combat.LaunchPlayer(s, best.Value.ix, best.Value.iy,
                 s.Bases.IndexOf(best.Value.bestBase));
             if (fired)
             {
-                m.ReserveUntil = s.Time + MathH.Clamp(best.Value.it * 0.9f + 0.24f, 0.3f, 1.28f);
+                // Reservation must outlast the interceptor's flight + explosion check,
+                // otherwise RunAuto on subsequent frames re-fires at the same target before the first shot arrives.
+                // Single-HP enemies: reserve through arrival + buffer so one interceptor is enough.
+                // Multi-HP enemies: shorter reserve so we can chip away with follow-ups.
+                float reserve = m.Hp <= 1
+                    ? best.Value.it + 0.55f
+                    : best.Value.it * 0.9f + 0.24f;
+                m.ReserveUntil = s.Time + MathH.Clamp(reserve, 0.5f, 3.6f);
                 shots++;
                 bases.Remove(best.Value.bestBase);
             }
         }
 
         // Try to intercept UFOs with remaining bases
-        int ufoReserve = s.UFOs.Count > 0 ? 1 : 0;
         foreach (var u in s.UFOs.OrderByDescending(u => ThreatUfo(s, u)))
         {
             if (shots >= maxShots + 1 || bases.Count == 0) break;
+            if (u.ReserveUntil > s.Time) continue;
 
-            (Base bestBase, float ix, float iy)? best = null;
+            (Base bestBase, float ix, float iy, float t)? best = null;
             float bestScore = float.MinValue;
 
             foreach (var b in bases)
@@ -73,19 +89,82 @@ public static class AutoDefense
                 if (score > bestScore)
                 {
                     bestScore = score;
-                    best = (b, intr.Value.x, intr.Value.y);
+                    best = (b, intr.Value.x, intr.Value.y, intr.Value.t);
                 }
             }
 
             if (best == null) continue;
+
+            int ufoNeeded = Math.Max(1, u.Hp);
+            int ufoInbound = CountInboundAt(s, best.Value.ix, best.Value.iy, 70f);
+            if (ufoInbound >= ufoNeeded) continue;
+
             bool fired = Combat.LaunchPlayer(s, best.Value.ix, best.Value.iy,
                 s.Bases.IndexOf(best.Value.bestBase));
             if (fired)
             {
+                float reserve = u.Hp <= 1
+                    ? best.Value.t + 0.6f
+                    : best.Value.t * 0.85f + 0.3f;
+                u.ReserveUntil = s.Time + MathH.Clamp(reserve, 0.55f, 3.6f);
                 shots++;
                 bases.Remove(best.Value.bestBase);
             }
         }
+    }
+
+    /// <summary>Count in-flight player interceptors whose target point is within radius of (x,y).
+    /// Used to prevent the auto-defense from double-committing when an interceptor is already inbound.</summary>
+    /// <summary>Keep pounding the mothership every time there's a free silo and no interceptor already inbound to its hull center.</summary>
+    static void TargetMothership(GameState s, List<Base> bases, ref int shots, int maxShots, float autoSpeed)
+    {
+        var ms = s.Mothership;
+        if (ms == null) return;
+
+        // Fire-budget for mothership: allow more concentrated volleys so it actually gets hammered down
+        int msBudget = Math.Min(3, bases.Count);
+        for (int k = 0; k < msBudget; k++)
+        {
+            if (shots >= maxShots + 2 || bases.Count == 0) break;
+
+            // Pick aim point: hull center with a little spread so shots fan across the hull
+            float aimX = ms.X + MathH.Rand(-ms.W * 0.35f, ms.W * 0.35f);
+            float aimY = ms.Y + MathH.Rand(-22, 10);
+
+            // Bail if several interceptors are already en route near the aim point
+            if (CountInboundAt(s, aimX, aimY, 60f) >= 2) continue;
+
+            // Pick nearest base that can reach
+            Base? best = null;
+            float bestDist = float.MaxValue;
+            foreach (var b in bases)
+            {
+                float dx = aimX - b.X, dy = aimY - b.Y;
+                float d = dx * dx + dy * dy;
+                if (d < bestDist) { bestDist = d; best = b; }
+            }
+            if (best == null) continue;
+
+            bool fired = Combat.LaunchPlayer(s, aimX, aimY, s.Bases.IndexOf(best));
+            if (fired)
+            {
+                shots++;
+                bases.Remove(best);
+            }
+        }
+    }
+
+    static int CountInboundAt(GameState s, float x, float y, float radius)
+    {
+        int count = 0;
+        float r2 = radius * radius;
+        foreach (var pm in s.PlayerMissiles)
+        {
+            if (pm.Detonated) continue;
+            float dx = pm.Tx - x, dy = pm.Ty - y;
+            if (dx * dx + dy * dy <= r2) count++;
+        }
+        return count;
     }
 
     static float Threat(GameState s, Enemy m)
