@@ -37,6 +37,7 @@ public static class Palette
         "drone" => new Color(156, 247, 255, 255),
         "spit" => new Color(255, 140, 106, 255),
         "hell" => new Color(255, 58, 45, 255),
+        "shield" => new Color(122, 196, 255, 255),
         _ => Enemy
     };
 }

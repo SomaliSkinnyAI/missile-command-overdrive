@@ -6,80 +6,180 @@ namespace MissileCommandOverdrive;
 /// <summary>All per-frame update logic.</summary>
 public static class GameUpdate
 {
-    public static void UpdateAll(GameState s, float dt)
+    // §4.7: simDt drives the sim (0 during hit-stop, scaled in slow-mo);
+    // rawDt drives presentation so UI/floaters/shake never freeze.
+    public static void UpdateAll(GameState s, float simDt, float rawDt)
     {
-        s.Time += dt;
+        s.Time += simDt;
+        // Cosmetic particle clock: slows with slow-mo but keeps moving in hit-stop
+        float fxDt = rawDt * s.TimeScale;
 
-        // Timers
-        if (s.MsgT > 0) s.MsgT = MathF.Max(0, s.MsgT - dt);
-        if (s.NoteT > 0) s.NoteT = MathF.Max(0, s.NoteT - dt);
+        // Timers — presentation on rawDt, sim timers on simDt
+        if (s.MsgT > 0) s.MsgT = MathF.Max(0, s.MsgT - rawDt);
+        if (s.NoteT > 0) s.NoteT = MathF.Max(0, s.NoteT - rawDt);
         if (s.ComboTimer > 0)
         {
-            s.ComboTimer = MathF.Max(0, s.ComboTimer - dt);
-            if (s.ComboTimer == 0) s.Combo = 0;
+            s.ComboTimer = MathF.Max(0, s.ComboTimer - simDt);
+            if (s.ComboTimer == 0)
+            {
+                // §5 4.5 combo-break: only a real chain (4+) earns the pitch-drop
+                // womp — single-kill expiries stay silent
+                if (s.Combo >= 4 && s.Phase == GamePhase.Playing) Audio.SynthAudio.ComboBreak();
+                s.Combo = 0;
+            }
         }
-        if (s.Shake > 0) s.Shake = MathF.Max(0, s.Shake - dt * 20);
-        if (s.Flash > 0) s.Flash = MathF.Max(0, s.Flash - dt * 1.7f);
-        if (s.EmpCd > 0) s.EmpCd = MathF.Max(0, s.EmpCd - dt);
-        if (s.Chromatic > 0) s.Chromatic = MathF.Max(0, s.Chromatic - dt * 1.8f);
+        if (s.Trauma > 0) s.Trauma = MathF.Max(0, s.Trauma - rawDt * 1.2f);
+        if (s.CrosshairPop > 0) s.CrosshairPop = MathF.Max(0, s.CrosshairPop - rawDt * 6.5f);
+        if (s.ComboPop > 0) s.ComboPop = MathF.Max(0, s.ComboPop - rawDt * 3.4f);
+        if (s.LowAmmoTickCd > 0) s.LowAmmoTickCd = MathF.Max(0, s.LowAmmoTickCd - rawDt);
+        // §5 4.4 odometer: DisplayScore chases Score — rate ∝ gap with a min step
+        // so small awards still visibly roll; Score only ever drops on reset, so
+        // a downward gap snaps (no reverse-rolling wheels)
+        if (s.DisplayScore < s.Score)
+            s.DisplayScore = MathF.Min(s.Score,
+                s.DisplayScore + MathF.Max((s.Score - s.DisplayScore) * 4f, 120f) * rawDt);
+        else if (s.DisplayScore > s.Score) s.DisplayScore = s.Score;
+        if (s.Flash > 0) s.Flash = MathF.Max(0, s.Flash - rawDt * 1.7f);
+        if (s.EmpCd > 0) s.EmpCd = MathF.Max(0, s.EmpCd - simDt);
+        // §5 4.3 CHAIN PULSE perk: fire the echo EMP scheduled by Combat.SpawnExpl
+        if (s.Perks.ChainT > 0 && s.Phase == GamePhase.Playing)
+        {
+            s.Perks.ChainT = MathF.Max(0, s.Perks.ChainT - simDt);
+            if (s.Perks.ChainT == 0)
+                Combat.SpawnExpl(s, s.Perks.ChainX, s.Perks.ChainY,
+                    228f * 0.6f * s.Upgrades.EmpScale, 1.15f, 0.42f,
+                    player: true, emp: true, flash: 0.18f, chainChild: true);
+        }
+        if (s.Chromatic > 0) s.Chromatic = MathF.Max(0, s.Chromatic - rawDt * 1.8f);
+        if (s.ScrapTickCd > 0) s.ScrapTickCd = MathF.Max(0, s.ScrapTickCd - rawDt);
+
+        // Micro-feedback timers (presentation — rawDt)
+        foreach (var b in s.Bases)
+        {
+            if (b.MuzzleT > 0) b.MuzzleT = MathF.Max(0, b.MuzzleT - rawDt);
+            if (b.ResupplyFlash > 0) b.ResupplyFlash = MathF.Max(0, b.ResupplyFlash - rawDt * 2.4f);
+            if (b.Recoil != 0 || b.RecoilV != 0)
+            {
+                b.RecoilV += (-400f * b.Recoil - 16f * b.RecoilV) * rawDt;
+                b.Recoil += b.RecoilV * rawDt;
+                if (MathF.Abs(b.Recoil) < 0.02f && MathF.Abs(b.RecoilV) < 0.5f) { b.Recoil = 0; b.RecoilV = 0; }
+            }
+        }
+        foreach (var m in s.Enemies)
+        {
+            if (m.FlashT > 0) m.FlashT = MathF.Max(0, m.FlashT - rawDt);
+            if (m.ShieldFlashT > 0) m.ShieldFlashT = MathF.Max(0, m.ShieldFlashT - rawDt);
+        }
+        foreach (var u in s.UFOs) if (u.FlashT > 0) u.FlashT = MathF.Max(0, u.FlashT - rawDt);
+        foreach (var r in s.Raiders) if (r.FlashT > 0) r.FlashT = MathF.Max(0, r.FlashT - rawDt);
+        foreach (var f in s.Fighters) if (f.FlashT > 0) f.FlashT = MathF.Max(0, f.FlashT - rawDt);
+        if (s.Demon != null && s.Demon.FlashT > 0) s.Demon.FlashT = MathF.Max(0, s.Demon.FlashT - rawDt);
 
         // Floating texts
         for (int i = s.FloatingTexts.Count - 1; i >= 0; i--)
         {
-            s.FloatingTexts[i].Life -= dt;
-            s.FloatingTexts[i].Y -= dt * 38;
+            s.FloatingTexts[i].Life -= rawDt;
+            s.FloatingTexts[i].Y -= rawDt * 38;
             if (s.FloatingTexts[i].Life <= 0) s.FloatingTexts.RemoveAt(i);
         }
 
-        if (s.GameOver)
+        if (s.Phase == GamePhase.GameOver)
         {
-            s.GameOverTime += dt;
-            UpdEnemies(s, dt);
-            UpdUfo(s, dt);
-            UpdRaiders(s, dt);
-            UpdPlayer(s, dt);
-            UpdExplosions(s, dt);
-            UpdParticles(s, dt);
-            Combat.RunCollisions(s);
+            s.GameOverTime += rawDt;
+            UpdEnemies(s, simDt);
+            UpdUfo(s, simDt);
+            UpdRaiders(s, simDt);
+            UpdPlayer(s, simDt);
+            UpdExplosions(s, simDt);
+            UpdParticles(s, fxDt);
+            // Damage is per-frame-of-overlap: resolving while simDt == 0 deals
+            // free ticks to multi-HP units inside frozen explosions
+            if (simDt > 0) Combat.RunCollisions(s);
             return;
         }
 
-        // Ammo resupply for alive bases
-        int aliveCities = s.Cities.Count(c => !c.Destroyed);
-        if (aliveCities > 0)
+        // Cached alive counts (§5 2.6): plain loops, recounted each frame so non-owned
+        // mutate sites (e.g. WaveSystem base resurrection) can never leave them stale
+        int aliveCities = 0;
+        for (int i = 0; i < s.Cities.Count; i++) if (!s.Cities[i].Destroyed) aliveCities++;
+        int aliveBases = 0;
+        for (int i = 0; i < s.Bases.Count; i++) if (!s.Bases[i].Destroyed) aliveBases++;
+        s.AliveCities = aliveCities;
+        s.AliveBases = aliveBases;
+
+        // Ammo resupply for alive bases (allocation-free; same RNG call order as before)
+        if (aliveCities > 0 && aliveBases > 0)
         {
-            var liveBases = s.Bases.Where(b => !b.Destroyed).ToList();
-            if (liveBases.Count > 0)
+            int targetLow = s.Auto ? 44 : 36;
+            int totalAmmo = 0;
+            Base? resupply = null; // alive base with the least ammo below targetLow
+            foreach (var b in s.Bases)
             {
-                int totalAmmo = liveBases.Sum(b => b.Ammo);
-                bool emergency = totalAmmo <= Math.Max(24, 8 + s.Level * 0.9f);
-                float supportRate = 0.18f + MathH.Clamp((s.Level - 12) * 0.012f, 0, 0.28f)
-                    + (s.Auto ? 0.09f : 0) + s.Danger * 0.16f + (emergency ? 0.32f : 0);
-                int targetLow = s.Auto ? 44 : 36;
-                var lowBases = liveBases.Where(b => b.Ammo < targetLow).ToList();
-                if (lowBases.Count > 0 && RandHelper.Next01() < dt * supportRate)
-                {
-                    var target = lowBases.OrderBy(b => b.Ammo).First();
-                    int grant = emergency && RandHelper.Next01() < 0.4f ? 2 : 1;
-                    target.Ammo = Math.Min(180, target.Ammo + grant);
-                }
+                if (b.Destroyed) continue;
+                totalAmmo += b.Ammo;
+                if (b.Ammo < targetLow && (resupply == null || b.Ammo < resupply.Ammo))
+                    resupply = b;
+            }
+            bool emergency = totalAmmo <= Math.Max(24, 8 + s.Level * 0.9f);
+            float supportRate = 0.18f + MathH.Clamp((s.Level - 12) * 0.012f, 0, 0.28f)
+                + (s.Auto ? 0.09f : 0) + s.Danger * 0.16f + (emergency ? 0.32f : 0);
+            if (resupply != null && RandHelper.Next01() < simDt * supportRate)
+            {
+                int grant = emergency && RandHelper.Next01() < 0.4f ? 2 : 1;
+                resupply.Ammo = Math.Min(180, resupply.Ammo + grant);
+                resupply.ResupplyFlash = 1f;
             }
         }
 
         // Base cooldowns
         foreach (var b in s.Bases)
-            if (b.Cooldown > 0) b.Cooldown = MathF.Max(0, b.Cooldown - dt);
+            if (b.Cooldown > 0) b.Cooldown = MathF.Max(0, b.Cooldown - simDt);
+
+        // §5 4.5 low-ammo geiger: the base that would answer the next click
+        // (selected, else nearest to the crosshair — same pick order as
+        // Combat.LaunchPlayer) crackles when below 25% magazine. Provably
+        // rate-capped: a tick always re-arms LowAmmoTickCd ≥ 0.45 s.
+        if (s.Phase == GamePhase.Playing && simDt > 0 && s.LowAmmoTickCd <= 0)
+        {
+            Base? next = null;
+            if (s.SelectedBase is int si && si >= 0 && si < s.Bases.Count
+                && !s.Bases[si].Destroyed && s.Bases[si].Ammo > 0)
+                next = s.Bases[si];
+            if (next == null)
+            {
+                float bestD = float.MaxValue;
+                foreach (var b in s.Bases)
+                {
+                    if (b.Destroyed || b.Ammo <= 0) continue;
+                    float d = MathF.Abs(b.X - s.MouseX);
+                    if (d < bestD) { bestD = d; next = b; }
+                }
+            }
+            if (next != null && next.MaxAmmo > 0 && next.Ammo * 4 < next.MaxAmmo)
+            {
+                // ticks quicken as the magazine drains (0.9 s → 0.45 s floor)
+                float fill = next.Ammo / (next.MaxAmmo * 0.25f); // 1 → 0 toward empty
+                s.LowAmmoTickCd = 0.45f + 0.45f * fill;
+                Audio.SynthAudio.GeigerTick(MathH.Clamp(next.X / s.W, 0, 1));
+            }
+        }
 
         // Wave spawning (suppressed while mothership is active — cinematic pause)
-        if (!s.Intro && !s.Shop && !MothershipSystem.HoldSpawning(s))
+        if (s.Phase == GamePhase.Playing && !MothershipSystem.HoldSpawning(s))
         {
             if (s.WavePause > 0)
             {
-                s.WavePause -= dt;
+                s.WavePause -= simDt;
             }
             else
             {
-                s.WaveTime += dt;
+                // §4.5 spawn gating (L4D-style breathing room): at peak stress
+                // the spawn clock holds so no new pressure lands — except inside
+                // the finale segment, the authored climax, which always arrives
+                // on schedule. No deadlock: with the sky empty the inbound and
+                // near-miss terms are 0 and Intensity decays well below the gate.
+                if (s.Intensity <= SpawnHoldIntensity || s.WaveTime >= s.FinaleStart)
+                    s.WaveTime += simDt;
                 while (s.SpawnI < s.WavePlan.Count && s.WavePlan[s.SpawnI].Time <= s.WaveTime)
                 {
                     WaveSystem.SpawnEnemy(s, s.WavePlan[s.SpawnI]);
@@ -100,48 +200,104 @@ public static class GameUpdate
             }
         }
 
-        UpdEnemies(s, dt);
-        UpdUfo(s, dt);
-        UpdRaiders(s, dt);
-        DemonSystem.Update(s, dt);
-        MothershipSystem.Update(s, dt);
-        MothershipSystem.UpdateFighters(s, dt);
-        UpdPlayer(s, dt);
-        UpdExplosions(s, dt);
-        UpdParticles(s, dt);
-        Combat.RunCollisions(s);
+        // Assist (§5 3.1): enemies advance on a slowed clock (×0.8); player
+        // missiles, timers and spawn schedule stay at full rate
+        float enemyDt = s.Settings.AssistEnemySlow ? simDt * 0.8f : simDt;
+        UpdEnemies(s, enemyDt);
+        UpdUfo(s, enemyDt);
+        UpdRaiders(s, enemyDt);
+        DemonSystem.Update(s, enemyDt);
+        MothershipSystem.Update(s, enemyDt);
+        MothershipSystem.UpdateFighters(s, enemyDt);
+        UpdPlayer(s, simDt);
+        UpdExplosions(s, simDt);
+        UpdParticles(s, fxDt);
+        // Same gate as the GameOver branch: no collision resolution on frozen frames
+        if (simDt > 0) Combat.RunCollisions(s);
 
-        // Auto-defense AI
-        if (s.Auto) AutoDefense.RunAuto(s);
+        // Auto-defense AI (gated so it never decides on frozen state)
+        if (s.Auto && simDt > 0) AutoDefense.RunAuto(s);
 
         // Phalanx CIWS turrets
-        PhalanxSystem.UpdateAll(s, dt);
+        PhalanxSystem.UpdateAll(s, simDt);
 
         // HellRaiser underground launcher
-        HellRaiserSystem.Update(s, dt);
+        HellRaiserSystem.Update(s, simDt);
 
         // Weather
-        WeatherSystem.Update(s, dt);
+        WeatherSystem.Update(s, simDt);
 
-        // Wave cleared → shop
-        if (!s.Intro && !s.Shop
-            && s.SpawnI >= s.WavePlan.Count
-            && s.Enemies.Count == 0 && s.UFOs.Count == 0 && s.Raiders.Count == 0
-            && s.Explosions.Count == 0 && s.DebrisParts.Count == 0 && s.Shockwaves.Count == 0)
+        // Accessibility assists (§5 3.1) — any active assist marks the run
+        if (s.Settings.AssistEnemySlow || s.Settings.AssistAutoEmp) s.AssistedRun = true;
+        if (s.Settings.AssistAutoEmp && simDt > 0 && aliveCities == 1
+            && s.Emp > 0 && s.EmpCd <= 0)
         {
-            s.Shop = true;
-            s.ShopTimer = 18.0f;
-            Audio.SynthAudio.WaveCleared();
+            City? last = null;
+            for (int i = 0; i < s.Cities.Count && last == null; i++)
+                if (!s.Cities[i].Destroyed) last = s.Cities[i];
+            if (last != null && AssistThreatNear(s, last))
+            {
+                // Combat.UseEMP detonates at the cursor — borrow it for one call
+                float mx = s.MouseX, my = s.MouseY;
+                s.MouseX = last.X;
+                s.MouseY = s.GroundY - 90;
+                if (Combat.UseEMP(s))
+                {
+                    s.Note = "ASSIST: auto-EMP deployed";
+                    s.NoteT = 1.4f;
+                }
+                s.MouseX = mx;
+                s.MouseY = my;
+            }
         }
 
-        // Shop timer
-        if (s.Shop)
+        // Wave cleared → shop. §5 5.3: DebrisParts no longer gate the clear —
+        // debris is inert persistent ground litter now and would deadlock it.
+        if (s.Phase == GamePhase.Playing
+            && s.SpawnI >= s.WavePlan.Count
+            && s.Enemies.Count == 0 && s.UFOs.Count == 0 && s.Raiders.Count == 0
+            && s.Explosions.Count == 0 && s.Shockwaves.Count == 0)
         {
-            s.ShopTimer -= dt;
+            s.Phase = GamePhase.Shop;
+            s.ShopTimer = 18.0f;
+            // §5 3.5 end-of-wave salvage: intact structures shed scrap for the shop
+            // (recount here — the top-of-frame cache predates this frame's impacts)
+            int salvage = 0;
+            for (int i = 0; i < s.Cities.Count; i++) if (!s.Cities[i].Destroyed) salvage += 15;
+            for (int i = 0; i < s.Bases.Count; i++) if (!s.Bases[i].Destroyed) salvage += 8;
+            salvage = (int)MathF.Round(salvage * s.Perks.SalvageMult); // §5 4.3 SALVAGE RIGS
+            if (salvage > 0)
+            {
+                s.Scrap += salvage;
+                s.Note = $"Salvage recovered: +{salvage} scrap"; // once per wave — not a hot path
+                s.NoteT = 2.0f;
+            }
+            // §5 3.5 deterministic repairs: one free repair earned per 3 cleared
+            // waves; banked (counter holds) while nothing is damaged
+            s.Upgrades.WavesSinceFreeRepair++;
+            if (s.Upgrades.WavesSinceFreeRepair >= 3 && WaveSystem.FreeRepair(s))
+                s.Upgrades.WavesSinceFreeRepair = 0;
+            // §5 4.1 intel forecast: build and pin the NEXT wave's plan (§4.3)
+            WaveSystem.BuildForecast(s);
+            // §5 4.3 perk draft: 3 seeded cards (own stream — never plan draws)
+            PerkSystem.BuildDraft(s);
+            s.Events.Emit(EventKind.WaveCleared, s.W * 0.5f, s.H * 0.5f, s.Level);
+            Audio.SynthAudio.WaveCleared();
+            Audio.SynthAudio.ShopWhoosh(open: true); // §5 4.5 shop-open answer
+        }
+
+        // Shop timer (UI countdown — real time)
+        if (s.Phase == GamePhase.Shop)
+        {
+            s.ShopTimer -= rawDt;
             if (s.ShopTimer <= 0)
             {
-                s.Shop = false;
+                s.Phase = GamePhase.Playing;
                 s.Level++;
+                // §5 5.3: the wave's scorch history fades out across the wave
+                // pause (the only decay path — marks accumulate otherwise)
+                s.ScorchFadeT = 2.4f;
+                Audio.SynthAudio.ShopWhoosh(open: false); // §5 4.5 close answer
                 WaveSystem.StartWave(s, 2.9f);
             }
         }
@@ -149,18 +305,56 @@ public static class GameUpdate
         // Game over check
         if (aliveCities <= 0)
         {
-            if (!s.GameOver)
+            if (s.Phase != GamePhase.GameOver)
             {
                 s.GameOverTime = 0;
                 Audio.SynthAudio.GameOver();
             }
-            s.GameOver = true;
+            s.Phase = GamePhase.GameOver;
             s.Note = "Defense grid collapsed";
             s.NoteT = 2.2f;
         }
-        if (s.GameOver) s.GameOverTime += dt;
+        if (s.Phase == GamePhase.GameOver) s.GameOverTime += rawDt;
 
         UpdateDanger(s);
+        UpdateIntensity(s, simDt);
+    }
+
+    // §4.5 spawn-hold gate — tuned so only sustained, multi-source stress trips it
+    const float SpawnHoldIntensity = 0.85f;
+
+    /// <summary>§4.5 — THE shared tension scalar. Every term is clamped 0..1:
+    ///   city     = RecentCityHits · 0.5      (DrainEvents adds 1 per city lost; exp decay τ≈6 s — 2 fresh losses saturate)
+    ///   inbound  = hostiles / (6 + 2·aliveBases)   with hostiles = enemies + 2·(UFOs + raiders)
+    ///   nearMiss = terminal · 0.25            (enemies past 80% of their flight — 4 about-to-land saturate)
+    ///   scarcity = 1 − totalBaseAmmo / 60     (ready interceptor stock)
+    ///   raw      = 0.34·city + 0.30·inbound + 0.20·nearMiss + 0.16·scarcity
+    ///   Intensity → one-pole toward raw, τ ≈ 2 s. Runs on simDt only — frozen
+    /// (hit-stop) frames never advance tension.</summary>
+    static void UpdateIntensity(GameState s, float dt)
+    {
+        if (dt <= 0) return;
+        s.RecentCityHits *= MathF.Exp(-dt / 6f);
+        if (s.RecentCityHits < 0.01f) s.RecentCityHits = 0;
+
+        float city = MathH.Clamp(s.RecentCityHits * 0.5f, 0, 1);
+        int hostiles = s.Enemies.Count + (s.UFOs.Count + s.Raiders.Count) * 2;
+        float inbound = MathH.Clamp(hostiles / (6f + 2f * s.AliveBases), 0, 1);
+        int terminal = 0;
+        for (int i = 0; i < s.Enemies.Count; i++)
+        {
+            var m = s.Enemies[i];
+            if (m._Dur > 0 && m._Elapsed > m._Dur * 0.8f) terminal++;
+        }
+        float nearMiss = MathH.Clamp(terminal * 0.25f, 0, 1);
+        int totalAmmo = 0;
+        for (int i = 0; i < s.Bases.Count; i++)
+            if (!s.Bases[i].Destroyed) totalAmmo += s.Bases[i].Ammo;
+        float scarcity = 1f - MathH.Clamp(totalAmmo / 60f, 0, 1);
+
+        float raw = 0.34f * city + 0.30f * inbound + 0.20f * nearMiss + 0.16f * scarcity;
+        float k = 1f - MathF.Exp(-dt / 2f);
+        s.Intensity += (MathH.Clamp(raw, 0, 1) - s.Intensity) * k;
     }
 
     // --- Enemy Update ---
@@ -172,10 +366,11 @@ public static class GameUpdate
             m._Elapsed += dt;
             float p = m._Dur > 0 ? m._Elapsed / m._Dur : 1;
 
-            // Split check
-            if (m.Variant == "split" && !m.HasSplit && p >= m.SplitAt)
+            // Split check — "split" variant and §5 4.2 plan-tagged MIRV heavies
+            if ((m.Split || m.Mirv) && !m.HasSplit && p >= m.SplitAt)
             {
                 Combat.SplitMissile(s, m);
+                m.Dead = true;
                 s.Enemies.RemoveAt(i);
                 continue;
             }
@@ -183,10 +378,14 @@ public static class GameUpdate
             // Reached target
             if (p >= 1)
             {
+                m.Dead = true;
                 s.Enemies.RemoveAt(i);
                 Combat.ImpactEnemy(s, m, m.Tx, m.Ty);
                 continue;
             }
+
+            // §5 4.2 behavioral roster — every act telegraphs ≥0.5 s ahead
+            UpdBehaviors(s, m, p, dt);
 
             // Homing
             if (m.HomingFactor > 0 && m.Target != null)
@@ -224,14 +423,75 @@ public static class GameUpdate
             m.Y = y;
 
             // Record trail position for curved trail rendering
-            m.Trail.Insert(0, (m.X, m.Y));
-            if (m.Trail.Count > Enemy.MaxTrail) m.Trail.RemoveAt(m.Trail.Count - 1);
+            m.Trail.Push(m.X, m.Y);
 
             // Hit ground
             if (m.Y >= s.GroundY - 4)
             {
+                m.Dead = true;
                 s.Enemies.RemoveAt(i);
                 Combat.ImpactEnemy(s, m, m.X, s.GroundY - 2);
+            }
+        }
+    }
+
+    // §5 4.2 telegraph lead — every behavior cues glow + audio this far ahead
+    const float TelegraphLead = 0.6f;
+
+    /// <summary>§5 4.2 behavioral roster: carrier deploy, MIRV warning, stealth
+    /// decloak pings. Telegraph one-shots only fire while the sim advances
+    /// (p is frozen at dt == 0, so a crossing always lands on a live frame).</summary>
+    static void UpdBehaviors(GameState s, Enemy m, float p, float dt)
+    {
+        // Carrier: bay glow + servo ping ≥0.5 s before releasing 2-3 drones.
+        // An early kill removes the carrier before the deploy point — spawn denied.
+        if (m.Variant == "carrier" && !m._Deployed && m._Dur > 0)
+        {
+            if (!m.TelegraphPinged && (m.DeployAt - p) * m._Dur <= TelegraphLead)
+            {
+                m.TelegraphPinged = true;
+                Audio.SynthAudio.CarrierBay(MathH.Clamp(m.X / s.W, 0, 1));
+            }
+            if (m.TelegraphPinged) m.TelegraphT += dt;
+            if (p >= m.DeployAt)
+            {
+                m._Deployed = true;
+                m.TelegraphT = 0;
+                Combat.DeployDrones(s, m);
+            }
+        }
+
+        // MIRV heavy: pulsing warning glow + warble ≥0.5 s before the split
+        // (the split itself rides the shared SplitAt check in UpdEnemies)
+        if (m.Mirv && !m.HasSplit && m._Dur > 0)
+        {
+            if (!m.TelegraphPinged && (m.SplitAt - p) * m._Dur <= TelegraphLead)
+            {
+                m.TelegraphPinged = true;
+                Audio.SynthAudio.MirvWarble(MathH.Clamp(m.X / s.W, 0, 1));
+            }
+            if (m.TelegraphPinged) m.TelegraphT += dt;
+        }
+
+        // Stealth: periodic decloak ping (~1.4 s, cosmetic jitter) while cloaked —
+        // a brief light burst + sonar blip gives skilled players a track
+        if (m.Variant == "stealth")
+        {
+            m.PingT -= dt;
+            if (m.PingT <= 0)
+            {
+                m.PingT = VariantStats.Def(m.Variant).CloakPing + MathH.Rand(-0.25f, 0.25f);
+                // Same visibility curve the renderer uses — ping only while faded
+                float vis = MathF.Pow(MathH.Clamp((m.Y + 100) / (s.GroundY + 100), 0, 1), 3) * 0.55f + 0.05f;
+                if (vis < 0.4f)
+                {
+                    s.LightBursts.Add(new LightBurst
+                    {
+                        X = m.X, Y = m.Y,
+                        Radius = 46, Life = 0.32f, MaxLife = 0.32f
+                    });
+                    Audio.SynthAudio.SonarBlip(MathH.Clamp(m.X / s.W, 0, 1));
+                }
             }
         }
     }
@@ -254,7 +514,10 @@ public static class GameUpdate
                 u.FireCd = MathH.Rand(1.15f, 2.2f);
             }
             if ((u.Vx > 0 && u.X > s.W + 130) || (u.Vx < 0 && u.X < -130))
+            {
+                u.Dead = true;
                 s.UFOs.RemoveAt(i);
+            }
         }
     }
 
@@ -284,7 +547,10 @@ public static class GameUpdate
             r.Angle = MathF.Atan2(MathF.Cos(s.Time * 2.7f + r.Angle) * 24, r.Vx);
 
             if (r.X < -180 || r.X > s.W + 180)
+            {
+                r.Dead = true;
                 s.Raiders.RemoveAt(i);
+            }
         }
     }
 
@@ -338,8 +604,7 @@ public static class GameUpdate
             }
 
             // Record trail position for curved trail rendering
-            m.Trail.Insert(0, (m.X, m.Y));
-            if (m.Trail.Count > PlayerMissile.MaxTrail) m.Trail.RemoveAt(m.Trail.Count - 1);
+            m.Trail.Push(m.X, m.Y);
 
             float p = m._Dur > 0 ? m._Elapsed / m._Dur : 1;
             if (p >= 1)
@@ -356,102 +621,140 @@ public static class GameUpdate
                     Combat.SpawnExpl(s, m.Tx, m.Ty, m._Blast, 1.28f, 0.36f, player: true, flash: 0.08f);
                 }
             }
+            // §5 4.3 MIRV INTERCEPTOR perk: base-launched interceptors shed 3
+            // homing children at mid-flight (Hr missiles never re-split;
+            // point-blank shots with sub-0.5 s flights don't split). Children
+            // append past the loop start, so they update next frame.
+            else if (s.Perks.MirvInterceptor && !m.Hr && p >= 0.5f && m._Dur >= 0.5f
+                     && s.Phase == GamePhase.Playing)
+            {
+                s.PlayerMissiles.RemoveAt(i);
+                Combat.SplitPlayerMissile(s, m);
+            }
         }
     }
 
-    /// <summary>Check if a HellRaiser missile's target is still alive.</summary>
+    /// <summary>Check if a HellRaiser missile's target is still alive (§5 2.6: direct references).</summary>
     static bool HrTargetAlive(GameState s, PlayerMissile m)
     {
-        if (string.IsNullOrEmpty(m.HrTargetKind)) return false;
-        return m.HrTargetKind switch
+        // Every Enemy removal path sets Dead; UFOs/Raiders can be removed by
+        // PhalanxSystem without a flag, so verify membership too (lists are tiny).
+        if (m.HrTargetEnemy != null) return !m.HrTargetEnemy.Dead;
+        if (m.HrTargetUfo != null) return !m.HrTargetUfo.Dead && s.UFOs.Contains(m.HrTargetUfo);
+        if (m.HrTargetRaider != null) return !m.HrTargetRaider.Dead && s.Raiders.Contains(m.HrTargetRaider);
+
+        // Launch handoff: HellRaiserSystem passes kind+id once; adopt as a direct reference.
+        if (m.HrTargetKind.Length == 0) return false;
+        switch (m.HrTargetKind)
         {
-            "enemy" => s.Enemies.Any(e => e.Id == m.HrTargetId),
-            "ufo" => s.UFOs.Any(u => u.Id == m.HrTargetId),
-            "raider" => s.Raiders.Any(r => r.Id == m.HrTargetId),
-            _ => false
-        };
+            case "enemy":
+                foreach (var e in s.Enemies)
+                    if (e.Id == m.HrTargetId) { m.HrTargetEnemy = e; m.HrTargetKind = ""; return true; }
+                break;
+            case "ufo":
+                foreach (var u in s.UFOs)
+                    if (u.Id == m.HrTargetId) { m.HrTargetUfo = u; m.HrTargetKind = ""; return true; }
+                break;
+            case "raider":
+                foreach (var r in s.Raiders)
+                    if (r.Id == m.HrTargetId) { m.HrTargetRaider = r; m.HrTargetKind = ""; return true; }
+                break;
+        }
+        m.HrTargetKind = "";
+        return false;
     }
 
     /// <summary>Get the predicted position of a HellRaiser missile's target with lead.</summary>
     static (float X, float Y)? GetHrTargetPoint(GameState s, PlayerMissile m, float lead)
     {
-        if (string.IsNullOrEmpty(m.HrTargetKind)) return null;
-        if (m.HrTargetKind == "enemy")
-        {
-            var e = s.Enemies.FirstOrDefault(e => e.Id == m.HrTargetId);
-            if (e == null) return null;
-            return (e.X + e._Vx * lead, e.Y + e._Vy * lead);
-        }
-        if (m.HrTargetKind == "ufo")
-        {
-            var u = s.UFOs.FirstOrDefault(u => u.Id == m.HrTargetId);
-            if (u == null) return null;
-            return (u.X + u.Vx * lead, u.Y);
-        }
-        if (m.HrTargetKind == "raider")
-        {
-            var r = s.Raiders.FirstOrDefault(r => r.Id == m.HrTargetId);
-            if (r == null) return null;
-            return (r.X + r.Vx * lead, r.Y + MathF.Sin((s.Time + lead) * 2.7f + r.Angle) * 10);
-        }
+        if (m.HrTargetEnemy is { } e) return (e.X + e._Vx * lead, e.Y + e._Vy * lead);
+        if (m.HrTargetUfo is { } u) return (u.X + u.Vx * lead, u.Y);
+        if (m.HrTargetRaider is { } r) return (r.X + r.Vx * lead, r.Y + MathF.Sin((s.Time + lead) * 2.7f + r.Angle) * 10);
         return null;
     }
 
-    /// <summary>Pick a new target for a HellRaiser homing missile using weighted selection.</summary>
+    // Candidate weights for HellRaiser retargeting; 0 = excluded. Kept as separate
+    // helpers so the two-pass pick below computes identical values in both passes.
+    static float HrWeightEnemy(GameState s, PlayerMissile m, Enemy e)
+    {
+        if (e.Y > s.GroundY + 18) return 0;
+        float dx = e.X - m.X, dy = e.Y - m.Y;
+        float dist = MathF.Sqrt(dx * dx + dy * dy);
+        if (dist > 900) return 0;
+        float distW = 1f / (0.38f + dist * 0.0034f);
+        float baseW = 80 + (e.Target?.Type == "city" ? 46 : 0);
+        return MathF.Max(1, baseW * distW);
+    }
+
+    static float HrWeightUfo(PlayerMissile m, UFO u)
+    {
+        float dx = u.X - m.X, dy = u.Y - m.Y;
+        float dist = MathF.Sqrt(dx * dx + dy * dy);
+        if (dist > 900) return 0;
+        float distW = 1f / (0.38f + dist * 0.0034f);
+        return MathF.Max(1, (u.Boss ? 200 : 120) * distW);
+    }
+
+    static float HrWeightRaider(PlayerMissile m, Raider r)
+    {
+        float dx = r.X - m.X, dy = r.Y - m.Y;
+        float dist = MathF.Sqrt(dx * dx + dy * dy);
+        if (dist > 900) return 0;
+        float distW = 1f / (0.38f + dist * 0.0034f);
+        return MathF.Max(1, 228 * distW);
+    }
+
+    /// <summary>Pick a new target for a HellRaiser homing missile using weighted selection.
+    /// Two passes over the candidate lists replace the old per-retarget pool list —
+    /// zero allocation, identical pick order/RNG consumption.</summary>
     static void PickNewHrTarget(GameState s, PlayerMissile m)
     {
-        var pool = new List<(string Kind, int Id, float Weight)>();
+        m.HrTargetEnemy = null;
+        m.HrTargetUfo = null;
+        m.HrTargetRaider = null;
+        m.HrTargetKind = "";
+        m.HrTargetId = -1;
+
+        float total = 0;
+        foreach (var e in s.Enemies) total += HrWeightEnemy(s, m, e);
+        foreach (var u in s.UFOs) total += HrWeightUfo(m, u);
+        foreach (var r in s.Raiders) total += HrWeightRaider(m, r);
+        if (total <= 0) return;
+
+        // Weighted random pick
+        float roll = RandHelper.Next01() * total;
+        float acc = 0;
+        Enemy? lastE = null;
+        UFO? lastU = null;
+        Raider? lastR = null;
         foreach (var e in s.Enemies)
         {
-            if (e.Y > s.GroundY + 18) continue;
-            float dx = e.X - m.X, dy = e.Y - m.Y;
-            float dist = MathF.Sqrt(dx * dx + dy * dy);
-            if (dist > 900) continue;
-            float distW = 1f / (0.38f + dist * 0.0034f);
-            float baseW = 80 + (e.Target?.Type == "city" ? 46 : 0);
-            pool.Add(("enemy", e.Id, MathF.Max(1, baseW * distW)));
+            float w = HrWeightEnemy(s, m, e);
+            if (w <= 0) continue;
+            lastE = e;
+            acc += w;
+            if (roll <= acc) { m.HrTargetEnemy = e; return; }
         }
         foreach (var u in s.UFOs)
         {
-            float dx = u.X - m.X, dy = u.Y - m.Y;
-            float dist = MathF.Sqrt(dx * dx + dy * dy);
-            if (dist > 900) continue;
-            float distW = 1f / (0.38f + dist * 0.0034f);
-            pool.Add(("ufo", u.Id, MathF.Max(1, (u.Boss ? 200 : 120) * distW)));
+            float w = HrWeightUfo(m, u);
+            if (w <= 0) continue;
+            lastU = u;
+            acc += w;
+            if (roll <= acc) { m.HrTargetUfo = u; return; }
         }
         foreach (var r in s.Raiders)
         {
-            float dx = r.X - m.X, dy = r.Y - m.Y;
-            float dist = MathF.Sqrt(dx * dx + dy * dy);
-            if (dist > 900) continue;
-            float distW = 1f / (0.38f + dist * 0.0034f);
-            pool.Add(("raider", r.Id, MathF.Max(1, 228 * distW)));
+            float w = HrWeightRaider(m, r);
+            if (w <= 0) continue;
+            lastR = r;
+            acc += w;
+            if (roll <= acc) { m.HrTargetRaider = r; return; }
         }
-
-        if (pool.Count == 0)
-        {
-            m.HrTargetKind = "";
-            m.HrTargetId = -1;
-            return;
-        }
-
-        // Weighted random pick
-        float total = pool.Sum(p => p.Weight);
-        float roll = RandHelper.Next01() * total;
-        float acc = 0;
-        foreach (var p in pool)
-        {
-            acc += p.Weight;
-            if (roll <= acc)
-            {
-                m.HrTargetKind = p.Kind;
-                m.HrTargetId = p.Id;
-                return;
-            }
-        }
-        var last = pool[^1];
-        m.HrTargetKind = last.Kind;
-        m.HrTargetId = last.Id;
+        // Float-rounding fallback — the last candidate in pool order (raiders last)
+        if (lastR != null) m.HrTargetRaider = lastR;
+        else if (lastU != null) m.HrTargetUfo = lastU;
+        else m.HrTargetEnemy = lastE;
     }
 
     // --- Explosions Update ---
@@ -475,16 +778,73 @@ public static class GameUpdate
     static void UpdParticles(GameState s, float dt)
     {
         // Sparks
+        int scrapPickups = 0;
         for (int i = s.Sparks.Count - 1; i >= 0; i--)
         {
             var sp = s.Sparks[i];
             sp.Life -= dt;
-            if (sp.Life <= 0) { s.Sparks.RemoveAt(i); continue; }
-            sp.Vy += 140 * dt;
-            sp.X += sp.Vx * dt;
-            sp.Y += sp.Vy * dt;
-            sp.Vx *= 0.994f;
+            if (sp.Life <= 0)
+            {
+                if (sp.Target) scrapPickups++; // expiry lands on the counter (see below)
+                s.Sparks.RemoveAt(i);
+                continue;
+            }
+            if (sp.Target)
+            {
+                // §5 3.5 magnet-stream: scatter velocity fades out while an
+                // accelerating position pull (∝ t²) takes over — converges on the
+                // HUD counter within the spark's ~0.7 s life
+                float t = 1 - sp.Life / sp.MaxLife;
+                sp.X += sp.Vx * dt * (1 - t);
+                sp.Y += sp.Vy * dt * (1 - t);
+                float k = MathF.Min(1f, t * t * 22f * dt);
+                sp.X += (s.ScrapHudX - sp.X) * k;
+                sp.Y += (s.ScrapHudY - sp.Y) * k;
+                float ddx = s.ScrapHudX - sp.X, ddy = s.ScrapHudY - sp.Y;
+                if (ddx * ddx + ddy * ddy < 12f * 12f)
+                {
+                    scrapPickups++;
+                    s.Sparks.RemoveAt(i);
+                    continue;
+                }
+            }
+            else if (sp.Kind == SparkKind.Hot)
+            {
+                // §5 5.3 white-hot core: violent start, high drag on both axes
+                sp.X += sp.Vx * dt;
+                sp.Y += sp.Vy * dt;
+                sp.Vx *= 0.86f;
+                sp.Vy *= 0.86f;
+            }
+            else if (sp.Kind == SparkKind.Ember)
+            {
+                // §5 5.3 ember: heavier gravity; settles and cools where it lands
+                sp.Vy += 260 * dt;
+                sp.X += sp.Vx * dt;
+                sp.Y += sp.Vy * dt;
+                sp.Vx *= 0.988f;
+                if (sp.Y > s.GroundY - 2)
+                {
+                    sp.Y = s.GroundY - 2;
+                    sp.Vx *= 0.6f;
+                    sp.Vy = 0;
+                }
+            }
+            else
+            {
+                sp.Vy += 140 * dt;
+                sp.X += sp.Vx * dt;
+                sp.Y += sp.Vy * dt;
+                sp.Vx *= 0.994f;
+            }
             s.Sparks[i] = sp;
+        }
+        // Subtle pickup tick per arrival batch (existing voice, rate-limited,
+        // panned toward the bottom-left HUD)
+        if (scrapPickups > 0 && s.ScrapTickCd <= 0)
+        {
+            s.ScrapTickCd = 0.1f;
+            Audio.SynthAudio.Incoming(0.12f, 0.2f);
         }
 
         // Smoke
@@ -513,23 +873,38 @@ public static class GameUpdate
             s.Trails[i] = tr;
         }
 
-        // Debris
+        // Debris (§5 5.3 permanence): falls, bounces ONCE (restitution ~0.3),
+        // then rests as ground litter for the rest of the wave. Life is only
+        // the cooling clock — removal is wave start or the oldest-evicted cap.
         for (int i = s.DebrisParts.Count - 1; i >= 0; i--)
         {
             var d = s.DebrisParts[i];
-            d.Life -= dt;
-            if (d.Life <= 0) { s.DebrisParts.RemoveAt(i); continue; }
+            if (d.Life > 0)
+            {
+                d.Life = MathF.Max(0, d.Life - dt);
+                if (d.Resting) { s.DebrisParts[i] = d; continue; }
+            }
+            else if (d.Resting) continue; // cooled litter: fully inert
             d.Vy += 360 * dt;
             d.X += d.Vx * dt;
             d.Y += d.Vy * dt;
             d.Rot += d.RotSpeed * dt;
             d.Vx *= 0.992f;
-            if (d.Y > s.GroundY - 2)
+            if (d.Y > s.GroundY - 2 && d.Vy > 0)
             {
                 d.Y = s.GroundY - 2;
-                d.Vy *= -0.26f;
-                d.Vx *= 0.84f;
-                d.RotSpeed *= 0.7f;
+                if (!d.Bounced)
+                {
+                    d.Bounced = true;
+                    d.Vy *= -0.3f;
+                    d.Vx *= 0.7f;
+                    d.RotSpeed *= 0.5f;
+                }
+                else
+                {
+                    d.Resting = true;
+                    d.Vx = 0; d.Vy = 0; d.RotSpeed = 0;
+                }
             }
             s.DebrisParts[i] = d;
         }
@@ -563,13 +938,55 @@ public static class GameUpdate
             s.MuzzleFlashes[i] = mf;
         }
 
-        // Scorches
+        // Scorches (§5 5.3): marks hold all wave (only Heat — the lingering
+        // ground glow — cools); the shop-close ScorchFadeT window is the one
+        // place Life drains, staggering them out across the wave pause.
+        bool scorchFade = s.ScorchFadeT > 0;
+        if (scorchFade) s.ScorchFadeT = MathF.Max(0, s.ScorchFadeT - dt);
         for (int i = s.Scorches.Count - 1; i >= 0; i--)
         {
             var sc = s.Scorches[i];
-            sc.Life -= dt;
-            if (sc.Life <= 0) { s.Scorches.RemoveAt(i); continue; }
+            if (sc.Heat > 0) sc.Heat = MathF.Max(0, sc.Heat - dt * 0.4f);
+            if (scorchFade)
+            {
+                sc.Life -= dt * 5f;
+                if (sc.Life <= 0) { s.Scorches.RemoveAt(i); continue; }
+            }
             s.Scorches[i] = sc;
+        }
+
+        // Blast flash quads (§5 5.3) — die within a frame or two
+        for (int i = s.BlastFlashes.Count - 1; i >= 0; i--)
+        {
+            var bf = s.BlastFlashes[i];
+            bf.Life -= dt;
+            if (bf.Life <= 0) { s.BlastFlashes.RemoveAt(i); continue; }
+            s.BlastFlashes[i] = bf;
+        }
+
+        // §5 5.3 smoke columns: city ruins wisp continuously. Rate-limited by
+        // RuinSmokeCd; the cap below MaxSmoke reserves headroom for blasts.
+        s.RuinSmokeCd -= dt;
+        if (s.RuinSmokeCd <= 0)
+        {
+            s.RuinSmokeCd = 0.6f;
+            const int ruinSmokeCap = 120;
+            foreach (var c in s.Cities)
+            {
+                if (!c.Destroyed || s.SmokeParts.Count >= ruinSmokeCap) continue;
+                float life = MathH.Rand(3.2f, 5.6f);
+                s.SmokeParts.Add(new Smoke
+                {
+                    X = c.X + MathH.Rand(-0.28f, 0.28f) * c.W,
+                    Y = c.Y - MathH.Rand(4, 24),
+                    Vx = MathH.Rand(-6, 6) + s.Weather.Wind * 0.08f,
+                    Vy = -MathH.Rand(10, 22),
+                    Life = life, MaxLife = life,
+                    Size = MathH.Rand(9, 16),
+                    Alpha = MathH.Rand(0.28f, 0.42f), // column reads, blasts stay darker
+                    Blend = BlendClass.Alpha
+                });
+            }
         }
 
         // Shooting stars
@@ -601,10 +1018,27 @@ public static class GameUpdate
         }
     }
 
+    /// <summary>True when an enemy projectile is close enough to the last city to
+    /// justify the assist auto-EMP (§5 3.1).</summary>
+    static bool AssistThreatNear(GameState s, City c)
+    {
+        const float reach = 250f;
+        foreach (var m in s.Enemies)
+        {
+            float dx = m.X - c.X, dy = m.Y - (s.GroundY - 30);
+            if (dx * dx + dy * dy < reach * reach) return true;
+        }
+        return false;
+    }
+
     static void UpdateDanger(GameState s)
     {
-        if (s.Intro || s.GameOver) { s.Danger = 0; return; }
-        int alive = Math.Max(1, s.Cities.Count(c => !c.Destroyed));
+        if (s.Phase != GamePhase.Playing && s.Phase != GamePhase.Shop) { s.Danger = 0; return; }
+        // Fresh post-collision count (plain loop) — the top-of-frame cache predates this frame's kills
+        int aliveC = 0;
+        for (int i = 0; i < s.Cities.Count; i++) if (!s.Cities[i].Destroyed) aliveC++;
+        s.AliveCities = aliveC;
+        int alive = Math.Max(1, aliveC);
         float d = 0;
         d += s.Enemies.Count * 12;
         d += (s.WavePlan.Count - s.SpawnI) * 1.8f;

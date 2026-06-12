@@ -7,8 +7,9 @@ public static class MathH
     public static float Clamp(float v, float min, float max)
         => MathF.Max(min, MathF.Min(max, v));
 
+    // §4.3: cosmetic-stream backed (was Random.Shared). Same signature/range.
     public static float Rand(float a, float b)
-        => a + Random.Shared.NextSingle() * (b - a);
+        => a + RandHelper.Next01() * (b - a);
 
     public static float Rand(float a, float b, Random rng)
         => a + rng.NextSingle() * (b - a);

@@ -1,10 +1,18 @@
 ﻿using Raylib_cs;
 using MissileCommandOverdrive;
 using MissileCommandOverdrive.Audio;
+using MissileCommandOverdrive.Entities;
 using MissileCommandOverdrive.Util;
 
 const int InitialWidth = 1280;
 const int InitialHeight = 720;
+
+// §5 3.2 determinism self-check (MCOD_SELFTEST=1): runs headless before
+// InitWindow, prints PASS/FAIL, exits.
+if (Environment.GetEnvironmentVariable("MCOD_SELFTEST") == "1")
+{
+    Environment.Exit(SelfTest.Run() ? 0 : 1);
+}
 
 Raylib.SetConfigFlags(ConfigFlags.ResizableWindow | ConfigFlags.Msaa4xHint);
 Raylib.InitWindow(InitialWidth, InitialHeight, "Missile Command Overdrive");
@@ -20,11 +28,22 @@ var S = new GameState
     H = InitialHeight
 };
 
+RandHelper.Bind(S); // §4.3: the cosmetic stream lives on GameState
+Profile.Load();     // §4.2: profile (settings/top-10/lifetime) loads before world init
+S.Settings = Profile.Data.Settings; // same object — live settings edits persist on save
+
 Resize(S);
 GameInit.BuildWorld(S);
 SynthAudio.Init();
+SynthAudio.SetVolume(S.Settings.Volume); // Settings owns the master level (§5 3.1)
 
-while (!Raylib.WindowShouldClose())
+// §4.10 resize debounce: world geometry tracks the drag every frame (cheap),
+// but the RNG scenery/weather rebuild waits until the size has been stable.
+const float ResizeSettleDelay = 0.25f;
+float resizeSettleT = 0f;
+var prevPhase = S.Phase; // for the game-over edge (profile insert + initials arm)
+
+while (!Raylib.WindowShouldClose() && !S.QuitRequested)
 {
     // Handle resize
     if (Raylib.IsWindowResized())
@@ -32,134 +51,287 @@ while (!Raylib.WindowShouldClose())
         S.W = Raylib.GetScreenWidth();
         S.H = Raylib.GetScreenHeight();
         Resize(S);
+        resizeSettleT = ResizeSettleDelay;
     }
 
-    float dt = Raylib.GetFrameTime();
-    if (dt > 0.1f) dt = 0.1f; // cap to avoid giant steps
+    // §4.7 time spine: rawDt drives UI/floaters/shake/audio, simDt the sim
+    float rawDt = Raylib.GetFrameTime();
+    if (rawDt > 1f / 30f) rawDt = 1f / 30f;
+
+    if (resizeSettleT > 0)
+    {
+        resizeSettleT -= rawDt;
+        if (resizeSettleT <= 0) GameInit.RebuildScenery(S);
+    }
 
     // Input
     var mp = Raylib.GetMousePosition();
     S.MouseX = mp.X;
     S.MouseY = mp.Y;
+    if (DemoDriver.Active) DemoDriver.PinCursor(S); // scripted runs ignore the OS cursor
 
-    HandleInput(S);
-    if (!S.Intro) GameUpdate.UpdateAll(S, dt);
-    else S.Time += dt;
-    SynthAudio.Update(S, dt);
+    HandleInput(S, rawDt);
+    // §5 3.1 phase gate: Paused freezes the sim AND the feel clocks (hit-stop,
+    // trauma noise, time-scale ease all hold), never via HitStop.
+    switch (S.Phase)
+    {
+        case GamePhase.Title:
+            FeelDirector.Tick(S, rawDt);
+            S.Time += rawDt;
+            break;
+        case GamePhase.Paused:
+            break; // world frozen; audio still pumps below (§4.6)
+        default:
+            FeelDirector.Tick(S, rawDt);
+            float simDt = S.HitStop > 0 ? 0f : rawDt * S.TimeScale;
+            GameUpdate.UpdateAll(S, simDt, rawDt);
+            break;
+    }
+    DrainEvents(S);
+    // §5 3.2: run-ended edge — covers both the GameUpdate collapse and the
+    // WaveSystem no-target bail-out (single hook for every GameOver writer)
+    if (S.Phase == GamePhase.GameOver && prevPhase != GamePhase.GameOver)
+        Profile.OnGameOver(S);
+    prevPhase = S.Phase;
+    SynthAudio.Update(S, rawDt, S.TimeScale);
 
     Raylib.BeginDrawing();
     Raylib.ClearBackground(new Color(2, 5, 10, 255));
     MissileCommandOverdrive.Rendering.Renderer.DrawAll(S);
     Raylib.EndDrawing();
+
+    if (DemoDriver.Active && !DemoDriver.Update(S)) break;
 }
 
+Profile.Save(); // §4.2: settings + lifetime stats persist on shutdown
 MissileCommandOverdrive.Rendering.Renderer.Shutdown();
 SynthAudio.Shutdown();
 Raylib.CloseWindow();
 
 // --- Core functions ---
 
+// Drain the per-frame event ring — the single consumer loop. Later features
+// (SynthAudio reactions, StatsTracker) plug in here, before Clear().
+static void DrainEvents(GameState s)
+{
+    var ring = s.Events;
+    for (int i = 0; i < ring.Count; i++)
+    {
+        ref readonly var e = ref ring.At(i);
+        s.Debug.EventCounts[(int)e.Kind]++;
+        // Lifetime stats (§5 3.2) — persisted with the profile
+        if (e.Kind == EventKind.Kill) Profile.Data.Lifetime.Kills++;
+        else if (e.Kind == EventKind.WaveCleared) Profile.Data.Lifetime.WavesCleared++;
+        // §4.5 tension input: city losses feed the decaying accumulator behind
+        // s.Intensity (GameUpdate.UpdateIntensity owns the decay + blend)
+        else if (e.Kind == EventKind.CityDestroyed) s.RecentCityHits += 1f;
+        FeelDirector.OnEvent(s, in e);
+    }
+    ring.Clear();
+}
+
+// §5 4.5: one denied-buzz path for every refused shop interaction
+static void ShopDeny(GameState s, string msg)
+{
+    SynthAudio.UiDeny();
+    s.Msg = msg;
+    s.MsgT = 1.0f;
+}
+
 static void Resize(GameState s)
 {
     s.GroundY = s.H * 0.82f;
     s.HorizonY = s.H * 0.38f;
-    // Reposition defenses and rebuild scenery for new dimensions
+    // Reposition defenses for new dimensions (scenery rebuild is debounced — §4.10)
     if (s.Bases.Count > 0)
         GameInit.Reposition(s);
 }
 
-static void HandleInput(GameState s)
+static void HandleInput(GameState s, float rawDt)
 {
-    // ----- SECRET CODE BUFFER (666 -> summon demon) -----
-    // Accept digits 0-9 and letters a-z, keep last 8 chars
-    int keyCh = Raylib.GetCharPressed();
-    while (keyCh > 0)
+    // ----- INITIALS ENTRY (§5 3.2) — swallows all input until confirmed -----
+    if (s.Phase == GamePhase.GameOver && Profile.PendingInitials)
     {
-        if ((keyCh >= '0' && keyCh <= '9') || (keyCh >= 'a' && keyCh <= 'z') || (keyCh >= 'A' && keyCh <= 'Z'))
-        {
-            SecretCode.Buffer += char.ToLowerInvariant((char)keyCh);
-            if (SecretCode.Buffer.Length > 8) SecretCode.Buffer = SecretCode.Buffer.Substring(SecretCode.Buffer.Length - 8);
-            if (SecretCode.Buffer.EndsWith("666"))
-            {
-                DemonSystem.Summon(s);
-                SecretCode.Buffer = "";
-            }
-            else if (SecretCode.Buffer.EndsWith("777"))
-            {
-                MothershipSystem.Summon(s);
-                SecretCode.Buffer = "";
-            }
-        }
-        keyCh = Raylib.GetCharPressed();
+        Profile.UpdateInitialsEntry(s, rawDt);
+        return;
     }
 
-    // ----- SHOP INPUT (between waves) -----
-    if (s.Shop)
+    // ----- PAUSE (§5 3.1; ESC is free — SetExitKey(Null) above) -----
+    if (s.Phase == GamePhase.Paused)
     {
-        if (Raylib.IsKeyPressed(KeyboardKey.One) && s.Score >= 5000)
+        Menu.Update(s); // swallows all input, incl. ESC-to-resume
+        return;
+    }
+    if (Raylib.IsKeyPressed(KeyboardKey.Escape)
+        && (s.Phase == GamePhase.Playing || s.Phase == GamePhase.Shop))
+    {
+        Menu.Open(s);
+        return;
+    }
+
+    // ----- SECRET CODE BUFFER (666 -> summon demon) -----
+    // Accept digits 0-9 and letters a-z, keep last 8 chars. Playing only —
+    // §5 4.3 audit note: shop draft/buy digits must never type a summon code.
+    if (s.Phase == GamePhase.Playing)
+    {
+        int keyCh = Raylib.GetCharPressed();
+        while (keyCh > 0)
         {
-            var dead = s.Cities.Where(c => c.Destroyed).ToList();
-            if (dead.Count > 0)
+            if ((keyCh >= '0' && keyCh <= '9') || (keyCh >= 'a' && keyCh <= 'z') || (keyCh >= 'A' && keyCh <= 'Z'))
             {
-                s.Score -= 5000;
-                var c = dead[Random.Shared.Next(dead.Count)];
-                c.Destroyed = false;
-                SynthAudio.Thunder(0.5f, 0.4f);
-                s.Msg = "City rebuilt"; s.MsgT = 1.2f;
+                SecretCode.Buffer += char.ToLowerInvariant((char)keyCh);
+                if (SecretCode.Buffer.Length > 8) SecretCode.Buffer = SecretCode.Buffer.Substring(SecretCode.Buffer.Length - 8);
+                if (SecretCode.Buffer.EndsWith("666"))
+                {
+                    DemonSystem.Summon(s);
+                    SecretCode.Buffer = "";
+                }
+                else if (SecretCode.Buffer.EndsWith("777"))
+                {
+                    MothershipSystem.Summon(s);
+                    SecretCode.Buffer = "";
+                }
             }
-            else { s.Msg = "All cities intact"; s.MsgT = 1.0f; }
+            keyCh = Raylib.GetCharPressed();
         }
-        else if (Raylib.IsKeyPressed(KeyboardKey.Two) && s.Score >= 2500)
+    }
+
+    // ----- SHOP INPUT (between waves; §5 3.5 — spends SCRAP, Score stays
+    // leaderboard-pure: buying upgrades can never lower the final score) -----
+    if (s.Phase == GamePhase.Shop)
+    {
+        // §5 4.3 perk draft: 1-3 install a card, R rerolls once for 150 scrap.
+        // This block RETURNS below, before the global R-restart handler — a
+        // shop reroll can never restart the run. The seven scrap buys moved to
+        // 4-0 so the draft owns the 1-3 muscle-memory row (README updated).
+        if (Raylib.IsKeyPressed(KeyboardKey.One)) PerkSystem.TryPick(s, 0);
+        else if (Raylib.IsKeyPressed(KeyboardKey.Two)) PerkSystem.TryPick(s, 1);
+        else if (Raylib.IsKeyPressed(KeyboardKey.Three)) PerkSystem.TryPick(s, 2);
+        else if (Raylib.IsKeyPressed(KeyboardKey.R)) PerkSystem.TryReroll(s);
+        // §5 4.5 vocabulary: every buy key answers — confirm arp on success,
+        // denied buzz when scrap is short / the item is capped or pointless.
+        else if (Raylib.IsKeyPressed(KeyboardKey.Four))
         {
-            if (s.Emp < s.EmpMax)
+            if (s.Scrap < 500) ShopDeny(s, "Insufficient scrap");
+            else
             {
-                s.Score -= 2500;
+                var dead = s.Cities.Where(c => c.Destroyed).ToList();
+                if (dead.Count > 0)
+                {
+                    s.Scrap -= 500;
+                    var c = RandHelper.Pick(dead); // §4.3: cosmetic stream
+                    c.Destroyed = false;
+                    s.AliveCities++;
+                    SynthAudio.UiConfirm();
+                    s.Msg = "City rebuilt"; s.MsgT = 1.2f;
+                }
+                else ShopDeny(s, "All cities intact");
+            }
+        }
+        else if (Raylib.IsKeyPressed(KeyboardKey.Five))
+        {
+            if (s.Scrap < 250) ShopDeny(s, "Insufficient scrap");
+            else if (s.Emp < s.EmpMax)
+            {
+                s.Scrap -= 250;
                 s.Emp++;
-                SynthAudio.Launch(0.5f);
+                SynthAudio.UiConfirm();
                 s.Msg = "EMP +1"; s.MsgT = 1.0f;
             }
-            else { s.Msg = "EMP at maximum capacity"; s.MsgT = 1.0f; }
+            else ShopDeny(s, "EMP at maximum capacity");
         }
-        else if (Raylib.IsKeyPressed(KeyboardKey.Three) && s.Score >= 4000 && s.Upgrades.BlastScale < 2.8f - 0.001f)
+        else if (Raylib.IsKeyPressed(KeyboardKey.Six))
         {
-            s.Score -= 4000;
-            s.Upgrades.BlastScale = MathF.Min(2.8f, s.Upgrades.BlastScale + 0.2f);
-            SynthAudio.Impact(0.5f, false);
-            s.Msg = $"Warhead Yield x{s.Upgrades.BlastScale:F1}"; s.MsgT = 1.2f;
+            if (s.Scrap < 400) ShopDeny(s, "Insufficient scrap");
+            else if (s.Upgrades.BlastScale < 2.8f - 0.001f)
+            {
+                s.Scrap -= 400;
+                s.Upgrades.BlastScale = MathF.Min(2.8f, s.Upgrades.BlastScale + 0.2f);
+                SynthAudio.UiConfirm();
+                s.Msg = $"Warhead Yield x{s.Upgrades.BlastScale:F1}"; s.MsgT = 1.2f;
+            }
+            else ShopDeny(s, "Warhead yield at maximum");
         }
-        else if (Raylib.IsKeyPressed(KeyboardKey.Four) && s.Score >= 3500 && s.Upgrades.ReloadMult < 2.2f - 0.001f)
+        else if (Raylib.IsKeyPressed(KeyboardKey.Seven))
         {
-            s.Score -= 3500;
-            s.Upgrades.ReloadMult = MathF.Min(2.2f, s.Upgrades.ReloadMult + 0.12f);
-            SynthAudio.Launch(0.5f);
-            s.Msg = $"Reload Boost x{s.Upgrades.ReloadMult:F2}"; s.MsgT = 1.2f;
+            if (s.Scrap < 350) ShopDeny(s, "Insufficient scrap");
+            else if (s.Upgrades.ReloadMult < 2.2f - 0.001f)
+            {
+                s.Scrap -= 350;
+                s.Upgrades.ReloadMult = MathF.Min(2.2f, s.Upgrades.ReloadMult + 0.12f);
+                SynthAudio.UiConfirm();
+                s.Msg = $"Reload Boost x{s.Upgrades.ReloadMult:F2}"; s.MsgT = 1.2f;
+            }
+            else ShopDeny(s, "Reload boost at maximum");
         }
-        else if (Raylib.IsKeyPressed(KeyboardKey.Five) && s.Score >= 3600 && s.Upgrades.EmpScale < 2.4f - 0.001f)
+        else if (Raylib.IsKeyPressed(KeyboardKey.Eight))
         {
-            s.Score -= 3600;
-            s.Upgrades.EmpScale = MathF.Min(2.4f, s.Upgrades.EmpScale + 0.14f);
-            s.Upgrades.PhalanxEff = MathF.Min(2.0f, s.Upgrades.PhalanxEff + 0.08f);
-            SynthAudio.Thunder(0.5f, 0.5f);
-            s.Msg = "EMP/Phalanx Boost"; s.MsgT = 1.2f;
+            if (s.Scrap < 360) ShopDeny(s, "Insufficient scrap");
+            else if (s.Upgrades.EmpScale < 2.4f - 0.001f)
+            {
+                s.Scrap -= 360;
+                s.Upgrades.EmpScale = MathF.Min(2.4f, s.Upgrades.EmpScale + 0.14f);
+                s.Upgrades.PhalanxEff = MathF.Min(2.0f, s.Upgrades.PhalanxEff + 0.08f);
+                SynthAudio.UiConfirm();
+                s.Msg = "EMP/Phalanx Boost"; s.MsgT = 1.2f;
+            }
+            else ShopDeny(s, "Amplifier at maximum");
+        }
+        else if (Raylib.IsKeyPressed(KeyboardKey.Nine))
+        {
+            if (s.Scrap < 300) ShopDeny(s, "Insufficient scrap");
+            else
+            {
+                // §5 3.5 purchasable repair — ammo restored by the next StartWave
+                Base? deadBase = null;
+                foreach (var b in s.Bases) if (b.Destroyed) { deadBase = b; break; }
+                if (deadBase != null)
+                {
+                    s.Scrap -= 300;
+                    deadBase.Destroyed = false;
+                    s.AliveBases++;
+                    SynthAudio.UiConfirm();
+                    s.Msg = "Launch base repaired"; s.MsgT = 1.2f;
+                }
+                else ShopDeny(s, "All bases operational");
+            }
+        }
+        else if (Raylib.IsKeyPressed(KeyboardKey.Zero))
+        {
+            if (s.Scrap < 250) ShopDeny(s, "Insufficient scrap");
+            else
+            {
+                Phalanx? deadPhx = null;
+                foreach (var p in s.Phalanxes) if (p.Destroyed) { deadPhx = p; break; }
+                if (deadPhx != null)
+                {
+                    s.Scrap -= 250;
+                    deadPhx.Destroyed = false;
+                    SynthAudio.UiConfirm();
+                    s.Msg = "Phalanx CIWS repaired"; s.MsgT = 1.2f;
+                }
+                else ShopDeny(s, "Phalanx batteries operational");
+            }
         }
         else if (Raylib.IsKeyPressed(KeyboardKey.Space))
         {
-            s.Shop = false;
+            s.Phase = GamePhase.Playing;
             s.Level++;
+            SynthAudio.ShopWhoosh(open: false); // §5 4.5 close answer
             WaveSystem.StartWave(s, 2.9f);
         }
         return; // while shop open, suppress other gameplay inputs
     }
 
     // Fire interceptor
-    if (Raylib.IsMouseButtonPressed(MouseButton.Left) && !s.Intro && !s.GameOver && !s.Shop)
+    if (Raylib.IsMouseButtonPressed(MouseButton.Left) && s.Phase == GamePhase.Playing)
     {
         Combat.LaunchPlayer(s, s.MouseX, s.MouseY);
     }
 
     // EMP
     if ((Raylib.IsMouseButtonPressed(MouseButton.Right) || Raylib.IsKeyPressed(KeyboardKey.E))
-        && !s.Intro && !s.GameOver)
+        && s.Phase == GamePhase.Playing)
     {
         Combat.UseEMP(s);
     }
@@ -200,8 +372,8 @@ static void HandleInput(GameState s)
     // Level skip
     if (Raylib.IsKeyPressed(KeyboardKey.RightBracket) || Raylib.IsKeyPressed(KeyboardKey.PageUp))
     {
-        if (s.Intro || s.GameOver) GameInit.ResetGame(s);
-        s.Shop = false;
+        if (s.Phase is GamePhase.Title or GamePhase.GameOver) GameInit.ResetGame(s);
+        s.Phase = GamePhase.Playing;
         s.Level = Math.Max(1, s.Level + 1);
         WaveSystem.StartWave(s, 0.7f);
         s.Msg = $"Jumped to Wave {s.Level}";
@@ -209,8 +381,8 @@ static void HandleInput(GameState s)
     }
     if (Raylib.IsKeyPressed(KeyboardKey.LeftBracket) || Raylib.IsKeyPressed(KeyboardKey.PageDown))
     {
-        if (s.Intro || s.GameOver) GameInit.ResetGame(s);
-        s.Shop = false;
+        if (s.Phase is GamePhase.Title or GamePhase.GameOver) GameInit.ResetGame(s);
+        s.Phase = GamePhase.Playing;
         s.Level = Math.Max(1, s.Level - 1);
         WaveSystem.StartWave(s, 0.7f);
         s.Msg = $"Jumped to Wave {s.Level}";
@@ -233,8 +405,19 @@ static void HandleInput(GameState s)
         s.MsgT = 1.0f;
     }
 
-    // Start game on click during intro
-    if (s.Intro && Raylib.IsMouseButtonPressed(MouseButton.Left))
+    // Daily seeded run (§4.3): FNV-1a64 of the UTC date — same plans on every
+    // machine for the same date
+    if (s.Phase == GamePhase.Title && Raylib.IsKeyPressed(KeyboardKey.D))
+    {
+        s.PendingSeed = SeedUtil.DailySeed();
+        GameInit.ResetGame(s);
+        s.Msg = "DAILY SEED RUN";
+        s.MsgT = 1.6f;
+        return;
+    }
+
+    // Start game on click during the title screen
+    if (s.Phase == GamePhase.Title && Raylib.IsMouseButtonPressed(MouseButton.Left))
     {
         GameInit.ResetGame(s);
     }
@@ -243,3 +426,62 @@ static void HandleInput(GameState s)
 // Update is now handled by GameUpdate.UpdateAll()
 
 // Drawing is now handled by Rendering.Renderer.DrawAll()
+
+/// <summary>MCOD_SELFTEST=1 (§5 3.2 acceptance): same (seed, wave) must produce an
+/// identical wave plan — guards against stray RNG calls leaking into BuildPlan (R4).</summary>
+static class SelfTest
+{
+    public static bool Run()
+    {
+        bool ok = true;
+
+        ulong[] seeds = [0xDEADBEEFCAFEBABEUL, 0x12345678UL, SeedUtil.DailySeed()];
+        int[] waves = [1, 3, 8, 16];
+        foreach (ulong seed in seeds)
+        {
+            foreach (int wave in waves)
+            {
+                var r1 = new Xoshiro(seed ^ (ulong)wave);
+                var r2 = new Xoshiro(seed ^ (ulong)wave);
+                var p1 = WaveSystem.BuildPlan(wave, ref r1);
+                var p2 = WaveSystem.BuildPlan(wave, ref r2);
+                if (!PlansEqual(p1, p2))
+                {
+                    Console.WriteLine($"FAIL: plan mismatch seed={seed:X16} wave={wave}");
+                    ok = false;
+                }
+            }
+        }
+
+        // Different seeds must not collapse to one plan (sanity, not exhaustive)
+        var ra = new Xoshiro(1UL ^ 5UL);
+        var rb = new Xoshiro(2UL ^ 5UL);
+        if (PlansEqual(WaveSystem.BuildPlan(5, ref ra), WaveSystem.BuildPlan(5, ref rb)))
+        {
+            Console.WriteLine("FAIL: different seeds produced identical plans");
+            ok = false;
+        }
+
+        // Daily seed: FNV-1a64, stable within the same UTC day, never zero
+        if (SeedUtil.DailySeed() != SeedUtil.DailySeed() || SeedUtil.DailySeed() == 0)
+        {
+            Console.WriteLine("FAIL: daily seed unstable");
+            ok = false;
+        }
+
+        Console.WriteLine(ok ? "SELFTEST PASS" : "SELFTEST FAIL");
+        return ok;
+    }
+
+    static bool PlansEqual(List<WavePlanEntry> a, List<WavePlanEntry> b)
+    {
+        if (a.Count != b.Count) return false;
+        for (int i = 0; i < a.Count; i++)
+        {
+            if (a[i].Variant != b[i].Variant || a[i].Time != b[i].Time || a[i].Lane != b[i].Lane
+                || a[i].Mirv != b[i].Mirv)
+                return false;
+        }
+        return true;
+    }
+}

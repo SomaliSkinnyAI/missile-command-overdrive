@@ -51,7 +51,7 @@ public static class AutoDefense
 
             // Don't over-commit: skip if a player missile is already inbound to this intercept point.
             // Multi-HP enemies still allow one extra (to chip).
-            int needed = Math.Max(1, m.Hp);
+            int needed = Math.Max(1, (int)MathF.Ceiling(m.Hp));
             int inbound = CountInboundAt(s, best.Value.ix, best.Value.iy, 62f);
             if (inbound >= needed) continue;
 
@@ -177,7 +177,7 @@ public static class AutoDefense
         {
             "heavy" => 1.65f, "split" => 1.45f, "zig" => 1.35f, "fast" => 1.2f,
             "ufoBomb" => 1.42f, "cruise" => 1.58f, "carrier" => 1.9f, "drone" => 1.28f,
-            "spit" => 1.24f, "hell" => 1.74f, _ => 1f
+            "spit" => 1.24f, "hell" => 1.74f, "shield" => 1.7f, _ => 1f
         };
         float hpBonus = MathF.Max(0, m.Hp - 1) * 42;
         return tv * mul + 128 / (ti + 0.75f) + m.Speed * 0.18f + hpBonus;

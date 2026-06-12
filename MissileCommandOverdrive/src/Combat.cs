@@ -9,8 +9,10 @@ public static class Combat
 {
     // --- Enemy Projectile Factory ---
     public static Enemy CreateEnemyProjectile(GameState s, string v, float sx, float sy, TargetInfo t,
-        float? blastOverride = null, float? homingOverride = null, float? ampOverride = null, float? fqOverride = null)
+        float? blastOverride = null, float? homingOverride = null, float? ampOverride = null, float? fqOverride = null,
+        bool mirv = false)
     {
+        var def = VariantStats.Def(v);
         float dx = t.X - sx, dy = t.Y - sy;
         float dist = MathF.Max(100, MathF.Sqrt(dx * dx + dy * dy));
         float sp = VariantStats.Speed(v, s.Level);
@@ -52,6 +54,11 @@ public static class Combat
             _ => 0
         };
 
+        // §5 4.2: a heavy tagged by the wave plan MIRV-splits below half altitude
+        // (existing SplitAt/SplitMissile machinery; the split point itself is a
+        // runtime jitter on the cosmetic stream, matching the "split" variant)
+        bool isMirv = mirv && v == "heavy";
+
         var m = new Enemy
         {
             Id = s.NewId(),
@@ -62,14 +69,15 @@ public static class Combat
             Speed = sp,
             Progress = 0,
             Life = dur,
-            Resistance = VariantStats.Resistance(v),
+            Resistance = def.Resistance,
             ZigPhase = (v is "zig" or "drone" or "cruise" or "spit" or "hell") ? RandHelper.Next01() * MathH.TAU : 0,
             ZigAmp = amp,
             HomingFactor = homing,
             Split = v == "split",
-            SplitAt = v == "split" ? MathH.Rand(0.4f, 0.63f) : 0,
+            SplitAt = v == "split" ? MathH.Rand(0.4f, 0.63f) : isMirv ? MathH.Rand(0.46f, 0.56f) : 0,
             HasSplit = false,
-            Hp = v == "carrier" ? 3 : 1,
+            Hp = def.Hp,
+            Mirv = isMirv,
             Target = t,
             Dead = false
         };
@@ -80,9 +88,11 @@ public static class Combat
         m._Elapsed = 0;
         m._Fq = fq;
         m._Blast = blast;
-        m._DeployAt = v == "carrier" ? MathH.Rand(0.35f, 0.62f) : 0;
+        m.DeployAt = v == "carrier" ? MathH.Rand(def.DeployMin, def.DeployMax) : 0;
         m._Deployed = false;
-        m._Val = VariantStats.Value(v);
+        m._Val = def.Value;
+        // §5 4.2 stealth decloak pings: desynchronized start offsets (cosmetic)
+        if (def.CloakPing > 0) m.PingT = MathH.Rand(0.5f, def.CloakPing);
 
         s.Enemies.Add(m);
         return m;
@@ -91,10 +101,19 @@ public static class Combat
     // --- Explosion Factory ---
     public static void SpawnExpl(GameState s, float x, float y, float maxRadius = 92f,
         float life = 1.3f, float shakeTime = 0.36f, bool player = false, bool emp = false,
-        bool noShake = false, float flash = 0f, bool heavy = false)
+        bool noShake = false, float flash = 0f, bool heavy = false, bool chainChild = false)
     {
+        // §5 4.3 CHAIN PULSE perk: the player's EMP schedules one echo pulse —
+        // GameUpdate fires it with chainChild:true so an echo never re-chains
+        if (emp && player && !chainChild && s.Perks.EmpChain)
+        {
+            s.Perks.ChainT = 0.55f;
+            s.Perks.ChainX = x;
+            s.Perks.ChainY = y;
+        }
         s.Explosions.Add(new Explosion
         {
+            Id = s.NewId(),
             X = x, Y = y,
             Radius = 0,
             MaxRadius = maxRadius,
@@ -107,7 +126,7 @@ public static class Combat
             NoShake = noShake
         });
 
-        if (!noShake) s.Shake = MathF.Max(s.Shake, emp ? 19 : player ? 7 : heavy ? 14 : 11);
+        if (!noShake) s.AddTrauma(emp ? 0.45f : player ? 0.15f : heavy ? 0.4f : 0.25f);
         if (flash > 0) s.Flash = MathF.Max(s.Flash, flash);
         if (emp) s.Chromatic = MathF.Max(s.Chromatic, 1f);
         else if (heavy) s.Chromatic = MathF.Max(s.Chromatic, 0.45f);
@@ -134,12 +153,147 @@ public static class Combat
             });
         }
 
-        SpawnSparks(s, x, y, player, emp, MathH.Clamp(maxRadius / 100f, 0.9f, 1.9f));
+        // §5 5.3 layered blast anatomy: 1-frame flash quad on everything; EMP
+        // keeps its cyan omni ring burst (its identity), every other blast gets
+        // the flash → hot sparks → embers → dark smoke → debris composition.
+        float m = MathH.Clamp(maxRadius / 100f, 0.9f, 1.9f);
+        SpawnBlastFlash(s, x, y, maxRadius);
+        if (emp) SpawnSparks(s, x, y, player, emp, m);
+        else SpawnBlastRecipe(s, x, y, maxRadius, heavy, m);
+    }
+
+    // §5 5.3 pool caps — spawn sites clamp against these; debris evicts oldest
+    public const int MaxSparks = 480;
+    public const int MaxSmoke = 168;
+    public const int MaxDebris = 80;
+    public const int MaxBlastFlashes = 24;
+    public const float BlastFlashLife = 0.038f; // ~1-2 frames at 58 fps
+
+    static void SpawnBlastFlash(GameState s, float x, float y, float maxRadius)
+    {
+        if (s.BlastFlashes.Count >= MaxBlastFlashes) return;
+        s.BlastFlashes.Add(new BlastFlash
+        {
+            X = x, Y = y,
+            Size = maxRadius * 0.6f,
+            Rot = MathH.Rand(0, 90),
+            Life = BlastFlashLife
+        });
+    }
+
+    /// <summary>§5 5.3: spark/ember/smoke/debris composition for one non-EMP blast,
+    /// scaled by blast size. Caller spawns the flash quad. Structs only.</summary>
+    static void SpawnBlastRecipe(GameState s, float x, float y, float maxRadius, bool heavy, float m)
+    {
+        // 8-14 fast white-hot sparks — the detonation core; high drag kills
+        // them within ~0.3 s so the white reads as a pop, not a spray
+        int hot = Math.Min((int)(MathH.Rand(8, 14.99f) * MathF.Min(m, 1.5f)),
+            MaxSparks - s.Sparks.Count);
+        for (int i = 0; i < hot; i++)
+        {
+            float a = RandHelper.Next01() * MathH.TAU;
+            float sp = MathH.Rand(260, 760) * m;
+            float life = MathH.Rand(0.14f, 0.34f);
+            s.Sparks.Add(new Spark
+            {
+                X = x, Y = y,
+                Vx = MathF.Cos(a) * sp,
+                Vy = MathF.Sin(a) * sp,
+                Life = life, MaxLife = life,
+                Size = MathH.Rand(1.5f, 3f),
+                R = 255, G = 248, B = 232,
+                Kind = SparkKind.Hot
+            });
+        }
+
+        // 4-8 gravity embers — warm, longer-lived, settle on the ground
+        if (maxRadius >= 52)
+        {
+            int emb = Math.Min((int)(MathH.Rand(4, 8.99f) * MathF.Min(m, 1.5f)),
+                MaxSparks - s.Sparks.Count);
+            for (int i = 0; i < emb; i++)
+            {
+                float a = RandHelper.Next01() * MathH.TAU;
+                float sp = MathH.Rand(50, 190) * m;
+                float life = MathH.Rand(1.1f, 2.3f);
+                s.Sparks.Add(new Spark
+                {
+                    X = x, Y = y,
+                    Vx = MathF.Cos(a) * sp,
+                    Vy = MathF.Sin(a) * sp - MathH.Rand(30, 110),
+                    Life = life, MaxLife = life,
+                    Size = MathH.Rand(1.1f, 2.2f),
+                    R = 255, G = (byte)MathH.Rand(120, 185), B = (byte)MathH.Rand(40, 90),
+                    Kind = SparkKind.Ember
+                });
+            }
+        }
+
+        // 2-4 dark alpha-blended smoke puffs — rising, expanding (the renderer
+        // draws Alpha-class smoke as dark translucent, never additive)
+        if (maxRadius >= 60)
+        {
+            int n = Math.Min(heavy ? 4 : 2 + (RandHelper.Next01() < 0.5f ? 1 : 0),
+                MaxSmoke - s.SmokeParts.Count);
+            for (int i = 0; i < n; i++)
+            {
+                float life = MathH.Rand(1.9f, 3.4f);
+                s.SmokeParts.Add(new Smoke
+                {
+                    X = x + MathH.Rand(-0.3f, 0.3f) * maxRadius,
+                    Y = y + MathH.Rand(-12, 10),
+                    Vx = MathH.Rand(-18, 18),
+                    Vy = -MathH.Rand(24, 52),
+                    Life = life, MaxLife = life,
+                    Size = maxRadius * MathH.Rand(0.16f, 0.3f),
+                    Alpha = MathH.Rand(0.47f, 0.63f), // peaks in the 120-160/255 band
+                    Blend = BlendClass.Alpha
+                });
+            }
+        }
+
+        // city-palette debris chunks → persistent ground litter (§5 5.3 permanence)
+        if (maxRadius >= 64)
+            SpawnDebrisChunks(s, x, y, (int)(MathH.Rand(2, 5.99f) * MathF.Min(m, 1.6f)), m);
+    }
+
+    // City-palette chunk tones (DrawCityAlive body gradient / concrete / charred
+    // frame / neon glass) — keep in step with the §5 5.4 ThemePalette sweep.
+    static readonly (byte R, byte G, byte B)[] DebrisPalette =
+    [
+        (52, 62, 96),    // glass-gradient tower mid
+        (30, 38, 64),    // tower base shadow
+        (96, 110, 134),  // concrete grey
+        (24, 30, 46),    // charred frame
+        (124, 188, 232), // neon window shard
+    ];
+
+    public static void SpawnDebrisChunks(GameState s, float x, float y, int n, float m = 1f)
+    {
+        for (int i = 0; i < n; i++)
+        {
+            if (s.DebrisParts.Count >= MaxDebris) s.DebrisParts.RemoveAt(0); // oldest litter evicted
+            var c = DebrisPalette[(int)(RandHelper.Next01() * 0.999f * DebrisPalette.Length)];
+            float a = RandHelper.Next01() * MathH.TAU;
+            float sp = MathH.Rand(60, 230) * m;
+            float life = MathH.Rand(1.2f, 2f); // cooling clock only — litter persists
+            s.DebrisParts.Add(new Debris
+            {
+                X = x, Y = y,
+                Vx = MathF.Cos(a) * sp,
+                Vy = MathF.Sin(a) * sp - MathH.Rand(60, 170),
+                Life = life, MaxLife = life,
+                Size = MathH.Rand(1.6f, 3.4f),
+                Rot = RandHelper.Next01() * MathH.TAU,
+                RotSpeed = MathH.Rand(-7, 7),
+                R = c.R, G = c.G, B = c.B
+            });
+        }
     }
 
     public static void SpawnSparks(GameState s, float x, float y, bool player, bool emp, float m = 1f)
     {
-        int n = (int)((emp ? 46 : player ? 18 : 24) * m);
+        int n = Math.Min((int)((emp ? 46 : player ? 18 : 24) * m), MaxSparks - s.Sparks.Count);
         for (int i = 0; i < n; i++)
         {
             float a = RandHelper.Next01() * MathH.TAU;
@@ -161,8 +315,39 @@ public static class Combat
         }
     }
 
+    // §5 3.5 juice: gold scrap sparks that magnet-stream to the HUD scrap counter
+    // (homing handled in GameUpdate.UpdParticles via the Spark.Target flag).
+    const int MaxScrapSparks = 64; // global alive cap
+
+    static void SpawnScrapSparks(GameState s, float x, float y, int scrap)
+    {
+        int alive = 0;
+        for (int i = 0; i < s.Sparks.Count; i++)
+            if (s.Sparks[i].Target) alive++;
+        int n = 2 + scrap / 6;
+        if (n > 7) n = 7;
+        if (n > MaxScrapSparks - alive) n = MaxScrapSparks - alive;
+        for (int i = 0; i < n; i++)
+        {
+            float a = RandHelper.Next01() * MathH.TAU;
+            float sp = MathH.Rand(70, 190);
+            float life = MathH.Rand(0.55f, 0.75f);
+            s.Sparks.Add(new Spark
+            {
+                X = x, Y = y,
+                Vx = MathF.Cos(a) * sp,
+                Vy = MathF.Sin(a) * sp - MathH.Rand(20, 70),
+                Life = life, MaxLife = life,
+                Size = MathH.Rand(1.5f, 2.5f),
+                R = 255, G = (byte)MathH.Rand(192, 226), B = (byte)MathH.Rand(60, 110),
+                Target = true
+            });
+        }
+    }
+
     public static void SpawnSmoke(GameState s, float x, float y, int n, float k = 1f)
     {
+        n = Math.Min(n, MaxSmoke - s.SmokeParts.Count);
         for (int i = 0; i < n; i++)
         {
             s.SmokeParts.Add(new Smoke
@@ -174,7 +359,8 @@ public static class Combat
                 Life = MathH.Rand(2.2f, 4.6f),
                 MaxLife = MathH.Rand(2.2f, 4.6f),
                 Size = MathH.Rand(11, 26) * k,
-                Alpha = MathH.Rand(0.16f, 0.35f)
+                Alpha = MathH.Rand(0.16f, 0.35f),
+                Blend = BlendClass.Alpha
             });
         }
     }
@@ -185,21 +371,48 @@ public static class Combat
         {
             X = x, Y = y,
             Radius = MathH.Rand(12, 28),
-            Life = MathH.Rand(6, 12)
+            // §5 5.3: Life is the fade reservoir consumed at wave start; the
+            // mark holds at full strength for the whole wave (extended life)
+            Life = MathH.Rand(6, 12),
+            Heat = 1f // lingering ground glow, cools over ~2.5 s
         });
         if (s.Scorches.Count > 40) s.Scorches.RemoveAt(0);
     }
 
     // --- Damage / Kill ---
-    public static void RegKill(GameState s, Enemy m, float x, float y)
+    /// <summary>The single kill-bookkeeping site: score, combo, max combo, Kill event.
+    /// comboPerks (combo banner + EMP grant) historically fire only on enemy-missile kills.</summary>
+    public static void RegKill(GameState s, int value, float x, float y, bool comboPerks = false)
     {
-        float bonus = 1 + MathF.Min(2.2f, s.Combo * 0.09f);
-        int gain = (int)MathF.Round(m._Val * bonus);
+        // §5 3.2: Profile.OnGameOver snapshots Score/MaxCombo on the phase edge,
+        // but lingering explosions/in-flight interceptors keep killing afterwards.
+        // Freeze run-scoped totals (Score/Scrap/Combo) so the death screen matches
+        // the saved table row; the Kill event still fires for FX + lifetime stats.
+        if (s.Phase == GamePhase.GameOver)
+        {
+            s.Events.Emit(EventKind.Kill, x, y, value);
+            return;
+        }
+        // §5 4.3 OVERDRIVE SCORING perk scales the combo portion of the bonus
+        float bonus = 1 + MathF.Min(2.2f, s.Combo * 0.09f) * s.Perks.ComboBonusMult;
+        int gain = (int)MathF.Round(value * bonus);
         s.Score += gain;
+        // §5 3.5 scrap economy: flat Value/10 (no combo multiplier — the economy
+        // must not snowball with score), shed as gold sparks toward the HUD
+        // counter. §5 4.3 SCRAP MAGNET adds a flat per-kill bonus.
+        int scrap = value / 10 + s.Perks.ScrapPerKill;
+        if (scrap > 0)
+        {
+            s.Scrap += scrap;
+            SpawnScrapSparks(s, x, y, scrap);
+        }
         s.Combo++;
-        s.ComboTimer = 4;
+        s.ComboTimer = 4 + s.Perks.ComboTimeBonus; // §5 4.3 COMBO CAPACITOR
+        s.ComboPop = 1f; // §5 4.4 combo-ring squash-stretch pop
         s.MaxCombo = Math.Max(s.MaxCombo, s.Combo);
+        s.Events.Emit(EventKind.Kill, x, y, value);
 
+        if (!comboPerks) return;
         if (s.Combo > 1 && s.Combo % 5 == 0)
         {
             s.FloatingTexts.Add(new FloatingText
@@ -214,20 +427,30 @@ public static class Combat
             s.Emp++;
             s.Note = "EMP charge granted";
             s.NoteT = 1.25f;
+            SynthAudio.EmpReady(); // §5 4.5 charge-grant ping
         }
+    }
+
+    public static void RegKill(GameState s, Enemy m, float x, float y)
+    {
+        // All enemy kill paths (incl. PhalanxSystem) funnel here — flag for HR alive-checks
+        m.Dead = true;
+        RegKill(s, m._Val, x, y, comboPerks: true);
 
         float r = m.Variant is "heavy" or "carrier" ? 94 : m.Variant == "cruise" ? 78 : 70;
         SpawnExpl(s, x, y, r, 0.9f, 0.41f, player: true,
             flash: m.Variant is "heavy" or "carrier" ? 0.16f : 0.08f,
             noShake: m.Variant is not "heavy" and not "carrier");
-        SynthAudio.Hit(MathH.Clamp(x / s.W, 0, 1), m.Variant is "heavy" or "carrier" ? 1f : 0.6f);
+        // §5 4.4 pitch ladder: kill chains climb a semitone per combo step
+        SynthAudio.Hit(MathH.Clamp(x / s.W, 0, 1), m.Variant is "heavy" or "carrier" ? 1f : 0.6f, s.Combo);
     }
 
     public static bool DamageEnemyUnit(GameState s, Enemy m, float x, float y, float dmg = 1)
     {
         if (m.Hp > dmg)
         {
-            m.Hp -= (int)dmg;
+            m.Hp -= dmg;
+            m.FlashT = 0.05f;
             SpawnExpl(s, x, y, m.Variant == "carrier" ? 56 : 34, 0.46f, 0.34f, player: true, flash: 0.04f, noShake: true);
             return false;
         }
@@ -244,6 +467,7 @@ public static class Combat
         }
 
         bool inferHeavy = m.Variant is "heavy" or "carrier" or "hell";
+        s.Events.Emit(EventKind.GroundImpact, x, y, m._Blast);
         SpawnExpl(s, x, y, m._Blast,
             inferHeavy ? 1.22f : m.Variant == "drone" ? 0.82f : 1f,
             inferHeavy ? 0.24f : 0.3f,
@@ -263,28 +487,42 @@ public static class Combat
 
         if (t.Type == "city")
         {
-            var city = s.Cities.FirstOrDefault(c => c.Id == t.Id);
-            if (city != null && !city.Destroyed) KillCity(s, city, x, y);
+            foreach (var city in s.Cities)
+                if (city.Id == t.Id)
+                {
+                    if (!city.Destroyed) KillCity(s, city, x, y);
+                    break;
+                }
         }
         else if (t.Type == "base")
         {
-            var b = s.Bases.FirstOrDefault(b2 => b2.Id == t.Id);
-            if (b != null && !b.Destroyed)
-            {
-                b.Destroyed = true;
-                b.Ammo = 0;
-                SpawnExpl(s, b.X, b.Y - 4, 84, 1.05f, 0.3f, flash: 0.18f);
-            }
+            foreach (var b in s.Bases)
+                if (b.Id == t.Id)
+                {
+                    if (!b.Destroyed)
+                    {
+                        b.Destroyed = true;
+                        b.Ammo = 0;
+                        s.AliveBases--;
+                        s.Events.Emit(EventKind.BaseDestroyed, b.X, b.Y, 1f);
+                        SpawnExpl(s, b.X, b.Y - 4, 84, 1.05f, 0.3f, flash: 0.18f);
+                    }
+                    break;
+                }
         }
         else if (t.Type == "phalanx")
         {
-            var p = s.Phalanxes.FirstOrDefault(p2 => p2.Id == t.Id);
-            if (p != null && !p.Destroyed)
-            {
-                p.Destroyed = true;
-                p.Ammo = 0;
-                SpawnExpl(s, p.X, p.Y - 4, 72, 0.9f, 0.3f, flash: 0.14f);
-            }
+            foreach (var p in s.Phalanxes)
+                if (p.Id == t.Id)
+                {
+                    if (!p.Destroyed)
+                    {
+                        p.Destroyed = true;
+                        p.Ammo = 0;
+                        SpawnExpl(s, p.X, p.Y - 4, 72, 0.9f, 0.3f, flash: 0.14f);
+                    }
+                    break;
+                }
         }
 
         // Splash damage for big blasts
@@ -298,6 +536,8 @@ public static class Combat
                 {
                     b.Destroyed = true;
                     b.Ammo = 0;
+                    s.AliveBases--;
+                    s.Events.Emit(EventKind.BaseDestroyed, b.X, b.Y, 1f);
                     SpawnExpl(s, b.X, b.Y - 8, 78, 0.95f, 0.3f, flash: 0.12f, noShake: true);
                 }
             foreach (var p in s.Phalanxes)
@@ -311,9 +551,30 @@ public static class Combat
 
     public static void KillCity(GameState s, City city, float x, float y)
     {
+        // §5 4.3 AEGIS DOME perk: absorbs the first city hit of every wave
+        // (latch re-armed in WaveSystem.StartWave)
+        if (s.Perks.CityShield && !s.Perks.CityShieldUsed)
+        {
+            s.Perks.CityShieldUsed = true;
+            s.LightBursts.Add(new LightBurst
+            {
+                X = city.X, Y = s.GroundY - 26,
+                Radius = 120, Life = 0.55f, MaxLife = 0.55f
+            });
+            s.Flash = MathF.Max(s.Flash, 0.12f);
+            s.Note = "AEGIS DOME absorbed the hit";
+            s.NoteT = 1.5f;
+            SynthAudio.ShieldHum(MathH.Clamp(city.X / s.W, 0, 1));
+            return;
+        }
         city.Destroyed = true;
+        s.AliveCities--;
+        s.Events.Emit(EventKind.CityDestroyed, x, y, 1f);
         SpawnExpl(s, x, y, MathH.Rand(74, 120), 1.08f, 0.3f, flash: 0.22f, heavy: true);
         SpawnSmoke(s, x, y - 6, 16, 1.2f);
+        // §5 5.3: a collapsing city throws extra building chunks on top of the
+        // blast recipe's — this litter is the wave's most legible scar
+        SpawnDebrisChunks(s, city.X, s.GroundY - 18, 8, 1.25f);
         SpawnScorch(s, x, s.GroundY);
         SynthAudio.CityDestroyed(MathH.Clamp(x / s.W, 0, 1));
     }
@@ -340,15 +601,22 @@ public static class Combat
             }
             if (c == null)
             {
-                var live = s.Bases.Where(b => !b.Destroyed && b.Ammo > 0).ToList();
-                if (live.Count == 0) return false;
-                c = live.OrderBy(b => MathF.Abs(b.X - tx)).First();
+                // Nearest alive base with ammo (cooldown intentionally unchecked here,
+                // matching the old LINQ path — the guard below handles it)
+                float bestD = float.MaxValue;
+                foreach (var b in s.Bases)
+                {
+                    if (b.Destroyed || b.Ammo <= 0) continue;
+                    float d = MathF.Abs(b.X - tx);
+                    if (d < bestD) { bestD = d; c = b; }
+                }
+                if (c == null) return false;
             }
         }
 
         if (c.Destroyed || c.Ammo <= 0 || c.Cooldown > 0)
         {
-            s.Shake = MathF.Max(s.Shake, 2);
+            s.AddTrauma(0.05f);
             return false;
         }
 
@@ -359,11 +627,11 @@ public static class Combat
         float dur = dist / speed;
 
         c.Ammo--;
-        float reloadMult = s.Upgrades.ReloadMult;
+        float reloadMult = s.Upgrades.ReloadMult * s.Perks.ReloadMult; // §5 4.3 RAPID CYCLER
         float lvlReload = 1 + MathF.Min(1.9f, s.Level * 0.03f);
         c.Cooldown = 0.24f / (MathF.Max(0.4f, reloadMult) * lvlReload);
 
-        float blastRadius = 102f * s.Upgrades.BlastScale;
+        float blastRadius = 102f * s.Upgrades.BlastScale * s.Perks.BlastMult; // §5 4.3 BIG-BORE WARHEADS
 
         s.PlayerMissiles.Add(new PlayerMissile
         {
@@ -391,6 +659,16 @@ public static class Combat
             Life = 0.18f, MaxLife = 0.18f
         });
 
+        // Micro-feedback: 2-frame silo flash + recoil spring kick; crosshair pop
+        // only for mouse fire (auto-defense passes baseIndex)
+        c.MuzzleT = Base.MuzzleFlashDur;
+        c.RecoilV = 70f;
+        if (baseIndex == null)
+        {
+            s.CrosshairPop = 1f;
+            SynthAudio.UiClick(); // §5 4.5 crosshair fire click (manual fire only)
+        }
+
         SynthAudio.Launch(MathH.Clamp(c.X / s.W, 0, 1));
         return true;
     }
@@ -400,10 +678,11 @@ public static class Combat
         if (s.Intro || s.GameOver || s.Emp <= 0 || s.EmpCd > 0) return false;
         s.Emp--;
         s.EmpCd = 13;
+        s.Events.Emit(EventKind.Emp, s.MouseX, s.MouseY, 228 * s.Upgrades.EmpScale);
         SpawnExpl(s, s.MouseX, s.MouseY,
             228 * s.Upgrades.EmpScale, 1.45f, 0.42f,
             player: true, emp: true, flash: 0.32f);
-        s.Shake = MathF.Max(s.Shake, 20);
+        s.AddTrauma(0.4f);
         s.Flash = MathF.Max(s.Flash, 0.32f);
         s.Chromatic = MathF.Max(s.Chromatic, 0.8f);
         s.Note = "EMP pulse deployed";
@@ -424,12 +703,15 @@ public static class Combat
     }
 
     // --- Split Missile ---
+    /// <summary>Shared split machinery: "split" variant sheds 2-3 shards; a plan-
+    /// tagged MIRV heavy (§5 4.2) always sheds 3 heavier warheads.</summary>
     public static void SplitMissile(GameState s, Enemy m)
     {
         m.HasSplit = true;
-        SpawnExpl(s, m.X, m.Y, 42, 0.62f, 0.28f, flash: 0.08f, noShake: true);
+        bool mirv = m.Mirv;
+        SpawnExpl(s, m.X, m.Y, mirv ? 50 : 42, 0.62f, 0.28f, flash: mirv ? 0.11f : 0.08f, noShake: true);
 
-        int count = 2 + (RandHelper.Next01() < 0.35f ? 1 : 0);
+        int count = mirv ? 3 : 2 + (RandHelper.Next01() < 0.35f ? 1 : 0);
         for (int i = 0; i < count; i++)
         {
             var t = ChooseTargetForShard(s);
@@ -442,15 +724,112 @@ public static class Combat
                 Y = t.Value.Y,
                 Id = t.Value.Id
             }, ampOverride: MathH.Rand(14, 34), fqOverride: MathH.Rand(1.2f, 2.4f),
-                blastOverride: MathH.Rand(40, 64));
+                blastOverride: mirv ? MathH.Rand(56, 84) : MathH.Rand(40, 64));
         }
+    }
+
+    /// <summary>§5 4.2 carrier deploy: 2-3 drone children released mid-flight while
+    /// the carrier flies on. Only reached via the living carrier's update — an
+    /// early kill removes it first and denies the spawn.</summary>
+    public static void DeployDrones(GameState s, Enemy carrier)
+    {
+        int count = 2 + (RandHelper.Next01() < 0.5f ? 1 : 0); // cosmetic stream
+        for (int i = 0; i < count; i++)
+        {
+            var t = WaveSystem.ChooseTarget(s, "drone");
+            if (t == null) break;
+            CreateEnemyProjectile(s, "drone", carrier.X + MathH.Rand(-14, 14), carrier.Y + 8, t.Value);
+        }
+        // Bay-release pop (visual only — non-player explosion, no shake)
+        SpawnExpl(s, carrier.X, carrier.Y + 6, 30, 0.5f, 0.3f, flash: 0.04f, noShake: true);
+        s.LightBursts.Add(new LightBurst
+        {
+            X = carrier.X, Y = carrier.Y + 6,
+            Radius = 52, Life = 0.4f, MaxLife = 0.4f
+        });
     }
 
     static TargetInfo? ChooseTargetForShard(GameState s) => WaveSystem.ChooseTarget(s, "shard");
 
+    // §5 4.3 MIRV INTERCEPTOR: shorter trail cap for the children
+    public const int MirvChildTrail = 18;
+
+    /// <summary>§5 4.3 MIRV INTERCEPTOR perk: a base-launched interceptor sheds
+    /// 3 homing children at mid-flight, reusing the HellRaiser Hr* machinery on
+    /// PlayerMissile (steering/retargeting/detonation all ride the existing Hr
+    /// path in GameUpdate.UpdPlayer). The caller removes the parent.</summary>
+    public static void SplitPlayerMissile(GameState s, PlayerMissile m)
+    {
+        float ang0 = MathF.Atan2(m._Vy, m._Vx);
+        float speed = MathF.Sqrt(m._Vx * m._Vx + m._Vy * m._Vy);
+        float remain = MathF.Max(0.3f, m._Dur - m._Elapsed);
+        // Split pop — a small player blast, so the break-up itself can clip a track
+        SpawnExpl(s, m.X, m.Y, 26, 0.4f, 0.3f, player: true, flash: 0.04f, noShake: true);
+        for (int k = 0; k < 3; k++)
+        {
+            float ang = ang0 + (k - 1) * 0.42f; // fan: left / straight / right
+            s.PlayerMissiles.Add(new PlayerMissile(MirvChildTrail)
+            {
+                Id = s.NewId(),
+                X = m.X, Y = m.Y,
+                Sx = m.X, Sy = m.Y,
+                Tx = m.Tx, Ty = m.Ty,
+                Speed = speed,
+                BaseIndex = m.BaseIndex,
+                Auto = m.Auto,
+                _Vx = MathF.Cos(ang) * speed,
+                _Vy = MathF.Sin(ang) * speed,
+                _Dur = remain + MathH.Rand(0.2f, 0.45f),
+                _Elapsed = 0,
+                _Blast = m._Blast * 0.55f,
+                Hr = true,                      // reuse the homing machinery
+                HrSpeed = speed * 0.92f,
+                HrTurn = MathH.Rand(5.0f, 7.5f),
+                HrRetarget = 0,                 // adopt a target on the first live frame
+                SquiggleAmp = MathH.Rand(4, 9),
+                SquiggleFreq = MathH.Rand(3.1f, 6.8f),
+                SquigglePhase = RandHelper.Next01() * MathH.TAU
+            });
+        }
+        SynthAudio.Launch(MathH.Clamp(m.X / s.W, 0, 1));
+    }
+
+    // §5 4.2 shield drones: per-frame scratch of living bubbles (zero alloc)
+    static readonly Enemy?[] _shieldScratch = new Enemy?[8];
+    static readonly float _shieldR2 =
+        VariantStats.Def("shield").ShieldRadius * VariantStats.Def("shield").ShieldRadius;
+
+    /// <summary>True when a living shield drone covers the target while the blast
+    /// center is outside its bubble. The drone itself is always damageable.</summary>
+    static bool ShieldBlocks(Enemy target, Explosion e, int shields)
+    {
+        if (target.Variant == "shield") return false;
+        if (e.Emp) return false; // EMP pierces bubbles — it's the anti-overwhelm tool
+        for (int i = 0; i < shields; i++)
+        {
+            var sd = _shieldScratch[i]!;
+            if (sd == target || sd.Dead) continue; // Dead recheck: a drone killed earlier this frame stops blocking
+            float tx = target.X - sd.X, ty = target.Y - sd.Y;
+            if (tx * tx + ty * ty > _shieldR2) continue; // target not covered
+            float ex = e.X - sd.X, ey = e.Y - sd.Y;
+            if (ex * ex + ey * ey <= _shieldR2) continue; // blast inside — penetrates
+            sd.ShieldFlashT = 0.25f;                      // bubble ripple feedback
+            return true;
+        }
+        return false;
+    }
+
     // --- Collisions ---
     public static void RunCollisions(GameState s)
     {
+        // §5 4.2: collect living shield drones once for the overlap checks below
+        int shields = 0;
+        for (int i = 0; i < s.Enemies.Count && shields < _shieldScratch.Length; i++)
+        {
+            var sd = s.Enemies[i];
+            if (!sd.Dead && sd.Variant == "shield") _shieldScratch[shields++] = sd;
+        }
+
         // Enemies vs player explosions
         for (int i = s.Enemies.Count - 1; i >= 0; i--)
         {
@@ -464,12 +843,17 @@ public static class Combat
                 float r = MathF.Max(18, e.Radius * rf);
                 if (dx * dx + dy * dy <= r * r)
                 {
+                    // A blast whose center is outside a covering bubble is blocked
+                    // for this target — another explosion may still connect
+                    if (shields > 0 && ShieldBlocks(m, e, shields)) continue;
                     removed = DamageEnemyUnit(s, m, m.X, m.Y, 1);
                     break;
                 }
             }
             if (removed) s.Enemies.RemoveAt(i);
         }
+        // Drop scratch refs so dead drones aren't pinned across frames/waves
+        for (int i = 0; i < shields; i++) _shieldScratch[i] = null;
 
         // UFOs vs player explosions
         for (int i = s.UFOs.Count - 1; i >= 0; i--)
@@ -484,6 +868,7 @@ public static class Combat
                 if (dx * dx + dy * dy <= r * r)
                 {
                     u.Hp -= 1;
+                    u.FlashT = 0.05f;
                     hit = true;
                     SpawnExpl(s, u.X, u.Y, u.Boss ? 64 : 44, 0.58f, 0.34f, player: true, flash: 0.06f, noShake: true);
                     break;
@@ -492,12 +877,8 @@ public static class Combat
             if (!hit) continue;
             if (u.Hp <= 0)
             {
-                float bonus = 1 + MathF.Min(2.2f, s.Combo * 0.09f);
-                int gain = (int)MathF.Round((u.Boss ? 1500 : 260) * bonus);
-                s.Score += gain;
-                s.Combo++;
-                s.ComboTimer = 4;
-                s.MaxCombo = Math.Max(s.MaxCombo, s.Combo);
+                u.Dead = true;
+                RegKill(s, u.Boss ? 1500 : 260, u.X, u.Y);
                 SpawnExpl(s, u.X, u.Y, u.Boss ? 140 : 96, u.Boss ? 1.4f : 1.02f, 0.34f, player: true, flash: u.Boss ? 0.32f : 0.18f);
                 SpawnSmoke(s, u.X, u.Y, u.Boss ? 20 : 10, u.Boss ? 1.3f : 1.05f);
                 s.Note = u.Boss ? "Boss UFO destroyed" : "UFO destroyed";
@@ -519,6 +900,7 @@ public static class Combat
                 if (dx * dx + dy * dy <= rr * rr)
                 {
                     r.Hp -= 1;
+                    r.FlashT = 0.05f;
                     hit = true;
                     SpawnExpl(s, r.X + MathH.Rand(-8, 8), r.Y + MathH.Rand(-5, 5), 42, 0.52f, 0.35f,
                         player: true, flash: 0.05f, noShake: true);
@@ -528,12 +910,8 @@ public static class Combat
             if (!hit) continue;
             if (r.Hp <= 0)
             {
-                float bonus = 1 + MathF.Min(2.2f, s.Combo * 0.09f);
-                int gain = (int)MathF.Round(460 * bonus);
-                s.Score += gain;
-                s.Combo++;
-                s.ComboTimer = 4;
-                s.MaxCombo = Math.Max(s.MaxCombo, s.Combo);
+                r.Dead = true;
+                RegKill(s, 460, r.X, r.Y);
                 SpawnExpl(s, r.X, r.Y, 116, 1.1f, 0.33f, player: true, flash: 0.24f);
                 SpawnSmoke(s, r.X, r.Y, 12, 1.1f);
                 s.Note = "Stratospheric raider destroyed";
@@ -549,13 +927,16 @@ public static class Combat
             float hullHalf = ms.W * 0.5f;
             float hullRx = hullHalf * 0.92f;
             float hullRy = 42f;
-            // Snapshot — SpawnExpl calls below mutate s.Explosions, which would throw on foreach
-            var exps = s.Explosions.ToArray();
-            foreach (var e in exps)
+            // Snapshot the count — SpawnExpl calls below only APPEND to s.Explosions
+            // (nothing removes during RunCollisions), so index-iterating up to the
+            // pre-loop count is safe and avoids the old per-frame ToArray copy
+            int expCount = s.Explosions.Count;
+            for (int ei = 0; ei < expCount; ei++)
             {
+                var e = s.Explosions[ei];
                 if (!e.Player) continue;
                 // Each explosion damages the mothership at most once
-                if (ms.HitBy.Contains(e)) continue;
+                if (ms.HitBy.Contains(e.Id)) continue;
 
                 float dx = (ms.X - e.X) / hullRx;
                 float dy = (ms.Y - e.Y) / hullRy;
@@ -565,7 +946,7 @@ public static class Combat
                 bool inBlast = gx * gx + gy * gy <= (hullRx + blastR) * (hullRx + blastR);
                 if (!(inHull || inBlast)) continue;
 
-                ms.HitBy.Add(e);
+                ms.HitBy.Add(e.Id);
 
                 // Deflector shield absorbs damage when active — only ripple + minor spark
                 if (ms.ShieldActive)
@@ -584,12 +965,7 @@ public static class Combat
 
                 if (ms.Hp <= 0)
                 {
-                    float bonus = 1 + MathF.Min(2.2f, s.Combo * 0.09f);
-                    int gain = (int)MathF.Round(18000 * bonus);
-                    s.Score += gain;
-                    s.Combo++;
-                    s.ComboTimer = 4;
-                    s.MaxCombo = Math.Max(s.MaxCombo, s.Combo);
+                    RegKill(s, 18000, ms.X, ms.Y);
 
                     for (int k = 0; k < 14; k++)
                     {
@@ -602,7 +978,7 @@ public static class Combat
                     }
                     SpawnSmoke(s, ms.X, ms.Y, 46, 1.8f);
                     s.Flash = MathF.Max(s.Flash, 0.6f);
-                    s.Shake = MathF.Max(s.Shake, 28);
+                    s.AddTrauma(0.5f);
                     s.Note = "MOTHERSHIP DESTROYED";
                     s.NoteT = 2.4f;
                     s.Mothership = null;
@@ -625,15 +1001,12 @@ public static class Combat
                 if (dx * dx + dy * dy <= r * r)
                 {
                     f.Hp -= 1;
+                    f.FlashT = 0.05f;
                     SpawnExpl(s, f.X + MathH.Rand(-4, 4), f.Y, 28, 0.42f, 0.22f,
                         player: true, noShake: true);
                     if (f.Hp <= 0)
                     {
-                        float bonus = 1 + MathF.Min(2.2f, s.Combo * 0.09f);
-                        s.Score += (int)MathF.Round(180 * bonus);
-                        s.Combo++;
-                        s.ComboTimer = 4;
-                        s.MaxCombo = Math.Max(s.MaxCombo, s.Combo);
+                        RegKill(s, 180, f.X, f.Y);
                         SpawnExpl(s, f.X, f.Y, 62, 0.72f, 0.28f, player: true, flash: 0.08f);
                         SpawnSmoke(s, f.X, f.Y, 6, 0.8f);
                         dead = true;
@@ -656,16 +1029,12 @@ public static class Combat
                 if (dx * dx + dy * dy <= r * r)
                 {
                     dm.Hp -= 1;
+                    dm.FlashT = 0.05f;
                     SpawnExpl(s, dm.X + MathH.Rand(-10, 10), dm.Y + MathH.Rand(-6, 6),
                         40, 0.55f, 0.32f, player: true, flash: 0.06f, noShake: true);
                     if (dm.Hp <= 0)
                     {
-                        float bonus = 1 + MathF.Min(2.2f, s.Combo * 0.09f);
-                        int gain = (int)MathF.Round(3200 * bonus);
-                        s.Score += gain;
-                        s.Combo++;
-                        s.ComboTimer = 4;
-                        s.MaxCombo = Math.Max(s.MaxCombo, s.Combo);
+                        RegKill(s, 3200, dm.X, dm.Y);
                         SpawnExpl(s, dm.X, dm.Y, 170, 1.6f, 0.5f, player: true, flash: 0.44f, heavy: true);
                         SpawnSmoke(s, dm.X, dm.Y, 30, 1.5f);
                         s.Note = "DAEMON BANISHED";

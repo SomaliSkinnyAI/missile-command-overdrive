@@ -92,7 +92,7 @@ public static class HellRaiserSystem
         var targets = CollectTargets(s, topX, topY);
         if (targets.Count == 0) return;
 
-        float fireRate = 95 + MathF.Min(52, s.Level * 3.4f);
+        float fireRate = (95 + MathF.Min(52, s.Level * 3.4f)) * s.Perks.HrRateMult; // §5 4.3 HOT LOADER
         hr.FireCd += dt * fireRate;
 
         int shots = 0;

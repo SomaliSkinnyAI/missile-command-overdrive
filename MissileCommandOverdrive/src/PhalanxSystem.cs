@@ -37,7 +37,8 @@ public static class PhalanxSystem
             return;
         }
 
-        float fireRange = 620 + MathF.Max(0, phEff - 1) * 110;
+        // §5 4.3 LONG-BARREL CIWS perk scales range (lock range tracks it below)
+        float fireRange = (620 + MathF.Max(0, phEff - 1) * 110) * s.Perks.PhalanxRangeMult;
         float lockRange = MathF.Max(fireRange * 2.15f, s.W * 1.08f);
 
         // Acquire target
@@ -78,9 +79,9 @@ public static class PhalanxSystem
             return;
         }
 
-        // Fire
+        // Fire (§5 4.3 DOUBLE FEED perk scales the rate)
         float fireRate = ((p.Heat > 0.72f ? 56 : 94) + MathF.Min(28, s.Level * 2.2f))
-            * (1 + (phEff - 1) * 0.4f);
+            * (1 + (phEff - 1) * 0.4f) * s.Perks.PhalanxRateMult;
         p.FireAcc += dt * fireRate;
 
         int shots = 0;
@@ -143,14 +144,12 @@ public static class PhalanxSystem
                 if (RandHelper.Next01() < hitChance)
                 {
                     target.Hp--;
+                    target.FlashT = 0.05f;
                     Combat.SpawnExpl(s, target.X + MathH.Rand(-9, 9), target.Y + MathH.Rand(-5, 5),
                         30, 0.43f, 0.34f, player: true, flash: 0.03f, noShake: true);
                     if (target.Hp <= 0)
                     {
-                        float bonus = 1 + MathF.Min(2.2f, s.Combo * 0.09f);
-                        s.Score += (int)MathF.Round((target.Boss ? 1500 : 260) * bonus);
-                        s.Combo++; s.ComboTimer = 4;
-                        s.MaxCombo = Math.Max(s.MaxCombo, s.Combo);
+                        Combat.RegKill(s, target.Boss ? 1500 : 260, target.X, target.Y);
                         Combat.SpawnExpl(s, target.X, target.Y, target.Boss ? 140 : 96, target.Boss ? 1.4f : 1.02f, 0.34f, player: true, flash: target.Boss ? 0.32f : 0.18f);
                         s.UFOs.Remove(target);
                         break;
@@ -167,14 +166,12 @@ public static class PhalanxSystem
                 if (RandHelper.Next01() < hitChance)
                 {
                     target.Hp--;
+                    target.FlashT = 0.05f;
                     Combat.SpawnExpl(s, target.X + MathH.Rand(-8, 8), target.Y + MathH.Rand(-5, 5),
                         38, 0.46f, 0.35f, player: true, flash: 0.05f, noShake: true);
                     if (target.Hp <= 0)
                     {
-                        float bonus = 1 + MathF.Min(2.2f, s.Combo * 0.09f);
-                        s.Score += (int)MathF.Round(460 * bonus);
-                        s.Combo++; s.ComboTimer = 4;
-                        s.MaxCombo = Math.Max(s.MaxCombo, s.Combo);
+                        Combat.RegKill(s, 460, target.X, target.Y);
                         Combat.SpawnExpl(s, target.X, target.Y, 116, 1.1f, 0.33f, player: true, flash: 0.24f);
                         s.Raiders.Remove(target);
                         break;

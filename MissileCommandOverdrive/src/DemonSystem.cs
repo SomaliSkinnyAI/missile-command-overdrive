@@ -34,7 +34,7 @@ public static class DemonSystem
         s.Note = "EASTER EGG: DAEMON UNLEASHED";
         s.NoteT = 2.0f;
         s.Flash = MathF.Max(s.Flash, 0.28f);
-        s.Shake = MathF.Max(s.Shake, 11);
+        s.AddTrauma(0.35f);
         SynthAudio.Thunder(0.5f, 1.0f);
     }
 

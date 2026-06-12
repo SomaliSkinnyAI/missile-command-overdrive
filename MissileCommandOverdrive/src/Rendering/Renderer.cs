@@ -10,15 +10,11 @@ namespace MissileCommandOverdrive.Rendering;
 public static class Renderer
 {
     const float TAU = MathF.PI * 2;
-    const float BloomScale = 0.25f;
     const int GrainSize = 160;
     const int GradientSize = 128;
     const int MoonSize = 192;
-    const int BlurPasses = 3;
 
     static RenderTexture2D _frameTarget;
-    static RenderTexture2D _bloomTarget;
-    static RenderTexture2D _bloomPing; // ping-pong blur
     static Texture2D _grainTexture;
     static Texture2D _gradientTex; // smooth radial gradient: white center ? transparent edge
     static Texture2D _moonTex; // procedural moon with maria + craters + terminator shading
@@ -27,19 +23,175 @@ public static class Renderer
     static bool _gradientReady;
     static bool _moonReady;
 
+    // Post uber-shader (§5 1.4): one-pass vignette/scanlines/grain/CA/barrel/flash/
+    // desat over the §4.1 composite blit. If the GLSL fails to compile the legacy
+    // CPU draws in DrawPostFx/DrawGrain stay active as the fallback.
+    static Shader _postShader;
+    static bool _postShaderTried;
+    static bool _postShaderActive;
+    static int _locTime, _locDanger, _locChromatic, _locFlashAmount;
+    static int _locFlashDir, _locFlashColor, _locResolution, _locHdrActive;
+
+    // Shockwave refraction / heat shimmer / EMP ripple (§5 2.2): the strongest
+    // ≤16 live shockwaves go up each frame as vec4(center texcoord, radius in
+    // screen-height units, strength); EMP waves are flagged in-band as
+    // w = 1 + strength. The 4 hottest live non-EMP explosions feed the shimmer
+    // mask through a second small array (see Shaders.cs for why not a w-flag).
+    const int MaxShaderShockwaves = 16;
+    const int MaxShaderHeatSources = 4;
+    static int _locShockwaves, _locShockwaveCount;
+    static int _locHeatSources, _locHeatCount;
+    // No gameplay writer feeds flash direction/color yet — constants match the
+    // legacy full-screen cyan flash with its ground-side emphasis (y-down dir).
+    static readonly Vector2 FlashDirDefault = new(0f, 1f);
+    static readonly Vector3 FlashColorDefault = new(160 / 255f, 218 / 255f, 255 / 255f);
+
+    // GPU threshold bloom (§5 2.1): soft-knee bright pass → 4-mip dual-Kawase
+    // chain → additive composite back into _frameTarget, so the uber-shader
+    // grades on top of the bloomed scene. No CPU fallback — on compile failure
+    // the scene renders unbloomed.
+    const int BloomMipCount = 4; // W/2, W/4, W/8, W/16
+    const float BloomThreshold = 0.6f;
+    const float BloomKnee = 0.3f;
+    const float BloomIntensity = 0.9f;
+
+    // HDR scene target (§5 5.1 / §4.9): _frameTarget and the bloom mips become
+    // hand-assembled FP16 FBOs (the binding has no Rlgl.SetFramebufferWidth/
+    // Height, so stock LoadRenderTexture can't be re-formatted) wrapped in
+    // stock RenderTexture2D structs — BeginTextureMode and every existing
+    // blit work unchanged. MCOD_NO_HDR=1 or any incomplete FBO drops the whole
+    // chain back to stock RGBA8, which with hdrActive=0 in the uber-shader
+    // reproduces the Phase 2-4 baseline exactly.
+    const float HdrExposure = 1.15f; // pre-ACES lift — see the shader comment
+    static bool _hdrDisabled = Environment.GetEnvironmentVariable("MCOD_NO_HDR") == "1";
+    static bool _hdrActive;
+    static readonly RenderTexture2D[] _bloomMips = new RenderTexture2D[BloomMipCount];
+    static Shader _bloomPrefilter;
+    static Shader _bloomDown;
+    static Shader _bloomUp;
+    static bool _bloomShaderTried;
+    static bool _bloomActive;
+    static int _locBloomDownHalfPixel, _locBloomUpHalfPixel;
+
+    // Dynamic 2D light buffer (§5 5.2): quarter-res RGBA8 target filled with
+    // additive gradient blobs collected during the world pass (positions are
+    // already computed in the draw functions — never recomputed), then bound
+    // as a second sampler on the uber-shader and composited at the refracted
+    // uv. Always stock RGBA8 even on the HDR path: light values live in 0..1.
+    const int MaxLights = 48;
+    static RenderTexture2D _lightTarget;
+    static readonly (float X, float Y, float R, byte Cr, byte Cg, byte Cb, byte Ca)[] _lights =
+        new (float, float, float, byte, byte, byte, byte)[MaxLights];
+    static int _lightCount;
+    static bool _lightsOn; // post shader live and not env-disabled, latched per frame
+    static bool _lightDisabled = Environment.GetEnvironmentVariable("MCOD_NO_LIGHT") == "1";
+    static int _locLightTex, _locDayFactor, _locLightActive;
+    // GL blend enums for Rlgl.SetBlendFactorsSeparate (raylib doesn't re-export them)
+    const int GlSrcAlpha = 0x0302;
+    const int GlOne = 1;
+    const int GlOneMinusSrcAlpha = 0x0303;
+    const int GlFuncAdd = 0x8006;
+
     // Moon disc mask for star-occlusion (matches HTML: stars inside the moon circle are skipped)
     static float _moonMaskX, _moonMaskY, _moonMaskR;
     static bool _moonMaskActive;
 
-    // Modern font (Segoe UI TTF) — replaces raylib's blocky bitmap default
+    // Trauma camera (§5 1.3): baked 1D value-noise tables sampled on the
+    // unscaled FeelDirector.Clock (s.Time freezes during hit-stop).
+    const int NoiseLen = 1024;       // power of two — wrap via mask
+    const int NoiseCtrlStep = 16;    // control point spacing inside the table
+    const float NoiseRate = 280f;    // table entries traversed per second (~17 Hz wobble)
+    const float MaxShakePx = 16f;
+    const float MaxRollDeg = 1.5f;
+    static readonly float[] _shakeNoiseX = BakeNoise(101);
+    static readonly float[] _shakeNoiseY = BakeNoise(797);
+    static readonly float[] _shakeNoiseRoll = BakeNoise(523);
+
+    static float[] BakeNoise(int seed)
+    {
+        var rng = new Random(seed);
+        int ctrlCount = NoiseLen / NoiseCtrlStep;
+        var ctrl = new float[ctrlCount];
+        for (int i = 0; i < ctrlCount; i++) ctrl[i] = (float)(rng.NextDouble() * 2 - 1);
+        var table = new float[NoiseLen];
+        for (int i = 0; i < NoiseLen; i++)
+        {
+            int c0 = i / NoiseCtrlStep;
+            int c1 = (c0 + 1) % ctrlCount;
+            float f = (i % NoiseCtrlStep) / (float)NoiseCtrlStep;
+            float k = (1 - MathF.Cos(f * MathF.PI)) * 0.5f; // cosine-smoothed
+            table[i] = ctrl[c0] + (ctrl[c1] - ctrl[c0]) * k;
+        }
+        return table;
+    }
+
+    static float SampleNoise(float[] table, float t)
+    {
+        float idx = t % NoiseLen;
+        int i0 = (int)idx;
+        float f = idx - i0;
+        int i1 = (i0 + 1) & (NoiseLen - 1);
+        return table[i0] + (table[i1] - table[i0]) * f;
+    }
+
+    // Fixed-seed scenery randoms (§5 2.6): the draw path used to run
+    // `new Random(seed)` every frame (56-int Knuth init per ctor) just to replay
+    // the same sequence. The unit draws are baked once and indexed instead,
+    // preserving the exact pre-existing layouts.
+    static float[] RandTable(int seed, int count)
+    {
+        var rng = new Random(seed);
+        var t = new float[count];
+        for (int i = 0; i < count; i++) t[i] = rng.NextSingle();
+        return t;
+    }
+    static readonly float[] _bokehRand = RandTable(271, 12 * 6);  // 6 draws per bokeh circle
+    static readonly float[] _starRand = RandTable(42, 950 * 3);   // x/y/size per star
+    static readonly float[] _ridgeFarRand = RandTable(777, 17);   // segs+1 ridge offsets
+    static readonly float[] _ridgeNearRand = RandTable(888, 21);
+    static readonly float[] _hazeRand = RandTable(555, 5 * 5);    // 5 draws per haze band
+
+    // Zero-alloc xorshift PRNG for per-frame procedural drawing (§5 2.6) —
+    // replaces per-frame `new Random(seed)` in the city/ruin draws. Not
+    // sequence-compatible with System.Random, which is fine here: city seeds
+    // come from string.GetHashCode and already re-roll every process.
+    struct DrawRand
+    {
+        uint _s;
+        public DrawRand(int seed)
+        {
+            // SplitMix32 scramble so adjacent seeds give unrelated streams.
+            uint z = (uint)seed + 0x9E3779B9u;
+            z = (z ^ (z >> 16)) * 0x85EBCA6Bu;
+            z = (z ^ (z >> 13)) * 0xC2B2AE35u;
+            _s = z ^ (z >> 16);
+            if (_s == 0) _s = 0x9E3779B9u;
+        }
+        uint NextU() { uint x = _s; x ^= x << 13; x ^= x >> 17; x ^= x << 5; return _s = x; }
+        public float NextSingle() => (NextU() >> 8) * (1f / 16777216f);
+        public int Next(int maxExclusive) => (int)((ulong)NextU() * (uint)maxExclusive >> 32);
+        public int Next() => (int)(NextU() >> 1);
+    }
+
+    // Per-frame scratch buffers (§5 2.6) — the draw path must not allocate.
+    static readonly (float X, float Y)[] _ridgePts = new (float, float)[24]; // max segs+1 = 21
+    static readonly (float bx, float bw, float bh, byte r, byte g, byte b, int rt, float rh,
+        int seed, float stepW, float stepH, float spireH, float antH, int antCol)[] _cityBuildings =
+        new (float, float, float, byte, byte, byte, int, float, int, float, float, float, float, int)[16]; // n ≤ 15
+    static readonly (float fx, float fw, float fh, float tip, float t)[] _ruinFrags =
+        new (float, float, float, float, float)[11]; // n ≤ 10
+
+    // Modern font (embedded JetBrains Mono, Windows system TTFs as fallback)
+    // — replaces raylib's blocky bitmap default
     static Font _uiFont;
     static Font _uiFontBold;
+    static bool _uiFontTried;
     static bool _uiFontReady;
 
     public static Font UiFont => _uiFontReady ? _uiFont : Raylib.GetFontDefault();
     public static Font UiFontBold => _uiFontReady ? _uiFontBold : Raylib.GetFontDefault();
 
-    /// <summary>Modern text draw (TrueType via LoadFontEx). Falls back to bitmap if font failed to load.</summary>
+    /// <summary>Modern text draw (TrueType). Falls back to bitmap if font failed to load.</summary>
     public static void DrawTextM(string text, float x, float y, float size, Color color, bool bold = false)
     {
         if (_uiFontReady)
@@ -66,9 +218,7 @@ public static class Renderer
     {
         if (_fxReady)
         {
-            Raylib.UnloadRenderTexture(_frameTarget);
-            Raylib.UnloadRenderTexture(_bloomTarget);
-            Raylib.UnloadRenderTexture(_bloomPing);
+            UnloadFxTargets();
             _fxReady = false;
         }
 
@@ -90,233 +240,288 @@ public static class Renderer
             _moonReady = false;
         }
 
-        if (_uiFontReady)
+        if (_uiFont.BaseSize > 0) { Raylib.UnloadFont(_uiFont); _uiFont = default; }
+        if (_uiFontBold.BaseSize > 0) { Raylib.UnloadFont(_uiFontBold); _uiFontBold = default; }
+        _uiFontReady = false;
+        _uiFontTried = false;
+
+        if (_postShaderActive)
         {
-            Raylib.UnloadFont(_uiFont);
-            Raylib.UnloadFont(_uiFontBold);
-            _uiFontReady = false;
+            Raylib.UnloadShader(_postShader);
+            _postShaderActive = false;
         }
+        _postShaderTried = false;
+
+        if (_bloomActive)
+        {
+            Raylib.UnloadShader(_bloomPrefilter);
+            Raylib.UnloadShader(_bloomDown);
+            Raylib.UnloadShader(_bloomUp);
+            _bloomActive = false;
+        }
+        _bloomShaderTried = false;
     }
 
-    static void RenderBloomPass(GameState s)
+    /// <summary>§4.9 hand-assembled FP16 render target, mirroring raylib's
+    /// LoadRenderTexture step-for-step with the color format swapped to
+    /// R16G16B16A16 (GL_RGBA16F under GL 3.3). Returns false — with every GL
+    /// object already released — when the driver rejects half-float textures
+    /// or reports the FBO incomplete; the caller then falls back to RGBA8.</summary>
+    static unsafe bool TryLoadRenderTextureFp16(int w, int h, out RenderTexture2D rt)
     {
-        if (!_fxReady || !_gradientReady || s.Theme == "recharged") return;
-
-        // 1. Render bright elements to bloom target using gradient texture
-        Raylib.BeginTextureMode(_bloomTarget);
-        Raylib.ClearBackground(new Color((byte)0, (byte)0, (byte)0, (byte)0));
-        Raylib.BeginBlendMode(BlendMode.Additive);
-
-        float scale = BloomScale;
-        foreach (var e in s.Explosions)
+        rt = default;
+        uint fbo = Rlgl.LoadFramebuffer();
+        if (fbo == 0) return false;
+        Rlgl.EnableFramebuffer(fbo);
+        uint tex = Rlgl.LoadTexture(null, w, h, PixelFormat.UncompressedR16G16B16A16, 1);
+        if (tex == 0) // GPU without half-float texture support
         {
-            float elapsed = e.MaxLife - e.Life;
-            float a = e.Life / MathF.Max(0.001f, e.MaxLife);
-            if (a <= 0) continue;
-            float r = e.Radius * (e.Emp ? 1.18f : 1f) * scale;
-            float x = e.X * scale;
-            float y = e.Y * scale;
-            Color col = e.Player
-                ? new Color((byte)180, (byte)250, (byte)255, (byte)(a * 180))
-                : new Color((byte)255, (byte)208, (byte)136, (byte)(a * 170));
-            DrawGradientCircle(x, y, r, col);
+            Rlgl.DisableFramebuffer();
+            Rlgl.UnloadFramebuffer(fbo);
+            return false;
         }
-
-        foreach (var t in s.Trails)
+        uint depth = Rlgl.LoadTextureDepth(w, h, true); // depth renderbuffer, like stock
+        Rlgl.FramebufferAttach(fbo, tex, FramebufferAttachType.ColorChannel0,
+            FramebufferAttachTextureType.Texture2D, 0);
+        Rlgl.FramebufferAttach(fbo, depth, FramebufferAttachType.Depth,
+            FramebufferAttachTextureType.Renderbuffer, 0);
+        bool ok = Rlgl.FramebufferComplete(fbo);
+        Rlgl.DisableFramebuffer();
+        if (!ok)
         {
-            float a = t.Life / MathF.Max(0.001f, t.MaxLife);
-            if (a <= 0) continue;
-            float r = (2.1f + t.Size * 1.6f) * scale;
-            float x = t.X * scale;
-            float y = t.Y * scale;
-            var col = new Color(t.R, t.G, t.B, (byte)(a * 140));
-            DrawGradientCircle(x, y, r, col);
+            Rlgl.UnloadTexture(tex);
+            Rlgl.UnloadFramebuffer(fbo); // also deletes the attached depth renderbuffer
+            return false;
         }
+        rt.Id = fbo;
+        rt.Texture.Id = tex;
+        rt.Texture.Width = w;
+        rt.Texture.Height = h;
+        rt.Texture.Mipmaps = 1;
+        rt.Texture.Format = PixelFormat.UncompressedR16G16B16A16;
+        rt.Depth.Id = depth;
+        rt.Depth.Width = w;
+        rt.Depth.Height = h;
+        rt.Depth.Mipmaps = 1;
+        rt.Depth.Format = (PixelFormat)19; // raylib's DEPTH_COMPONENT_24 sentinel
+        return true;
+    }
 
-        // Moon glow → bloom
-        var (phase, day, _, _) = SkyCycle(s.Time);
-        float moonTrack = phase;
-        float moonArc = MathF.Sin(moonTrack * MathF.PI);
-        float mmx = MathH.Lerp(-s.W * 0.12f, s.W * 1.12f, moonTrack);
-        float mmy = MathH.Lerp(s.HorizonY * 0.95f, s.HorizonY * 0.2f, moonArc) + MathF.Cos(moonTrack * TAU) * 6;
-        float mmr = MathF.Max(35, s.W * 0.0336f);
-        float moonVisRaw = MathH.Clamp((0.5f - day) / 0.22f, 0, 1);
-        float moonVisS = moonVisRaw * moonVisRaw * (3 - 2 * moonVisRaw);
-        float mmA = moonVisS * 0.92f * MathH.Clamp((moonArc + 0.06f) / 1.06f, 0, 1);
-        if (mmA > 0.02f)
+    /// <summary>All-or-nothing FP16 creation of the scene target + bloom mips.
+    /// On any failure every already-created FP16 object is released and the
+    /// caller reverts the whole chain to RGBA8 — targets never mix formats.</summary>
+    static bool TryCreateHdrTargets(int w, int h)
+    {
+        if (!TryLoadRenderTextureFp16(w, h, out _frameTarget)) return false;
+        for (int i = 0; i < BloomMipCount; i++)
         {
-            DrawGradientCircle(mmx * scale, mmy * scale, mmr * 2.8f * scale,
-                new Color((byte)170, (byte)210, (byte)255, (byte)(mmA * 95)));
-            DrawGradientCircle(mmx * scale, mmy * scale, mmr * 1.5f * scale,
-                new Color((byte)220, (byte)240, (byte)255, (byte)(mmA * 150)));
-        }
-
-        // Sun corona → bloom (day)
-        float sunTrack = (moonTrack + 0.02f) % 1f;
-        float sunArc = MathF.Sin(sunTrack * MathF.PI);
-        float ssx = MathH.Lerp(-s.W * 0.12f, s.W * 1.12f, sunTrack);
-        float ssy = MathH.Lerp(s.HorizonY * 0.95f, s.HorizonY * 0.24f, sunArc) + MathF.Cos(sunTrack * TAU) * 5;
-        float ssr = MathF.Max(26, s.W * 0.024f);
-        float sunVisRaw = MathH.Clamp((day - 0.58f) / 0.22f, 0, 1);
-        float sunVisS = sunVisRaw * sunVisRaw * (3 - 2 * sunVisRaw);
-        float sunA = sunVisS * MathH.Clamp((sunArc + 0.08f) / 1.08f, 0, 1);
-        if (sunA > 0.02f)
-        {
-            DrawGradientCircle(ssx * scale, ssy * scale, ssr * 3.0f * scale,
-                new Color((byte)255, (byte)210, (byte)150, (byte)(sunA * 130)));
-        }
-
-        // City antenna warning lights → bloom (cheap, big dreamy impact)
-        foreach (var city in s.Cities)
-        {
-            if (city.Destroyed) continue;
-            float cx = city.X - city.W * 0.5f;
-            float cy = city.Y;
-            var rng = new Random(city.Id.GetHashCode());
-            int n = 10 + rng.Next(6);
-            float slice = city.W / n;
-            for (int i = 0; i < n; i++)
+            if (!TryLoadRenderTextureFp16(Math.Max(1, w >> (i + 1)), Math.Max(1, h >> (i + 1)),
+                out _bloomMips[i]))
             {
-                float bw = slice * (0.55f + rng.NextSingle() * 0.9f);
-                float bh = 32 + rng.NextSingle() * 74;
-                float bx = cx + i * slice + (slice - bw) * 0.5f;
-                rng.Next(18); rng.Next(22); rng.Next(36); rng.Next(4);
-                rng.NextSingle();
-                bool hasStep = rng.NextSingle() < 0.35f;
-                if (hasStep) rng.NextSingle();
-                bool hasSpire = rng.NextSingle() < 0.28f;
-                if (hasSpire) rng.NextSingle();
-                bool hasAnt = rng.NextSingle() < 0.42f;
-                float antH = hasAnt ? 6 + rng.NextSingle() * 14 : 0f;
-                int antCol = rng.Next(3);
-                rng.Next();
-                if (antH > 0)
-                {
-                    float sxp = bx + bw * 0.5f;
-                    float syp = cy - bh - antH;
-                    float bl = 0.4f + 0.6f * MathF.Max(0f, MathF.Sin(s.Time * 5f + i * 1.7f));
-                    byte lr = 255, lg = 50, lb = 50;
-                    if (antCol == 1) { lr = 255; lg = 255; lb = 100; }
-                    else if (antCol == 2) { lr = 120; lg = 200; lb = 255; }
-                    DrawGradientCircle(sxp * scale, syp * scale, 14f * scale,
-                        new Color(lr, lg, lb, (byte)(bl * 180)));
-                }
+                UnloadManualTarget(ref _frameTarget);
+                for (int j = 0; j < i; j++) UnloadManualTarget(ref _bloomMips[j]);
+                return false;
             }
         }
+        return true;
+    }
 
+    /// <summary>Single teardown owner for the scene + bloom targets (resize
+    /// branch and Shutdown both come through here).</summary>
+    static void UnloadFxTargets()
+    {
+        if (_hdrActive)
+        {
+            UnloadManualTarget(ref _frameTarget);
+            for (int i = 0; i < BloomMipCount; i++) UnloadManualTarget(ref _bloomMips[i]);
+            _hdrActive = false;
+        }
+        else
+        {
+            Raylib.UnloadRenderTexture(_frameTarget);
+            for (int i = 0; i < BloomMipCount; i++) Raylib.UnloadRenderTexture(_bloomMips[i]);
+        }
+        // The light buffer (§5 5.2) is always a stock RGBA8 target — stock
+        // teardown on both the HDR and fallback paths.
+        Raylib.UnloadRenderTexture(_lightTarget);
+        _lightTarget = default;
+    }
+
+    // Manual FBO teardown (§4.9): color texture first, then the framebuffer —
+    // Rlgl.UnloadFramebuffer queries and deletes the attached depth
+    // renderbuffer itself. Stock UnloadRenderTexture would issue the exact
+    // same two GL deletes on the wrapped struct, so routing a hand-assembled
+    // target through BOTH paths would double-free GL names; manual targets are
+    // torn down only here, never via UnloadRenderTexture.
+    static void UnloadManualTarget(ref RenderTexture2D rt)
+    {
+        if (rt.Id == 0) return;
+        Rlgl.UnloadTexture(rt.Texture.Id);
+        Rlgl.UnloadFramebuffer(rt.Id);
+        rt = default;
+    }
+
+    /// <summary>One bloom-chain pass: full-quad shader blit srcTex → dst. Explicit
+    /// negative-height source rect on every RT→RT blit (each pass un-flips raylib's
+    /// render-texture y-inversion — never rely on even-pass-count cancellation).</summary>
+    static void BloomBlit(Shader shader, Texture2D srcTex, RenderTexture2D dst)
+    {
+        Raylib.BeginTextureMode(dst);
+        Raylib.BeginShaderMode(shader);
+        Raylib.DrawTexturePro(srcTex,
+            new Rectangle(0, 0, srcTex.Width, -srcTex.Height),
+            new Rectangle(0, 0, dst.Texture.Width, dst.Texture.Height),
+            Vector2.Zero, 0, Color.White);
+        Raylib.EndShaderMode();
+        Raylib.EndTextureMode();
+    }
+
+    /// <summary>GPU threshold bloom (§5 2.1). Bright pixels come from the rendered
+    /// scene itself — soft-knee bright pass into mip0 (W/2), dual-Kawase down to
+    /// W/16 and back up, then additive composite into _frameTarget so the §4.1
+    /// uber-shader blit grades on top of the bloomed scene.</summary>
+    static void RenderBloom()
+    {
+        // Bright pass: _frameTarget → mip0. threshold/knee/intensity were
+        // uploaded once at shader load (uniform values persist on the program).
+        BloomBlit(_bloomPrefilter, _frameTarget.Texture, _bloomMips[0]);
+
+        for (int i = 0; i < BloomMipCount - 1; i++)
+        {
+            var srcTex = _bloomMips[i].Texture;
+            Raylib.SetShaderValue(_bloomDown, _locBloomDownHalfPixel,
+                new Vector2(0.5f / srcTex.Width, 0.5f / srcTex.Height), ShaderUniformDataType.Vec2);
+            BloomBlit(_bloomDown, srcTex, _bloomMips[i + 1]);
+        }
+
+        // Up chain overwrites the lower mips in place — pure dual-Kawase, each
+        // step only needs the previous step's output.
+        for (int i = BloomMipCount - 1; i > 0; i--)
+        {
+            var srcTex = _bloomMips[i].Texture;
+            Raylib.SetShaderValue(_bloomUp, _locBloomUpHalfPixel,
+                new Vector2(0.5f / srcTex.Width, 0.5f / srcTex.Height), ShaderUniformDataType.Vec2);
+            BloomBlit(_bloomUp, srcTex, _bloomMips[i - 1]);
+        }
+
+        // Additive composite, RGB only: dstRGB += srcRGB·srcA while alpha blends
+        // src-over (srcA + dstA·(1−srcA)) — bloom can't pollute _frameTarget's
+        // alpha ahead of the composite blit.
+        Rlgl.SetBlendFactorsSeparate(GlSrcAlpha, GlOne, GlOne, GlOneMinusSrcAlpha, GlFuncAdd, GlFuncAdd);
+        var tex = _bloomMips[0].Texture;
+        Raylib.BeginTextureMode(_frameTarget);
+        Raylib.BeginBlendMode(BlendMode.CustomSeparate);
+        Raylib.DrawTexturePro(tex,
+            new Rectangle(0, 0, tex.Width, -tex.Height),
+            new Rectangle(0, 0, _fxW, _fxH),
+            Vector2.Zero, 0, Color.White);
         Raylib.EndBlendMode();
         Raylib.EndTextureMode();
-
-        // 2. Multi-pass box blur via ping-pong between _bloomTarget and _bloomPing
-        BlurBloomTarget(s);
     }
 
-    /// <summary>Separable 5-tap Gaussian blur (ping-pong) — proper weighted convolution for soft dreamy glow.</summary>
-    static void BlurBloomTarget(GameState s)
+    /// <summary>§5 5.2: queue one light blob for this frame's light pass. Called
+    /// from inside the world-pass draw functions, where the positions already
+    /// exist. Past the cap the newest entries drop — by collection order that
+    /// sacrifices late explosion blobs before scenery lights, acceptable in
+    /// max-chaos frames.</summary>
+    static void AddLight(float x, float y, float radius, byte r, byte g, byte b, byte a)
     {
-        int bw = _bloomTarget.Texture.Width;
-        int bh = _bloomTarget.Texture.Height;
-        float blurAmount = 8 + s.Danger * 14 + MathH.Clamp(s.Flash * 24, 0, 18);
-        float step = MathF.Max(1.2f, blurAmount * BloomScale * 0.48f);
-
-        // Gaussian weights (sigma ~1.6, radius 2): [0.0702, 0.2448, 0.3900, 0.2448, 0.0702]
-        byte w0 = (byte)(0.3900f * 255); // center
-        byte w1 = (byte)(0.2448f * 255); // ±1
-        byte w2 = (byte)(0.0702f * 255); // ±2
-
-        var src = new Rectangle(0, 0, bw, -bh);
-        var dst = new Rectangle(0, 0, bw, bh);
-
-        for (int pass = 0; pass < BlurPasses; pass++)
-        {
-            float off1 = step * (1 + pass * 0.8f);
-            float off2 = off1 * 2f;
-
-            // Horizontal: _bloomTarget -> _bloomPing
-            Raylib.BeginTextureMode(_bloomPing);
-            Raylib.ClearBackground(new Color((byte)0, (byte)0, (byte)0, (byte)0));
-            Raylib.BeginBlendMode(BlendMode.Additive);
-            Raylib.DrawTexturePro(_bloomTarget.Texture, src, dst, Vector2.Zero, 0,
-                new Color((byte)255, (byte)255, (byte)255, w0));
-            Raylib.DrawTexturePro(_bloomTarget.Texture, src,
-                new Rectangle(-off1, 0, bw, bh), Vector2.Zero, 0,
-                new Color((byte)255, (byte)255, (byte)255, w1));
-            Raylib.DrawTexturePro(_bloomTarget.Texture, src,
-                new Rectangle(off1, 0, bw, bh), Vector2.Zero, 0,
-                new Color((byte)255, (byte)255, (byte)255, w1));
-            Raylib.DrawTexturePro(_bloomTarget.Texture, src,
-                new Rectangle(-off2, 0, bw, bh), Vector2.Zero, 0,
-                new Color((byte)255, (byte)255, (byte)255, w2));
-            Raylib.DrawTexturePro(_bloomTarget.Texture, src,
-                new Rectangle(off2, 0, bw, bh), Vector2.Zero, 0,
-                new Color((byte)255, (byte)255, (byte)255, w2));
-            Raylib.EndBlendMode();
-            Raylib.EndTextureMode();
-
-            // Vertical: _bloomPing -> _bloomTarget
-            Raylib.BeginTextureMode(_bloomTarget);
-            Raylib.ClearBackground(new Color((byte)0, (byte)0, (byte)0, (byte)0));
-            Raylib.BeginBlendMode(BlendMode.Additive);
-            Raylib.DrawTexturePro(_bloomPing.Texture, src, dst, Vector2.Zero, 0,
-                new Color((byte)255, (byte)255, (byte)255, w0));
-            Raylib.DrawTexturePro(_bloomPing.Texture, src,
-                new Rectangle(0, -off1, bw, bh), Vector2.Zero, 0,
-                new Color((byte)255, (byte)255, (byte)255, w1));
-            Raylib.DrawTexturePro(_bloomPing.Texture, src,
-                new Rectangle(0, off1, bw, bh), Vector2.Zero, 0,
-                new Color((byte)255, (byte)255, (byte)255, w1));
-            Raylib.DrawTexturePro(_bloomPing.Texture, src,
-                new Rectangle(0, -off2, bw, bh), Vector2.Zero, 0,
-                new Color((byte)255, (byte)255, (byte)255, w2));
-            Raylib.DrawTexturePro(_bloomPing.Texture, src,
-                new Rectangle(0, off2, bw, bh), Vector2.Zero, 0,
-                new Color((byte)255, (byte)255, (byte)255, w2));
-            Raylib.EndBlendMode();
-            Raylib.EndTextureMode();
-        }
+        if (!_lightsOn || _lightCount >= MaxLights || a < 2 || radius <= 2f) return;
+        _lights[_lightCount++] = (x, y, radius, r, g, b, a);
     }
 
-    static void DrawBloomOverlay(GameState s)
+    /// <summary>§5 5.2 light pass: all collected blobs into the quarter-res
+    /// target — one clear, one blend mode, one texture (the shared radial
+    /// gradient), so the whole pass is a single batched draw.</summary>
+    static void RenderLightBuffer()
     {
-        if (!_fxReady || s.Theme == "recharged") return;
-
-        float baseAlpha = 0.45f + s.Danger * 0.28f + MathH.Clamp(s.Flash * 0.22f, 0, 0.16f);
-        if (baseAlpha <= 0.01f) return;
-
-        var tex = _bloomTarget.Texture;
-        var src = new Rectangle(0, 0, tex.Width, -tex.Height);
-        var dst = new Rectangle(0, 0, s.W, s.H);
+        float sx = _lightTarget.Texture.Width / (float)_fxW;
+        float sy = _lightTarget.Texture.Height / (float)_fxH;
+        Raylib.BeginTextureMode(_lightTarget);
+        Raylib.ClearBackground(Color.Blank);
         Raylib.BeginBlendMode(BlendMode.Additive);
-        // Sharper pass (full alpha)
-        Raylib.DrawTexturePro(tex, src, dst, Vector2.Zero, 0,
-            new Color((byte)255, (byte)255, (byte)255, (byte)(baseAlpha * 255)));
-        // Wider spread pass — bigger dreamy halo
-        float spread = 16 + s.Danger * 10;
-        Raylib.DrawTexturePro(tex, src,
-            new Rectangle(-spread, -spread, s.W + spread * 2, s.H + spread * 2),
-            Vector2.Zero, 0,
-            new Color((byte)255, (byte)255, (byte)255, (byte)(baseAlpha * 0.78f * 255)));
-        // Extra-wide ultra-soft pass
-        float spread2 = spread * 2.2f;
-        Raylib.DrawTexturePro(tex, src,
-            new Rectangle(-spread2, -spread2, s.W + spread2 * 2, s.H + spread2 * 2),
-            Vector2.Zero, 0,
-            new Color((byte)255, (byte)255, (byte)255, (byte)(baseAlpha * 0.42f * 255)));
+        for (int i = 0; i < _lightCount; i++)
+        {
+            ref var l = ref _lights[i];
+            DrawGradientCircle(l.X * sx, l.Y * sy, l.R * sx, new Color(l.Cr, l.Cg, l.Cb, l.Ca));
+        }
         Raylib.EndBlendMode();
+        Raylib.EndTextureMode();
+    }
+
+    /// <summary>Feature 2.2 per-frame uniforms: shockwave ring fronts and heat-shimmer
+    /// sources for the uber-shader's refraction pass. stackalloc + the Span overload of
+    /// SetShaderValueV — zero heap allocation. World y converts to texcoord y-up
+    /// (cy = 1 - y/H); radii normalize by screen height to match the shader's
+    /// aspect-corrected distance space.</summary>
+    static void UploadRefractionUniforms(GameState s)
+    {
+        float invW = 1f / s.W, invH = 1f / s.H;
+
+        // Newest-first copy = oldest-first eviction beyond 16 (the newest fronts
+        // are the strongest on screen; the oldest are nearly faded anyway).
+        Span<Vector4> waves = stackalloc Vector4[MaxShaderShockwaves];
+        int waveCount = 0;
+        for (int i = s.Shockwaves.Count - 1; i >= 0 && waveCount < MaxShaderShockwaves; i--)
+        {
+            var sw = s.Shockwaves[i];
+            float strength = sw.Life / sw.MaxLife; // = 1 - age
+            if (strength <= 0.01f) continue;
+            // EMP flag: the EMP explosion that spawned this wave is still live at
+            // the exact same center (SpawnExpl adds both from one x/y, never moved).
+            bool emp = false;
+            for (int j = s.Explosions.Count - 1; j >= 0; j--)
+            {
+                var e = s.Explosions[j];
+                if (e.Emp && e.X == sw.X && e.Y == sw.Y) { emp = true; break; }
+            }
+            waves[waveCount++] = new Vector4(sw.X * invW, 1f - sw.Y * invH,
+                sw.Radius * invH, emp ? 1f + strength : MathF.Min(strength, 0.999f));
+        }
+
+        // 4 hottest live non-EMP explosions (EMP is light, not heat), ranked by
+        // remaining life × size — insertion sort into a fixed descending array.
+        Span<Vector4> heat = stackalloc Vector4[MaxShaderHeatSources];
+        Span<float> heatRank = stackalloc float[MaxShaderHeatSources];
+        int heatCount = 0;
+        for (int i = 0; i < s.Explosions.Count; i++)
+        {
+            var e = s.Explosions[i];
+            if (e.Emp || e.MaxRadius < 70f) continue;
+            float h = (e.Life / e.MaxLife) * MathH.Clamp(e.MaxRadius / 160f, 0.55f, 1f);
+            if (h <= 0.02f) continue;
+            if (heatCount == MaxShaderHeatSources && h <= heatRank[MaxShaderHeatSources - 1]) continue;
+            int pos = heatCount < MaxShaderHeatSources ? heatCount : MaxShaderHeatSources - 1;
+            while (pos > 0 && h > heatRank[pos - 1])
+            {
+                heatRank[pos] = heatRank[pos - 1];
+                heat[pos] = heat[pos - 1];
+                pos--;
+            }
+            heatRank[pos] = h;
+            heat[pos] = new Vector4(e.X * invW, 1f - e.Y * invH, e.MaxRadius * invH, h);
+            if (heatCount < MaxShaderHeatSources) heatCount++;
+        }
+
+        if (waveCount > 0)
+            Raylib.SetShaderValueV<Vector4>(_postShader, _locShockwaves, waves, ShaderUniformDataType.Vec4, waveCount);
+        Raylib.SetShaderValue(_postShader, _locShockwaveCount, waveCount, ShaderUniformDataType.Int);
+        if (heatCount > 0)
+            Raylib.SetShaderValueV<Vector4>(_postShader, _locHeatSources, heat, ShaderUniformDataType.Vec4, heatCount);
+        Raylib.SetShaderValue(_postShader, _locHeatCount, heatCount, ShaderUniformDataType.Int);
     }
 
     public static void DrawAll(GameState s)
     {
         EnsureFxTargets(s);
-        RenderBloomPass(s);
+
+        // §5 5.2: arm light collection for this frame's world pass. Without the
+        // uber-shader there is no composite to consume the buffer — skip it all.
+        _lightsOn = _postShaderActive && !_lightDisabled;
+        _lightCount = 0;
 
         Raylib.BeginTextureMode(_frameTarget);
         Raylib.ClearBackground(new Color(2, 5, 10, 255));
-
-        float sx = s.Shake > 0 ? MathH.Rand(-s.Shake, s.Shake) : 0;
-        float sy = s.Shake > 0 ? MathH.Rand(-s.Shake * 0.65f, s.Shake * 0.65f) : 0;
-        Rlgl.PushMatrix();
-        Rlgl.Translatef(sx, sy, 0);
 
         DrawSky(s);
         DrawNebula(s);
@@ -330,6 +535,7 @@ public static class Renderer
         DrawGround(s);
         DrawScorches(s);
         Raylib.BeginBlendMode(BlendMode.Additive);
+        DrawScorchGlow(s); // §5 5.3 cooling ground glow — same additive group
         DrawLightBursts(s);
         Raylib.EndBlendMode();
         DrawCities(s);
@@ -350,25 +556,79 @@ public static class Renderer
         Raylib.BeginBlendMode(BlendMode.Additive);
         DrawMuzzleFlashes(s);
         DrawExplosions(s);
+        DrawBlastFlashes(s); // §5 5.3 1-frame detonation pop — same additive group
         DrawSparks(s);
         DrawShockwaves(s);
         Raylib.EndBlendMode();
         DrawDebris(s);
         DrawFloatingTexts(s);
 
-        Rlgl.PopMatrix();
-
-        DrawCrosshair(s);
-        DrawBloomOverlay(s);
-        DrawHUD(s);
-        DrawOverlays(s);
-
         Raylib.EndTextureMode();
 
+        if (_lightsOn) RenderLightBuffer(); // §5 5.2 — before bloom
+        if (_bloomActive) RenderBloom();
+
+        // §4.1 composite — ONE DrawTexturePro: trauma translation + roll about
+        // screen center. Settings.ShakeIntensity (§5 3.1) scales the amplitude.
+        float t2 = s.Trauma * s.Trauma * s.Settings.ShakeIntensity;
+        float offX = 0f, offY = 0f, roll = 0f;
+        if (t2 > 0.0001f)
+        {
+            float nt = FeelDirector.Clock * NoiseRate;
+            offX = SampleNoise(_shakeNoiseX, nt) * MaxShakePx * t2;
+            offY = SampleNoise(_shakeNoiseY, nt) * MaxShakePx * 0.65f * t2;
+            roll = SampleNoise(_shakeNoiseRoll, nt) * MaxRollDeg * t2;
+        }
+        // Zoom derived from the sampled roll/offset so the rotated quad provably
+        // contains the screen at any aspect (a static 1.03 exposed corners at
+        // ±1.5° roll). Cover needs quad half-extents of at least
+        //   (W/2+|offX|)·cosθ + (H/2+|offY|)·sinθ   (width)
+        //   (W/2+|offX|)·sinθ + (H/2+|offY|)·cosθ   (height);
+        // the +1 px pad absorbs float rounding when zoom ≈ 1.
+        float rollRad = MathF.Abs(roll) * (MathF.PI / 180f);
+        float cr = MathF.Cos(rollRad), sr = MathF.Sin(rollRad);
+        float exW = s.W + 2f * (MathF.Abs(offX) + 1f);
+        float exH = s.H + 2f * (MathF.Abs(offY) + 1f);
+        float zoom = MathF.Max((exW * cr + exH * sr) / s.W, (exW * sr + exH * cr) / s.H);
         var src = new Rectangle(0, 0, _frameTarget.Texture.Width, -_frameTarget.Texture.Height);
-        var dst = new Rectangle(0, 0, s.W, s.H);
-        Raylib.DrawTexturePro(_frameTarget.Texture, src, dst, Vector2.Zero, 0, Color.White);
+        var dst = new Rectangle(s.W * 0.5f + offX, s.H * 0.5f + offY, s.W * zoom, s.H * zoom);
+        if (_postShaderActive)
+        {
+            // Time wraps to keep the grain hash's sin() argument in float32 range.
+            Raylib.SetShaderValue(_postShader, _locTime, FeelDirector.Clock % 64f, ShaderUniformDataType.Float);
+            Raylib.SetShaderValue(_postShader, _locDanger, s.Danger, ShaderUniformDataType.Float);
+            Raylib.SetShaderValue(_postShader, _locChromatic, s.Chromatic, ShaderUniformDataType.Float);
+            // Flash reduction (§5 3.1): suppress the full-screen shader flash;
+            // DrawPostFx renders the edge vignette pulse instead.
+            float flashAmt = s.Settings.FlashReduction ? 0f : MathH.Clamp(s.Flash * 1.1f, 0f, 1f);
+            Raylib.SetShaderValue(_postShader, _locFlashAmount, flashAmt, ShaderUniformDataType.Float);
+            Raylib.SetShaderValue(_postShader, _locFlashDir, FlashDirDefault, ShaderUniformDataType.Vec2);
+            Raylib.SetShaderValue(_postShader, _locFlashColor, FlashColorDefault, ShaderUniformDataType.Vec3);
+            Raylib.SetShaderValue(_postShader, _locResolution, new Vector2(s.W, s.H), ShaderUniformDataType.Vec2);
+            Raylib.SetShaderValue(_postShader, _locHdrActive, _hdrActive ? 1f : 0f, ShaderUniformDataType.Float);
+            // §5 5.2: day/night ambient key (SkyCycle day peaks at 0.86 —
+            // normalize so full daylight reads exactly 1.0) + the light buffer
+            // as a second sampler. rlgl clears its extra texture slots after
+            // every batch draw, so the sampler rebinds every frame.
+            var (_, dayF, _, _) = SkyCycle(s.Time);
+            Raylib.SetShaderValue(_postShader, _locDayFactor,
+                MathH.Clamp(dayF / 0.86f, 0f, 1f), ShaderUniformDataType.Float);
+            Raylib.SetShaderValue(_postShader, _locLightActive, _lightsOn ? 1f : 0f, ShaderUniformDataType.Float);
+            if (_lightsOn) Raylib.SetShaderValueTexture(_postShader, _locLightTex, _lightTarget.Texture);
+            UploadRefractionUniforms(s);
+            Raylib.BeginShaderMode(_postShader);
+        }
+        Raylib.DrawTexturePro(_frameTarget.Texture, src, dst,
+            new Vector2(s.W * zoom * 0.5f, s.H * zoom * 0.5f), roll, Color.White);
+        if (_postShaderActive) Raylib.EndShaderMode();
+
         DrawPostFx(s);
+
+        // HUD / crosshair / overlays live on the backbuffer — they never
+        // shake, rotate, or refract with the world (overlays on top)
+        DrawCrosshair(s);
+        DrawHUD(s);
+        DrawOverlays(s);
     }
 
     static void EnsureFxTargets(GameState s)
@@ -377,24 +637,111 @@ public static class Renderer
         int h = Math.Max(1, (int)s.H);
         if (!_fxReady || _fxW != w || _fxH != h)
         {
-            if (_fxReady)
+            if (_fxReady) UnloadFxTargets();
+
+            // §5 5.1: FP16 first, so additive overlap accumulates past 1.0 for
+            // the bloom threshold and the ACES tonemap. A driver that rejects
+            // FP16 once will reject it on every resize — latch the fallback.
+            _hdrActive = !_hdrDisabled && TryCreateHdrTargets(w, h);
+            if (!_hdrActive && !_hdrDisabled)
             {
-                Raylib.UnloadRenderTexture(_frameTarget);
-                Raylib.UnloadRenderTexture(_bloomTarget);
-                Raylib.UnloadRenderTexture(_bloomPing);
+                _hdrDisabled = true;
+                Raylib.TraceLog(TraceLogLevel.Warning,
+                    "HDR: FP16 framebuffer unavailable, falling back to RGBA8");
+            }
+            if (!_hdrActive)
+            {
+                _frameTarget = Raylib.LoadRenderTexture(w, h);
+                for (int i = 0; i < BloomMipCount; i++)
+                    _bloomMips[i] = Raylib.LoadRenderTexture(Math.Max(1, w >> (i + 1)), Math.Max(1, h >> (i + 1)));
             }
 
-            int bw = Math.Max(1, (int)(w * BloomScale));
-            int bh = Math.Max(1, (int)(h * BloomScale));
-            _frameTarget = Raylib.LoadRenderTexture(w, h);
-            _bloomTarget = Raylib.LoadRenderTexture(bw, bh);
-            _bloomPing = Raylib.LoadRenderTexture(bw, bh);
             Raylib.SetTextureFilter(_frameTarget.Texture, TextureFilter.Bilinear);
-            Raylib.SetTextureFilter(_bloomTarget.Texture, TextureFilter.Bilinear);
-            Raylib.SetTextureFilter(_bloomPing.Texture, TextureFilter.Bilinear);
+            // Dual-Kawase mip chain W/2…W/16 — bilinear for the half-pixel taps,
+            // clamp so edge taps never wrap to the opposite screen edge.
+            for (int i = 0; i < BloomMipCount; i++)
+            {
+                Raylib.SetTextureFilter(_bloomMips[i].Texture, TextureFilter.Bilinear);
+                Raylib.SetTextureWrap(_bloomMips[i].Texture, TextureWrap.Clamp);
+            }
+
+            // §5 5.2: quarter-res light buffer. Bilinear hides the upscale;
+            // clamp keeps the shader's displaced-uv taps off the opposite edge.
+            _lightTarget = Raylib.LoadRenderTexture(Math.Max(1, w / 4), Math.Max(1, h / 4));
+            Raylib.SetTextureFilter(_lightTarget.Texture, TextureFilter.Bilinear);
+            Raylib.SetTextureWrap(_lightTarget.Texture, TextureWrap.Clamp);
+
             _fxW = w;
             _fxH = h;
             _fxReady = true;
+        }
+
+        if (!_postShaderTried)
+        {
+            _postShaderTried = true;
+            _postShader = Raylib.LoadShaderFromMemory(null, Shaders.PostFxFrag);
+            _locResolution = Raylib.GetShaderLocation(_postShader, "resolution");
+            // A failed compile hands back raylib's DEFAULT shader id (which
+            // IsShaderValid still accepts) — it has none of our uniforms, so
+            // also require a live custom-uniform location.
+            if (Raylib.IsShaderValid(_postShader) && _locResolution != -1)
+            {
+                _locTime = Raylib.GetShaderLocation(_postShader, "time");
+                _locDanger = Raylib.GetShaderLocation(_postShader, "danger");
+                _locChromatic = Raylib.GetShaderLocation(_postShader, "chromatic");
+                _locFlashAmount = Raylib.GetShaderLocation(_postShader, "flashAmount");
+                _locFlashDir = Raylib.GetShaderLocation(_postShader, "flashDir");
+                _locFlashColor = Raylib.GetShaderLocation(_postShader, "flashColor");
+                // GL returns array locations under "name[0]" on some drivers,
+                // bare "name" on others — try both. -1 stays harmless (no-op).
+                _locShockwaves = Raylib.GetShaderLocation(_postShader, "shockwaves");
+                if (_locShockwaves == -1) _locShockwaves = Raylib.GetShaderLocation(_postShader, "shockwaves[0]");
+                _locShockwaveCount = Raylib.GetShaderLocation(_postShader, "shockwaveCount");
+                _locHeatSources = Raylib.GetShaderLocation(_postShader, "heatSources");
+                if (_locHeatSources == -1) _locHeatSources = Raylib.GetShaderLocation(_postShader, "heatSources[0]");
+                _locHeatCount = Raylib.GetShaderLocation(_postShader, "heatCount");
+                // §5 5.1: hdrActive re-uploads per frame (the HDR chain can drop
+                // to RGBA8 on a resize failure); the pre-ACES exposure lift is a
+                // tuning constant — upload once, uniform values persist.
+                _locHdrActive = Raylib.GetShaderLocation(_postShader, "hdrActive");
+                Raylib.SetShaderValue(_postShader, Raylib.GetShaderLocation(_postShader, "exposure"),
+                    HdrExposure, ShaderUniformDataType.Float);
+                // §5 5.2 light-buffer uniforms (sampler rebinds per frame)
+                _locLightTex = Raylib.GetShaderLocation(_postShader, "lightTex");
+                _locDayFactor = Raylib.GetShaderLocation(_postShader, "dayFactor");
+                _locLightActive = Raylib.GetShaderLocation(_postShader, "lightActive");
+                _postShaderActive = true;
+            }
+        }
+
+        if (!_bloomShaderTried)
+        {
+            _bloomShaderTried = true;
+            _bloomPrefilter = Raylib.LoadShaderFromMemory(null, Shaders.BloomPrefilterFrag);
+            _bloomDown = Raylib.LoadShaderFromMemory(null, Shaders.BloomDownsampleFrag);
+            _bloomUp = Raylib.LoadShaderFromMemory(null, Shaders.BloomUpsampleFrag);
+            int locThreshold = Raylib.GetShaderLocation(_bloomPrefilter, "threshold");
+            _locBloomDownHalfPixel = Raylib.GetShaderLocation(_bloomDown, "halfPixel");
+            _locBloomUpHalfPixel = Raylib.GetShaderLocation(_bloomUp, "halfPixel");
+            // Same failed-compile detection as the post shader: a live custom
+            // uniform proves we didn't get raylib's default shader back.
+            if (Raylib.IsShaderValid(_bloomPrefilter) && locThreshold != -1
+                && Raylib.IsShaderValid(_bloomDown) && _locBloomDownHalfPixel != -1
+                && Raylib.IsShaderValid(_bloomUp) && _locBloomUpHalfPixel != -1)
+            {
+                // Tuning constants never change at runtime — upload once.
+                Raylib.SetShaderValue(_bloomPrefilter, locThreshold, BloomThreshold, ShaderUniformDataType.Float);
+                Raylib.SetShaderValue(_bloomPrefilter, Raylib.GetShaderLocation(_bloomPrefilter, "knee"),
+                    BloomKnee, ShaderUniformDataType.Float);
+                Raylib.SetShaderValue(_bloomPrefilter, Raylib.GetShaderLocation(_bloomPrefilter, "intensity"),
+                    BloomIntensity, ShaderUniformDataType.Float);
+                _bloomActive = true;
+            }
+            else
+            {
+                // Legacy CPU bloom was deleted (2.1) — the scene renders unbloomed.
+                Raylib.TraceLog(TraceLogLevel.Warning, "BLOOM: shader compile failed, rendering without bloom");
+            }
         }
 
         if (!_grainReady)
@@ -420,30 +767,75 @@ public static class Renderer
             _moonReady = true;
         }
 
-        if (!_uiFontReady)
+        if (!_uiFontTried)
         {
-            // Load Segoe UI (Windows) — smooth TTF with mipmaps. Fall back silently if not found.
-            string[] regularPaths = { @"C:\Windows\Fonts\segoeui.ttf", @"C:\Windows\Fonts\consola.ttf", @"C:\Windows\Fonts\arial.ttf" };
-            string[] boldPaths = { @"C:\Windows\Fonts\segoeuib.ttf", @"C:\Windows\Fonts\consolab.ttf", @"C:\Windows\Fonts\arialbd.ttf" };
-            foreach (var p in regularPaths)
+            _uiFontTried = true;
+            // Embedded JetBrains Mono (OFL, §5 1.5) — cross-platform primary.
+            // Resource bytes are read exactly once here, never per frame.
+            BuildUiCodepoints();
+            TryLoadEmbeddedFont("JetBrainsMono-Regular.ttf", ref _uiFont);
+            TryLoadEmbeddedFont("JetBrainsMono-Bold.ttf", ref _uiFontBold);
+
+            // Windows system fonts — fallback when the embedded resource is missing.
+            if (_uiFont.BaseSize <= 0)
             {
-                if (File.Exists(p))
+                string[] regularPaths = { @"C:\Windows\Fonts\segoeui.ttf", @"C:\Windows\Fonts\consola.ttf", @"C:\Windows\Fonts\arial.ttf" };
+                foreach (var p in regularPaths)
                 {
-                    _uiFont = Raylib.LoadFontEx(p, 64, null, 0);
-                    Raylib.SetTextureFilter(_uiFont.Texture, TextureFilter.Bilinear);
-                    break;
+                    if (File.Exists(p))
+                    {
+                        _uiFont = Raylib.LoadFontEx(p, 64, _uiCodepoints, _uiCodepoints!.Length);
+                        Raylib.SetTextureFilter(_uiFont.Texture, TextureFilter.Bilinear);
+                        break;
+                    }
                 }
             }
-            foreach (var p in boldPaths)
+            if (_uiFontBold.BaseSize <= 0)
             {
-                if (File.Exists(p))
+                string[] boldPaths = { @"C:\Windows\Fonts\segoeuib.ttf", @"C:\Windows\Fonts\consolab.ttf", @"C:\Windows\Fonts\arialbd.ttf" };
+                foreach (var p in boldPaths)
                 {
-                    _uiFontBold = Raylib.LoadFontEx(p, 64, null, 0);
-                    Raylib.SetTextureFilter(_uiFontBold.Texture, TextureFilter.Bilinear);
-                    break;
+                    if (File.Exists(p))
+                    {
+                        _uiFontBold = Raylib.LoadFontEx(p, 64, _uiCodepoints, _uiCodepoints!.Length);
+                        Raylib.SetTextureFilter(_uiFontBold.Texture, TextureFilter.Bilinear);
+                        break;
+                    }
                 }
             }
             _uiFontReady = _uiFont.BaseSize > 0 && _uiFontBold.BaseSize > 0;
+        }
+    }
+
+    // Raylib's default bake is ASCII 32-126 only; shop/HUD strings use a few
+    // typographic glyphs (· — →) the TTFs carry but the default atlas drops —
+    // they'd render as '?'. Built once at font init.
+    static int[]? _uiCodepoints;
+    static void BuildUiCodepoints()
+    {
+        var cp = new int[95 + 3];
+        for (int i = 0; i < 95; i++) cp[i] = 32 + i;
+        cp[95] = 0x00B7; cp[96] = 0x2014; cp[97] = 0x2192; // · — →
+        _uiCodepoints = cp;
+    }
+
+    static void TryLoadEmbeddedFont(string suffix, ref Font font)
+    {
+        var asm = typeof(Renderer).Assembly;
+        foreach (var name in asm.GetManifestResourceNames())
+        {
+            if (!name.EndsWith(suffix, StringComparison.Ordinal)) continue;
+            using var stream = asm.GetManifestResourceStream(name);
+            if (stream == null) return;
+            var bytes = new byte[stream.Length];
+            stream.ReadExactly(bytes);
+            var f = Raylib.LoadFontFromMemory(".ttf", bytes, 64, _uiCodepoints, _uiCodepoints!.Length);
+            if (f.BaseSize > 0)
+            {
+                Raylib.SetTextureFilter(f.Texture, TextureFilter.Bilinear);
+                font = f;
+            }
+            return;
         }
     }
 
@@ -699,6 +1091,9 @@ public static class Renderer
         float moonA = moonVis * 0.92f * MathH.Clamp((moonArc + 0.06f) / 1.06f, 0, 1);
         if (moonA > 0.01f && _moonReady)
         {
+            // §5 5.2: cool dim moonlight pool in the light buffer
+            AddLight(mx, my, mr * 3.0f, 140, 180, 255, (byte)(moonA * 55));
+
             // Layered soft glow halo (additive) — big dreamy bloom ring matching HTML
             Raylib.BeginBlendMode(BlendMode.Additive);
             // Far halo: soft wide blue-white
@@ -818,15 +1213,15 @@ public static class Renderer
         float my = (s.MouseY - s.H * 0.5f) / s.H;
 
         Raylib.BeginBlendMode(BlendMode.Additive);
-        var rng = new Random(271);
         for (int i = 0; i < 12; i++)
         {
-            float bx = rng.NextSingle() * s.W * 1.1f - s.W * 0.05f;
-            float by = rng.NextSingle() * s.HorizonY * 1.1f;
-            float br = (rng.NextSingle() * 0.12f + 0.08f) * s.W;
-            float ba = (rng.NextSingle() * 0.06f + 0.04f) * nightAlpha;
-            float drift = rng.NextSingle() * 0.08f + 0.02f;
-            float phase = rng.NextSingle() * TAU;
+            int ri = i * 6;
+            float bx = _bokehRand[ri] * s.W * 1.1f - s.W * 0.05f;
+            float by = _bokehRand[ri + 1] * s.HorizonY * 1.1f;
+            float br = (_bokehRand[ri + 2] * 0.12f + 0.08f) * s.W;
+            float ba = (_bokehRand[ri + 3] * 0.06f + 0.04f) * nightAlpha;
+            float drift = _bokehRand[ri + 4] * 0.08f + 0.02f;
+            float phase = _bokehRand[ri + 5] * TAU;
 
             float x = bx + MathF.Sin(s.Time * drift + phase) * 20 - mx * 30;
             float y = by + MathF.Cos(s.Time * drift * 0.7f + phase * 0.6f) * 14 - my * 20;
@@ -954,15 +1349,15 @@ public static class Renderer
         float mx = (s.MouseX - s.W * 0.5f) / s.W;
         float my = (s.MouseY - s.H * 0.5f) / s.H;
 
-        var rng = new Random(42);
         int count = 950;
         // Slightly expand the mask so glow halo pixels aren't crosshatched either
         float maskR2 = _moonMaskActive ? (_moonMaskR * 1.15f) * (_moonMaskR * 1.15f) : 0f;
         Raylib.BeginBlendMode(BlendMode.Additive);
         for (int i = 0; i < count; i++)
         {
-            float x = rng.NextSingle() * s.W - mx * 10;
-            float y = rng.NextSingle() * (s.HorizonY + 60) - my * 8;
+            int ri = i * 3;
+            float x = _starRand[ri] * s.W - mx * 10;
+            float y = _starRand[ri + 1] * (s.HorizonY + 60) - my * 8;
             if (_moonMaskActive)
             {
                 float ddx = x - _moonMaskX, ddy = y - _moonMaskY;
@@ -970,7 +1365,7 @@ public static class Renderer
             }
             float tw = 0.3f + 0.7f * (0.5f + 0.5f * MathF.Sin(s.Time * (0.8f + i * 0.012f) + i * 0.73f));
             byte a = (byte)(tw * 220 * visA);
-            float sz = 0.2f + rng.NextSingle() * 1.2f;
+            float sz = 0.2f + _starRand[ri + 2] * 1.2f;
             if (sz > 0.9f)
                 Raylib.DrawCircle((int)x, (int)y, sz * 2.5f, new Color((byte)140, (byte)170, (byte)255, (byte)(a / 12)));
             Raylib.DrawCircle((int)x, (int)y, sz, new Color((byte)220, (byte)230, (byte)255, a));
@@ -991,12 +1386,12 @@ public static class Renderer
         var nearTop = MixRgb(((byte)40, (byte)42, (byte)65), ((byte)98, (byte)110, (byte)142), day);
         var nearBot = MixRgb(((byte)11, (byte)10, (byte)20), ((byte)52, (byte)58, (byte)86), day);
 
-        DrawMountLayerGradient(s, new Random(777), s.HorizonY + 70, s.H * 0.11f, 16, 0.6f,
+        DrawMountLayerGradient(s, _ridgeFarRand, s.HorizonY + 70, s.H * 0.11f, 16, 0.6f,
             new Color(farTop.R, farTop.G, farTop.B, (byte)(210 + day * 10)),
             new Color(farBot.R, farBot.G, farBot.B, (byte)(242 - day * 16)),
             mx * 20);
 
-        DrawMountLayerGradient(s, new Random(888), s.HorizonY + 130, s.H * 0.14f, 20, 1f,
+        DrawMountLayerGradient(s, _ridgeNearRand, s.HorizonY + 130, s.H * 0.14f, 20, 1f,
             new Color(nearTop.R, nearTop.G, nearTop.B, (byte)(220 + day * 8)),
             new Color(nearBot.R, nearBot.G, nearBot.B, (byte)(250 - day * 20)),
             mx * 45);
@@ -1031,18 +1426,19 @@ public static class Renderer
         }
     }
 
-    static void DrawMountLayerGradient(GameState s, Random rng, float baseY, float amp, int segs, float roughness,
+    static void DrawMountLayerGradient(GameState s, float[] ridgeRand, float baseY, float amp, int segs, float roughness,
         Color topCol, Color botCol, float parallaxOffset)
     {
         float os = s.W * 0.1f;
-        // Generate ridge points
-        var pts = new List<(float X, float Y)>(segs + 1);
-        for (int i = 0; i <= segs; i++)
+        // Generate ridge points into the shared scratch buffer (no per-frame List)
+        var pts = _ridgePts;
+        int ptCount = segs + 1;
+        for (int i = 0; i < ptCount; i++)
         {
             float x = -os + (i / (float)segs * (s.W + os * 2));
             float w = MathF.Sin(i / (float)segs * MathF.PI * (1.5f + roughness * 0.7f));
-            float y = baseY - (w * amp + MathH.Rand(-amp * 0.45f, amp * 0.55f, rng));
-            pts.Add((x - parallaxOffset, y));
+            float y = baseY - (w * amp + MathH.Lerp(-amp * 0.45f, amp * 0.55f, ridgeRand[i]));
+            pts[i] = (x - parallaxOffset, y);
         }
 
         float gndY = s.GroundY + 4;
@@ -1050,10 +1446,10 @@ public static class Renderer
         // Draw using Rlgl quads � per-vertex colors give a proper gradient,
         // and quads avoid all triangle winding / backface-cull issues.
         // Rlgl quad vertex order must be: BL ? BR ? TR ? TL
-        Rlgl.CheckRenderBatchLimit(pts.Count * 4);
+        Rlgl.CheckRenderBatchLimit(ptCount * 4);
         Rlgl.SetTexture(Rlgl.GetTextureIdDefault());
         Rlgl.Begin(DrawMode.Quads);
-        for (int i = 1; i < pts.Count; i++)
+        for (int i = 1; i < ptCount; i++)
         {
             var a = pts[i - 1];
             var b = pts[i];
@@ -1132,14 +1528,14 @@ public static class Renderer
 
         // Haze bands above ground (subtle atmospheric haze)
         var hazeCol = MixRgb(((byte)106, (byte)148, (byte)210), ((byte)154, (byte)172, (byte)194), day);
-        var hrng = new Random(555);
         for (int i = 0; i < 5; i++)
         {
-            float hy = MathH.Lerp(s.HorizonY * 0.78f, s.GroundY - 30, hrng.NextSingle());
-            float hth = 44 + hrng.NextSingle() * 48;
-            float ha = hrng.NextSingle() * 0.06f + 0.04f;
-            float hsp = hrng.NextSingle() * 0.16f + 0.08f;
-            float hp = hrng.NextSingle() * TAU;
+            int ri = i * 5;
+            float hy = MathH.Lerp(s.HorizonY * 0.78f, s.GroundY - 30, _hazeRand[ri]);
+            float hth = 44 + _hazeRand[ri + 1] * 48;
+            float ha = _hazeRand[ri + 2] * 0.06f + 0.04f;
+            float hsp = _hazeRand[ri + 3] * 0.16f + 0.08f;
+            float hp = _hazeRand[ri + 4] * TAU;
             float wob = MathF.Sin(s.Time * hsp + hp);
             float cy = hy + wob * 16;
             float bandA = ha * (0.82f + 0.18f * wob) * (1 - day * 0.24f);
@@ -1177,6 +1573,21 @@ public static class Renderer
         }
     }
 
+    /// <summary>§5 5.3 lingering ground glow: fresh scorches radiate warm light
+    /// that cools over ~2.5 s. Caller wraps in the additive light-burst group.</summary>
+    static void DrawScorchGlow(GameState s)
+    {
+        foreach (var sc in s.Scorches)
+        {
+            if (sc.Heat <= 0.02f) continue;
+            float h = sc.Heat * sc.Heat; // ease the cooldown — hot pop, long tail
+            DrawGradientCircle(sc.X, sc.Y - 2, sc.Radius * (1.5f + (1 - sc.Heat) * 0.4f),
+                new Color((byte)255, (byte)110, (byte)40, (byte)(h * 120)));
+            DrawGradientCircle(sc.X, sc.Y - 2, sc.Radius * 0.6f,
+                new Color((byte)255, (byte)200, (byte)130, (byte)(h * 150)));
+        }
+    }
+
     // ?????????????? LIGHT BURSTS (additive) ??????????????
     static void DrawLightBursts(GameState s)
     {
@@ -1202,7 +1613,9 @@ public static class Renderer
     {
         float cx = city.X - city.W * 0.5f;
         float cy = city.Y;
-        var rng = new Random(city.Id.GetHashCode());
+        // §5 5.2: very dim warm neon pool over each alive skyline
+        AddLight(city.X, city.Y - 26f, city.W * 1.05f, 255, 190, 130, 22);
+        var rng = new DrawRand(city.Id.GetHashCode());
         int n = 10 + rng.Next(6);
         float slice = city.W / n;
 
@@ -1214,7 +1627,7 @@ public static class Renderer
             new Color((byte)124, (byte)198, (byte)255, (byte)80));
 
         // First pass: building bodies + roofs (opaque, back-to-front not needed since non-overlapping)
-        var buildings = new (float bx, float bw, float bh, byte r, byte g, byte b, int rt, float rh, int seed, float stepW, float stepH, float spireH, float antH, int antCol)[n];
+        var buildings = _cityBuildings; // shared scratch, first n slots valid this call
         for (int i = 0; i < n; i++)
         {
             float bw = slice * (0.55f + rng.NextSingle() * 0.9f);
@@ -1288,9 +1701,10 @@ public static class Renderer
 
         // Second pass: additive-blended windows, trims, warning lights (HTML: globalCompositeOperation='lighter')
         Raylib.BeginBlendMode(BlendMode.Additive);
-        foreach (var bd in buildings)
+        for (int bi = 0; bi < n; bi++)
         {
-            var brng = new Random(bd.seed);
+            var bd = buildings[bi];
+            var brng = new DrawRand(bd.seed);
             int cols = Math.Max(2, (int)(bd.bw / 7));
             int rows = Math.Max(3, (int)(bd.bh / 10));
             float colStep = (bd.bw - 4) / cols;
@@ -1372,7 +1786,7 @@ public static class Renderer
     {
         float cx = c.X - c.W * 0.5f;
         float cy = c.Y;
-        var rng = new Random(c.Id.GetHashCode() + 999);
+        var rng = new DrawRand(c.Id.GetHashCode() + 999);
         int n = 6 + rng.Next(5);
         float sl = c.W / n;
 
@@ -1381,7 +1795,7 @@ public static class Renderer
             new Color((byte)16, (byte)12, (byte)20, (byte)245));
 
         // Jagged fragment silhouettes (stable from seed)
-        var frags = new (float fx, float fw, float fh, float tip, float t)[n];
+        var frags = _ruinFrags; // shared scratch, first n slots valid this call
         for (int i = 0; i < n; i++)
         {
             float fw = sl * (0.45f + rng.NextSingle() * 0.8f);
@@ -1421,7 +1835,7 @@ public static class Renderer
             new Color((byte)255, (byte)220, (byte)180, (byte)(coreGl * 255)));
 
         // Ember pockets on each fragment (soft glow halos, not solid dots)
-        for (int i = 0; i < frags.Length; i++)
+        for (int i = 0; i < n; i++)
         {
             var f = frags[i];
             if ((i % 2) == 0) // half fragments have embers
@@ -1437,7 +1851,7 @@ public static class Renderer
         }
 
         // Scattered ember sparks (small stars rising from ruin)
-        var erng = new Random(c.Id.GetHashCode() + 1777);
+        var erng = new DrawRand(c.Id.GetHashCode() + 1777);
         int embCount = 14;
         for (int i = 0; i < embCount; i++)
         {
@@ -1477,8 +1891,16 @@ public static class Renderer
                 Raylib.DrawEllipse((int)b.X, (int)b.Y, 36, 12, new Color(40, 18, 12, 80));
                 Raylib.DrawRectangle((int)(b.X - 22), (int)(b.Y - 18), 14, 18, new Color(60, 30, 25, 100));
                 Raylib.DrawRectangle((int)(b.X + 8), (int)(b.Y - 12), 12, 12, new Color(60, 30, 25, 100));
-                Raylib.DrawText("OFFLINE", (int)(b.X - 30), (int)(b.Y - 56), 16, new Color(255, 100, 50, 200));
+                DrawTextM("OFFLINE", b.X - MeasureTextM("OFFLINE", 16) * 0.5f, b.Y - 56, 16, new Color(255, 100, 50, 200));
                 continue;
+            }
+
+            // Recoil spring: whole structure dips ~3 px on fire
+            bool recoiled = b.Recoil > 0.05f || b.Recoil < -0.05f;
+            if (recoiled)
+            {
+                Rlgl.PushMatrix();
+                Rlgl.Translatef(0, b.Recoil, 0);
             }
 
             float ar = b.Ammo / MathF.Max(1, 16 + MathF.Floor(s.Level * 2.2f));
@@ -1528,6 +1950,9 @@ public static class Renderer
                     byte ca = (byte)(140 + pulse * 110);
                     Raylib.DrawRectangle((int)(b.X - 12), (int)cy, 24, 3, new Color((byte)180, (byte)240, (byte)255, ca));
                     Raylib.DrawRectangle((int)(b.X - 10), (int)(cy + 0.5f), 20, 2, new Color((byte)220, (byte)255, (byte)255, (byte)(ca * 0.7f)));
+                    if (b.ResupplyFlash > 0)
+                        Raylib.DrawRectangle((int)(b.X - 12), (int)cy, 24, 3,
+                            new Color((byte)255, (byte)255, (byte)255, (byte)(b.ResupplyFlash * 150)));
                 }
                 else
                 {
@@ -1557,10 +1982,22 @@ public static class Renderer
             // Radar dish (3D rotating)
             DrawRadarDish(s, b.X + 30, b.Y - 16, 14, 22, s.Time * 2.5f + b.X);
 
+            // 2-frame additive muzzle flash at the silo mouth
+            if (b.MuzzleT > 0)
+            {
+                float mt = b.MuzzleT / Entities.Base.MuzzleFlashDur;
+                Raylib.BeginBlendMode(BlendMode.Additive);
+                Raylib.DrawCircle((int)b.X, (int)(b.Y - 58), 17 + (1 - mt) * 7,
+                    new Color((byte)190, (byte)238, (byte)255, (byte)(mt * 200)));
+                Raylib.DrawCircle((int)b.X, (int)(b.Y - 58), 8,
+                    new Color((byte)255, (byte)255, (byte)255, (byte)(mt * 235)));
+                Raylib.EndBlendMode();
+            }
+
             // Floating ammo counter � large retro display
             string ammoStr = b.Ammo.ToString();
             int ammoFontSz = 26;
-            int ammoW = Raylib.MeasureText(ammoStr, ammoFontSz);
+            int ammoW = MeasureTextM(ammoStr, ammoFontSz);
             int ammoX = (int)(b.X - ammoW / 2);
             int ammoY = (int)(b.Y - 100);
             // Backing panel
@@ -1576,7 +2013,9 @@ public static class Renderer
             // Number
             Color ammoCol = ar > 0.25f ? new Color((byte)210, (byte)250, (byte)255, (byte)252)
                 : new Color((byte)255, (byte)100, (byte)60, (byte)252);
-            Raylib.DrawText(ammoStr, ammoX, ammoY, ammoFontSz, ammoCol);
+            DrawTextM(ammoStr, ammoX, ammoY, ammoFontSz, ammoCol);
+
+            if (recoiled) Rlgl.PopMatrix();
         }
     }
 
@@ -1729,7 +2168,7 @@ public static class Renderer
             }
 
             // Ammo count
-            Raylib.DrawText(MathF.Max(0, hr.Ammo).ToString(), (int)(hr.X - 6), (int)(topY - 98), 12,
+            DrawTextM(MathF.Max(0, hr.Ammo).ToString(), hr.X - 6, topY - 98, 12,
                 new Color(255, 236, 176, 242));
         }
 
@@ -1751,7 +2190,7 @@ public static class Renderer
                 Raylib.DrawRectangle((int)(p.X - 18), (int)(p.Y - 20), 36, 20, new Color(40, 25, 20, 200));
                 Raylib.DrawLineEx(new Vector2(p.X - 16, p.Y - 6), new Vector2(p.X + 16, p.Y - 16), 2.5f,
                     new Color(255, 80, 40, 150));
-                Raylib.DrawText("OFFLINE", (int)(p.X - 30), (int)(p.Y - 40), 14, new Color(255, 80, 40, 180));
+                DrawTextM("OFFLINE", p.X - MeasureTextM("OFFLINE", 14) * 0.5f, p.Y - 40, 14, new Color(255, 80, 40, 180));
                 continue;
             }
 
@@ -1944,7 +2383,7 @@ public static class Renderer
             Raylib.EndBlendMode();
 
             // Ammo counter
-            Raylib.DrawText((p.Ammo).ToString(), (int)(p.X - 10), (int)(p.Y - 64), 12,
+            DrawTextM((p.Ammo).ToString(), p.X - 10, p.Y - 64, 12,
                 new Color(255, 236, 176, 242));
         }
     }
@@ -2049,6 +2488,8 @@ public static class Renderer
                 Raylib.DrawLineEx(new Vector2(u.X - 8 * sc, u.Y + sc), new Vector2(u.X - 2 * sc, u.Y - 1.8f * sc), 1.1f, new Color((byte)60, (byte)40, (byte)34, da));
                 Raylib.DrawLineEx(new Vector2(u.X + 6 * sc, u.Y + 2.4f * sc), new Vector2(u.X + 13 * sc, u.Y + 0.2f * sc), 1.1f, new Color((byte)60, (byte)40, (byte)34, da));
             }
+
+            DrawDamageFlash(u.X, u.Y, u.FlashT, 28 * sc, 11 * sc);
         }
     }
 
@@ -2122,6 +2563,8 @@ public static class Renderer
             Raylib.DrawEllipse((int)fp.X, (int)fp.Y, (int)(6.2f + flame * 3), (int)(2.8f + flame),
                 new Color((byte)255, (byte)146, (byte)102, (byte)(flame * 175)));
             Raylib.EndBlendMode();
+
+            DrawDamageFlash(r.X, r.Y, r.FlashT, 40, 12);
         }
     }
 
@@ -2129,6 +2572,17 @@ public static class Renderer
     {
         Raylib.DrawTriangle(a, b, c, col);
         Raylib.DrawTriangle(a, c, d, col);
+    }
+
+    /// <summary>Additive white tint for damaged-but-not-killed enemies (FlashT 0.05 → 0).</summary>
+    static void DrawDamageFlash(float x, float y, float flashT, float rx, float ry)
+    {
+        if (flashT <= 0) return;
+        float fa = MathH.Clamp(flashT / 0.05f, 0, 1);
+        Raylib.BeginBlendMode(BlendMode.Additive);
+        Raylib.DrawEllipse((int)x, (int)y, (int)rx, (int)ry,
+            new Color((byte)255, (byte)255, (byte)255, (byte)(fa * 170)));
+        Raylib.EndBlendMode();
     }
 
     /// <summary>Shorthand to avoid Color(int,int,int,byte) ambiguity.</summary>
@@ -2252,6 +2706,8 @@ public static class Renderer
             Raylib.DrawRectangle((int)(d.X - 21), (int)(d.Y + 43), (int)(42 * hpR), 2,
                 new Color((byte)255, (byte)90, (byte)70, (byte)240));
         }
+
+        DrawDamageFlash(d.X, d.Y, d.FlashT, 30, 26);
     }
 
     // ?????????????? MOTHERSHIP (Star Destroyer easter egg) ??????????????
@@ -2638,6 +3094,8 @@ public static class Renderer
             DrawGradientCircle(ep.X, ep.Y, 14f,
                 new Color((byte)180, (byte)220, (byte)255, (byte)(winPulse * 130)));
             Raylib.EndBlendMode();
+
+            DrawDamageFlash(f.X, f.Y, f.FlashT, 16, 14);
         }
     }
 
@@ -2699,12 +3157,17 @@ public static class Renderer
                 Raylib.DrawLineEx(new Vector2(seg.X1, seg.Y1), new Vector2(seg.X2, seg.Y2), lw, col);
             }
 
-            // Layer 3: Bright core (trunk segments only)
+            // Layer 3: Bright core (trunk segments only). §5 5.2: a blob every
+            // 3rd trunk segment lights the cloudscape along the bolt's path.
+            int trunkIdx = 0;
             foreach (var seg in bolt.Segments)
             {
                 if (seg.Branch) continue;
                 Raylib.DrawLineEx(new Vector2(seg.X1, seg.Y1), new Vector2(seg.X2, seg.Y2),
                     1f, new Color((byte)255, (byte)255, (byte)255, (byte)(a * 0.9f * 255)));
+                if (trunkIdx++ % 3 == 1)
+                    AddLight((seg.X1 + seg.X2) * 0.5f, (seg.Y1 + seg.Y2) * 0.5f, 70f,
+                        185, 205, 255, (byte)(a * 110));
             }
         }
         Raylib.EndBlendMode();
@@ -2722,22 +3185,40 @@ public static class Renderer
     }
 
     // ?????????????? SMOKE ??????????????
+    // §5 5.3: destruction smoke is DARK and alpha-blended — the old bright
+    // blue-grey stops washed out over additive fire. Drawn grouped per
+    // BlendClass so the blend mode switches at most once for the whole list.
     static void DrawSmoke(GameState s)
     {
+        bool anyAdditive = false;
         foreach (var sm in s.SmokeParts)
         {
+            if (sm.Blend == BlendClass.Additive) { anyAdditive = true; continue; }
+            float p = 1 - sm.Life / sm.MaxLife;
+            // Quick fade-in (first 12% of life) so puffs don't pop, then fade out
+            float a = sm.Alpha * MathF.Min(1f, p * 8.5f) * (1 - p);
+            if (a <= 0.01f) continue;
+            float r = sm.Size * (0.85f + p * 1.8f);
+            // Brown-grey translucent body, max-alpha clamped at 160
+            byte body = (byte)MathF.Min(160f, a * 255f);
+            DrawGradientCircle(sm.X, sm.Y, r, new Color((byte)33, (byte)29, (byte)26, body));
+            DrawGradientCircle(sm.X, sm.Y, r * 0.55f,
+                new Color((byte)45, (byte)39, (byte)34, (byte)(body * 0.8f)));
+        }
+        if (!anyAdditive) return;
+        // Additive-class smoke (bright vapor) — none spawned today; this is the
+        // §5 5.3 grouping seam so a future class never costs per-puff flushes.
+        Raylib.BeginBlendMode(BlendMode.Additive);
+        foreach (var sm in s.SmokeParts)
+        {
+            if (sm.Blend != BlendClass.Additive) continue;
             float p = 1 - sm.Life / sm.MaxLife;
             float a = sm.Alpha * (1 - p);
             if (a <= 0.01f) continue;
-            float r = sm.Size * (0.85f + p * 1.8f);
-            // Layered gradient circles matching HTML 3-stop radial gradient
-            DrawGradientCircle(sm.X, sm.Y, r,
-                new Color((byte)10, (byte)16, (byte)28, (byte)(a * 0.15f * 255)));
-            DrawGradientCircle(sm.X, sm.Y, r * 0.65f,
-                new Color((byte)88, (byte)102, (byte)140, (byte)(a * 0.24f * 255)));
-            DrawGradientCircle(sm.X, sm.Y, r * 0.3f,
-                new Color((byte)168, (byte)184, (byte)220, (byte)(a * 0.44f * 255)));
+            DrawGradientCircle(sm.X, sm.Y, sm.Size * (0.85f + p * 1.8f),
+                new Color((byte)150, (byte)180, (byte)220, (byte)(a * 255)));
         }
+        Raylib.EndBlendMode();
     }
 
     // --- ENEMY MISSILES --- Rotated shaped warheads
@@ -2758,6 +3239,7 @@ public static class Renderer
             bool isDrone = m.Variant == "drone";
             bool isSpit = m.Variant == "spit";
             bool isHell = m.Variant == "hell";
+            bool isShield = m.Variant == "shield";
 
             float sAlpha = isStealth ? MathF.Pow(MathH.Clamp((m.Y + 100) / (s.GroundY + 100), 0, 1), 3) * 0.55f + 0.05f : 1f;
 
@@ -2818,6 +3300,17 @@ public static class Renderer
                     new Color((byte)126, (byte)238, (byte)255, (byte)(ep * 200 * sAlpha)));
                 DrawQuad(MP(-24, 2f), MP(-19, 2f), MP(-19, 3f), MP(-24, 3f),
                     new Color((byte)126, (byte)238, (byte)255, (byte)(ep * 200 * sAlpha)));
+                // §5 4.2 deploy telegraph: pulsing bay glow under the hull,
+                // ≥0.5 s before the drones release
+                if (m.TelegraphT > 0 && !m._Deployed)
+                {
+                    float bp = 0.55f + 0.45f * MathF.Sin(m.TelegraphT * 13f);
+                    var bay = MP(-3, 6.5f);
+                    Raylib.DrawEllipse((int)bay.X, (int)bay.Y, 12f, 5f,
+                        new Color((byte)255, (byte)188, (byte)110, (byte)(bp * 170 * sAlpha)));
+                    Raylib.DrawEllipse((int)bay.X, (int)bay.Y, 6f, 2.6f,
+                        new Color((byte)255, (byte)236, (byte)190, (byte)(bp * 140 * sAlpha)));
+                }
                 Raylib.EndBlendMode();
             }
             else if (isCruise)
@@ -2894,6 +3387,35 @@ public static class Renderer
                 Raylib.DrawEllipse((int)exP.X, (int)exP.Y, 4.5f, 2.2f, exC);
                 Raylib.EndBlendMode();
             }
+            else if (isShield)
+            {
+                // §5 4.2 shield drone — hexagonal bubble shimmer + hovering core.
+                // The bubble is drawn at its true gameplay radius so cover reads.
+                float bubbleR = VariantStats.Def("shield").ShieldRadius;
+                float shim = 0.5f + 0.5f * MathF.Sin(s.Time * 2.4f + m.Id);
+                float ripple = MathH.Clamp(m.ShieldFlashT * 4f, 0, 1);
+                var center = new Vector2(m.X, m.Y);
+
+                Raylib.BeginBlendMode(BlendMode.Additive);
+                DrawGradientCircle(m.X, m.Y, bubbleR,
+                    new Color((byte)96, (byte)178, (byte)255, (byte)(14 + shim * 8 + ripple * 46)));
+                // Counter-rotating hex outlines = the shimmer
+                Raylib.DrawPolyLinesEx(center, 6, bubbleR, s.Time * 9f + m.Id, 2.2f,
+                    new Color((byte)136, (byte)208, (byte)255, (byte)(58 + shim * 42 + ripple * 130)));
+                Raylib.DrawPolyLinesEx(center, 6, bubbleR * 0.94f, -s.Time * 6f + m.Id * 0.7f, 1.3f,
+                    new Color((byte)110, (byte)190, (byte)255, (byte)(30 + shim * 26 + ripple * 80)));
+                Raylib.EndBlendMode();
+
+                // Core: hex emitter body + glowing heart
+                Raylib.DrawPoly(center, 6, 8f, s.Time * 30f + m.Id, C4(58, 84, 120, 245));
+                Raylib.DrawPolyLinesEx(center, 6, 8f, s.Time * 30f + m.Id, 1.6f, C4(150, 214, 255, 235));
+                Raylib.BeginBlendMode(BlendMode.Additive);
+                Raylib.DrawCircle((int)m.X, (int)m.Y, 4.5f + shim * 1.5f,
+                    new Color((byte)140, (byte)220, (byte)255, (byte)(150 + ripple * 90)));
+                Raylib.DrawCircle((int)m.X, (int)m.Y, 2.2f,
+                    new Color((byte)230, (byte)250, (byte)255, (byte)230));
+                Raylib.EndBlendMode();
+            }
             else
             {
                 // Standard / fast / zig / stealth / decoy / split / shard / heavy
@@ -2944,6 +3466,13 @@ public static class Renderer
                 {
                     Raylib.BeginBlendMode(BlendMode.Additive);
                     Raylib.DrawCircle((int)m.X, (int)m.Y, 9, new Color((byte)255, (byte)104, (byte)88, (byte)(100 * sAlpha)));
+                    // §5 4.2 MIRV telegraph: pulsing red warning glow ≥0.5 s before the split
+                    if (m.Mirv && m.TelegraphT > 0 && !m.HasSplit)
+                    {
+                        float wp = 0.5f + 0.5f * MathF.Sin(m.TelegraphT * 15f);
+                        Raylib.DrawCircle((int)m.X, (int)m.Y, 13 + wp * 6,
+                            new Color((byte)255, (byte)84, (byte)56, (byte)((40 + wp * 130) * sAlpha)));
+                    }
                     Raylib.EndBlendMode();
                 }
                 // Bright core dot
@@ -2951,9 +3480,12 @@ public static class Renderer
                     new Color((byte)255, (byte)248, (byte)230, (byte)(240 * sAlpha)));
             }
 
-            // Exhaust trail
-            DrawQuad(MP(-18, -1.1f), MP(-4, -1.1f), MP(-4, 1.1f), MP(-18, 1.1f),
-                new Color(vc.R, vc.G, vc.B, (byte)(100 * sAlpha)));
+            // Exhaust trail (shield drone hovers — no exhaust)
+            if (!isShield)
+                DrawQuad(MP(-18, -1.1f), MP(-4, -1.1f), MP(-4, 1.1f), MP(-18, 1.1f),
+                    new Color(vc.R, vc.G, vc.B, (byte)(100 * sAlpha)));
+
+            DrawDamageFlash(m.X, m.Y, m.FlashT, isCarrier ? 18 : 10, isCarrier ? 12 : 10);
         }
     }
 
@@ -3007,6 +3539,7 @@ public static class Renderer
             float t = mf.Life / mf.MaxLife;
             byte a = (byte)(t * 225);
             float sz = 15 + (1 - t) * 12;
+            AddLight(mf.X, mf.Y, sz * 3.2f, 185, 228, 255, (byte)(t * 120)); // §5 5.2
             Raylib.DrawCircle((int)mf.X, (int)mf.Y, sz, new Color((byte)175, (byte)225, (byte)255, (byte)(a / 3)));
             Raylib.DrawCircle((int)mf.X, (int)mf.Y, sz * 0.45f, new Color((byte)215, (byte)248, (byte)255, (byte)(a / 2)));
         }
@@ -3023,6 +3556,29 @@ public static class Renderer
             if (a < 0.01f) continue;
 
             float r = ex.Radius;
+
+            // §5 5.2: light contribution. Fire light is warm regardless of the
+            // blast's palette (the cyan player core still throws orange onto
+            // the skyline — that's the acceptance shot); EMP is the exception:
+            // a cyan center pool plus blobs riding the expanding ring front.
+            // The light radius floors at 0.55·MaxRadius: ex.Radius grows from 0
+            // while brightness (a) starts at 1, so without the floor a newborn
+            // blast would throw no light exactly when it should strobe hardest.
+            float lr = MathF.Max(r, ex.MaxRadius * 0.55f);
+            if (ex.Emp)
+            {
+                AddLight(ex.X, ex.Y, lr * 1.5f, 110, 225, 255, (byte)(a * 70));
+                for (int k = 0; k < 10; k++)
+                {
+                    float ang = k * (TAU / 10f);
+                    AddLight(ex.X + MathF.Cos(ang) * r, ex.Y + MathF.Sin(ang) * r,
+                        r * 0.55f, 120, 235, 255, (byte)(a * 80));
+                }
+            }
+            else if (ex.Player)
+                AddLight(ex.X, ex.Y, lr * 2.2f, 255, 186, 120, (byte)(a * 125));
+            else
+                AddLight(ex.X, ex.Y, lr * 2.2f, 255, 140, 64, (byte)(a * 140));
 
             if (ex.Player)
             {
@@ -3075,6 +3631,39 @@ public static class Renderer
         {
             float a = sp.Life / sp.MaxLife;
             if (a <= 0) continue;
+            if (sp.Target)
+            {
+                // §5 3.5 scrap spark: motion streak + hot white-gold core
+                Raylib.DrawLineEx(
+                    new Vector2(sp.X - sp.Vx * 0.03f * a, sp.Y - sp.Vy * 0.03f * a),
+                    new Vector2(sp.X, sp.Y), 1.6f,
+                    new Color(sp.R, sp.G, sp.B, (byte)(a * 150)));
+                Raylib.DrawCircle((int)sp.X, (int)sp.Y, sp.Size * 1.5f, new Color(sp.R, sp.G, sp.B, (byte)(a * 235)));
+                Raylib.DrawCircle((int)sp.X, (int)sp.Y, sp.Size * 0.7f,
+                    new Color((byte)255, (byte)246, (byte)205, (byte)(a * 245)));
+                continue;
+            }
+            if (sp.Kind == SparkKind.Hot)
+            {
+                // §5 5.3 white-hot core spark: shrinks as it dies, slight streak
+                Raylib.DrawLineEx(
+                    new Vector2(sp.X - sp.Vx * 0.016f, sp.Y - sp.Vy * 0.016f),
+                    new Vector2(sp.X, sp.Y), 1.4f,
+                    new Color(sp.R, sp.G, sp.B, (byte)(a * 170)));
+                Raylib.DrawCircle((int)sp.X, (int)sp.Y, sp.Size * (0.6f + 0.7f * a),
+                    new Color(sp.R, sp.G, sp.B, (byte)(a * 245)));
+                continue;
+            }
+            if (sp.Kind == SparkKind.Ember)
+            {
+                // §5 5.3 ember: warm flickering mote with a soft glow halo
+                float fl = 0.72f + 0.28f * MathF.Sin(sp.Life * 26f + sp.Size * 7f);
+                DrawGradientCircle(sp.X, sp.Y, sp.Size * 3f,
+                    new Color(sp.R, sp.G, sp.B, (byte)(a * fl * 110)));
+                Raylib.DrawCircle((int)sp.X, (int)sp.Y, sp.Size * 0.8f,
+                    new Color((byte)255, (byte)226, (byte)170, (byte)(a * fl * 220)));
+                continue;
+            }
             Raylib.DrawCircle((int)sp.X, (int)sp.Y, sp.Size * 1.3f, new Color(sp.R, sp.G, sp.B, (byte)(a * 225)));
         }
     }
@@ -3094,15 +3683,35 @@ public static class Renderer
     }
 
     // ?????????????? DEBRIS ??????????????
+    // §5 5.3 permanence: chunks never alpha out — Life is only the cooling
+    // clock, lerping blast-hot orange back down to the city-palette tone.
     static void DrawDebris(GameState s)
     {
         foreach (var d in s.DebrisParts)
         {
-            float p = 1 - d.Life / d.MaxLife;
-            byte a = (byte)((1 - p) * 215);
+            float heat = d.MaxLife > 0 ? MathH.Clamp(d.Life / d.MaxLife, 0, 1) : 0;
+            byte r = (byte)(d.R + (255 - d.R) * heat);
+            byte g = (byte)(d.G + (196 - d.G) * heat);
+            byte b = (byte)(d.B + (120 - d.B) * heat);
+            byte a = d.Resting ? (byte)200 : (byte)230;
             Raylib.DrawRectanglePro(new Rectangle(d.X, d.Y, d.Size * 2.2f, d.Size * 1.1f),
                 new Vector2(d.Size * 1.1f, d.Size * 0.55f), d.Rot * 57.2958f,
-                new Color((byte)255, (byte)168, (byte)98, a));
+                new Color(r, g, b, a));
+        }
+    }
+
+    // ?????????????? BLAST FLASHES (additive) ??????????????
+    /// <summary>§5 5.3: the 1-frame white detonation quad. Caller wraps in the
+    /// shared explosion additive group.</summary>
+    static void DrawBlastFlashes(GameState s)
+    {
+        foreach (var bf in s.BlastFlashes)
+        {
+            float a = MathH.Clamp(bf.Life / Combat.BlastFlashLife, 0f, 1f);
+            if (a <= 0.02f) continue;
+            Raylib.DrawRectanglePro(new Rectangle(bf.X, bf.Y, bf.Size * 2f, bf.Size * 2f),
+                new Vector2(bf.Size, bf.Size), bf.Rot,
+                new Color((byte)255, (byte)255, (byte)255, (byte)(a * 235)));
         }
     }
 
@@ -3131,34 +3740,33 @@ public static class Renderer
             byte al = (byte)(a * 255);
             bool combo = ft.Text.Contains("COMBO");
             int sz = combo ? 26 : 22;
-            int fw = Raylib.MeasureText(ft.Text, sz);
 
             // Pop-in scale effect
             float scale = 1 + (1 - MathF.Min(1, ft.Life / 0.3f)) * 0.2f;
             int drawSz = (int)(sz * scale);
-            int drawFw = Raylib.MeasureText(ft.Text, drawSz);
+            int drawFw = MeasureTextM(ft.Text, drawSz);
             int tx = (int)(ft.X - drawFw * 0.5f);
             int ty = (int)ft.Y;
 
             // Black outline (4 offsets like HTML strokeText)
             var outCol = new Color((byte)0, (byte)0, (byte)0, (byte)(a * 0.7f * 255));
-            Raylib.DrawText(ft.Text, tx - 1, ty, drawSz, outCol);
-            Raylib.DrawText(ft.Text, tx + 1, ty, drawSz, outCol);
-            Raylib.DrawText(ft.Text, tx, ty - 1, drawSz, outCol);
-            Raylib.DrawText(ft.Text, tx, ty + 1, drawSz, outCol);
+            DrawTextM(ft.Text, tx - 1, ty, drawSz, outCol);
+            DrawTextM(ft.Text, tx + 1, ty, drawSz, outCol);
+            DrawTextM(ft.Text, tx, ty - 1, drawSz, outCol);
+            DrawTextM(ft.Text, tx, ty + 1, drawSz, outCol);
 
             // Themed fill
             var col = combo
                 ? new Color((byte)255, (byte)200, (byte)100, al)
                 : new Color((byte)255, (byte)255, (byte)255, al);
-            Raylib.DrawText(ft.Text, tx, ty, drawSz, col);
+            DrawTextM(ft.Text, tx, ty, drawSz, col);
         }
     }
 
     // ?????????????? CROSSHAIR ??????????????
     static void DrawCrosshair(GameState s)
     {
-        if (s.Intro || s.GameOver) return;
+        if (s.Phase != GamePhase.Playing && s.Phase != GamePhase.Shop) return;
         int mx = (int)s.MouseX, my = (int)s.MouseY;
         bool hot = false;
         foreach (var m in s.Enemies)
@@ -3182,6 +3790,17 @@ public static class Renderer
         {
             float dx = s.Demon.X - mx, dy = s.Demon.Y - my;
             if (dx * dx + dy * dy < 240 * 240) hot = true;
+        }
+
+        // Scale-pop 1.3 → 1.0 on fire (pop² of the linear timer = ease-out)
+        float pop = 1f + 0.3f * s.CrosshairPop * s.CrosshairPop;
+        bool popped = pop > 1.001f;
+        if (popped)
+        {
+            Rlgl.PushMatrix();
+            Rlgl.Translatef(mx, my, 0);
+            Rlgl.Scalef(pop, pop, 1);
+            Rlgl.Translatef(-mx, -my, 0);
         }
 
         if (s.Theme == "recharged")
@@ -3239,64 +3858,136 @@ public static class Renderer
                 ? new Color((byte)255, (byte)156, (byte)96, (byte)255)
                 : new Color((byte)218, (byte)255, (byte)255, (byte)215));
         }
+
+        if (popped) Rlgl.PopMatrix();
+
+        // §5 4.4 combo ring — live decay arc around the crosshair; hidden at
+        // combo 0 and outside active play
+        if (s.Phase == GamePhase.Playing && s.Combo > 0) DrawComboRing(s, mx, my);
+    }
+
+    // §5 4.4 combo-ring geometry/feel constants
+    const float ComboRingR = 27f;
+
+    static float EaseOutBack(float t)
+    {
+        const float c1 = 1.70158f, c3 = c1 + 1f;
+        float u = t - 1f;
+        return 1f + c3 * u * u * u + c1 * u * u;
+    }
+
+    /// <summary>§5 4.4 combo widget: DrawRing arc = remaining combo window,
+    /// squash-stretch pop on each kill (ease-out-back settle via s.ComboPop —
+    /// brief overshoot below 1 reads as the rebound), white→gold→red ramp with
+    /// the chain, tremble in the final second. Chain count is a cached string.</summary>
+    static void DrawComboRing(GameState s, int mx, int my)
+    {
+        float window = 4f + s.Perks.ComboTimeBonus; // matches Combat.RegKill
+        float frac = MathH.Clamp(s.ComboTimer / window, 0f, 1f);
+
+        // White (fresh) → gold (≈×6) → red (≈×14+)
+        float t1 = MathH.Clamp((s.Combo - 1) / 5f, 0f, 1f);
+        float t2 = MathH.Clamp((s.Combo - 6) / 8f, 0f, 1f);
+        byte cg = (byte)MathH.Lerp(MathH.Lerp(255, 214, t1), 80, t2);
+        byte cb = (byte)MathH.Lerp(MathH.Lerp(255, 90, t1), 60, t2);
+        var col = new Color((byte)255, cg, cb, (byte)215);
+        var faint = new Color((byte)255, cg, cb, (byte)36);
+
+        float cx = mx, cy = my;
+        if (s.ComboTimer < 1f) // tremble as the window runs out
+        {
+            float amp = (1f - s.ComboTimer) * 2.6f;
+            float ph = FeelDirector.Clock * 43f;
+            cx += MathF.Sin(ph) * amp;
+            cy += MathF.Cos(ph * 1.31f) * amp;
+        }
+
+        // Squash-stretch pop: x stretches while y squashes, settling through a
+        // slight ease-out-back undershoot
+        float e = 1f - EaseOutBack(1f - s.ComboPop);
+        bool scaled = MathF.Abs(e) > 0.001f;
+        if (scaled)
+        {
+            Rlgl.PushMatrix();
+            Rlgl.Translatef(cx, cy, 0);
+            Rlgl.Scalef(1f + 0.45f * e, 1f - 0.25f * e, 1);
+            Rlgl.Translatef(-cx, -cy, 0);
+        }
+        var center = new Vector2(cx, cy);
+        Raylib.DrawRing(center, ComboRingR - 2.2f, ComboRingR, 0f, 360f, 40, faint);
+        Raylib.DrawRing(center, ComboRingR - 2.6f, ComboRingR + 0.4f,
+            -90f, -90f + 360f * frac, 40, col);
+        if (scaled) Rlgl.PopMatrix();
+
+        // Chain multiplier under the ring (CacheSb dialect — no per-frame alloc)
+        string txt = HudX(ref _ringCombo, s.Combo);
+        DrawTextM(txt, cx - MeasureTextM(txt, 13, true) * 0.5f, cy + ComboRingR + 5f, 13, col, true);
     }
 
     // ?????????????? POST-FX ??????????????
+    // Legacy CPU post chain — kept ONLY as the fallback when the 1.4 uber-shader
+    // failed to compile (vignette/scanlines/flash/danger/grain live in the shader).
     static void DrawPostFx(GameState s)
     {
-        float vignetteAlpha = 0.42f;
-        float vignetteRadius = MathF.Max(s.W, s.H) * 0.85f;
-        Raylib.DrawCircleGradient((int)(s.W * 0.5f), (int)(s.H * 0.5f), vignetteRadius,
-            new Color((byte)0, (byte)0, (byte)0, (byte)0), new Color((byte)0, (byte)0, (byte)0, (byte)(vignetteAlpha * 255)));
-
-        float scanAlpha = 0.06f + s.Danger * 0.05f;
-        byte sa = (byte)(scanAlpha * 255);
-        for (int y = 0; y < (int)s.H; y += 3)
-            Raylib.DrawLine(0, y, (int)s.W, y, new Color((byte)106, (byte)181, (byte)255, sa));
-
-        if (s.Flash > 0.01f)
+        if (!_postShaderActive)
         {
+            float vignetteAlpha = 0.42f;
+            float vignetteRadius = MathF.Max(s.W, s.H) * 0.85f;
+            Raylib.DrawCircleGradient((int)(s.W * 0.5f), (int)(s.H * 0.5f), vignetteRadius,
+                new Color((byte)0, (byte)0, (byte)0, (byte)0), new Color((byte)0, (byte)0, (byte)0, (byte)(vignetteAlpha * 255)));
+
+            float scanAlpha = 0.06f + s.Danger * 0.05f;
+            byte sa = (byte)(scanAlpha * 255);
+            for (int y = 0; y < (int)s.H; y += 3)
+                Raylib.DrawLine(0, y, (int)s.W, y, new Color((byte)106, (byte)181, (byte)255, sa));
+
+            if (s.Flash > 0.01f && !s.Settings.FlashReduction)
+            {
+                Raylib.BeginBlendMode(BlendMode.Additive);
+                byte fa = (byte)(MathH.Clamp(s.Flash * 1.1f, 0, 1) * 255);
+                Raylib.DrawRectangle(0, 0, (int)s.W, (int)s.H, new Color((byte)160, (byte)218, (byte)255, fa));
+                Raylib.DrawRectangleGradientV(0, (int)s.HorizonY, (int)s.W, (int)(s.H - s.HorizonY),
+                    new Color((byte)255, (byte)142, (byte)106, (byte)(s.Flash * 216)),
+                    new Color((byte)255, (byte)142, (byte)106, (byte)0));
+                Raylib.EndBlendMode();
+            }
+
+            if (s.Danger > 0.55f)
+            {
+                Raylib.BeginBlendMode(BlendMode.Additive);
+                byte da = (byte)((s.Danger - 0.55f) * 56);
+                Raylib.DrawRectangle(0, 0, (int)s.W, (int)s.H, new Color((byte)255, (byte)80, (byte)60, da));
+                Raylib.EndBlendMode();
+            }
+        }
+
+        // Flash reduction (§5 3.1 accessibility): the full-screen flash (shader
+        // uniform / CPU rect, both gated off above) renders as an additive edge
+        // vignette pulse instead — same color and decay, none of the white-out.
+        if (s.Settings.FlashReduction && s.Flash > 0.01f)
+        {
+            float fa = MathH.Clamp(s.Flash * 1.1f, 0f, 1f);
+            int ew = (int)(MathF.Min(s.W, s.H) * 0.12f);
+            var inner = new Color((byte)160, (byte)218, (byte)255, (byte)(fa * 150));
+            var outer = new Color((byte)160, (byte)218, (byte)255, (byte)0);
             Raylib.BeginBlendMode(BlendMode.Additive);
-            byte fa = (byte)(MathH.Clamp(s.Flash * 1.1f, 0, 1) * 255);
-            Raylib.DrawRectangle(0, 0, (int)s.W, (int)s.H, new Color((byte)160, (byte)218, (byte)255, fa));
-            Raylib.DrawRectangleGradientV(0, (int)s.HorizonY, (int)s.W, (int)(s.H - s.HorizonY),
-                new Color((byte)255, (byte)142, (byte)106, (byte)(s.Flash * 216)),
-                new Color((byte)255, (byte)142, (byte)106, (byte)0));
+            Raylib.DrawRectangleGradientH(0, 0, ew, (int)s.H, inner, outer);
+            Raylib.DrawRectangleGradientH((int)s.W - ew, 0, ew, (int)s.H, outer, inner);
+            Raylib.DrawRectangleGradientV(0, 0, (int)s.W, ew, inner, outer);
+            Raylib.DrawRectangleGradientV(0, (int)s.H - ew, (int)s.W, ew, outer, inner);
             Raylib.EndBlendMode();
         }
 
-        if (s.Danger > 0.55f)
-        {
-            Raylib.BeginBlendMode(BlendMode.Additive);
-            byte da = (byte)((s.Danger - 0.55f) * 56);
-            Raylib.DrawRectangle(0, 0, (int)s.W, (int)s.H, new Color((byte)255, (byte)80, (byte)60, da));
-            Raylib.EndBlendMode();
-        }
-
+        // Weather ash tint is not part of the shader's uniform contract — always CPU.
         if (s.Weather.Mode == "ash" && s.Weather.Intensity > 0)
         {
             byte wa = (byte)(MathH.Clamp(s.Weather.Intensity * 0.08f, 0, 0.12f) * 255);
             Raylib.DrawRectangle(0, 0, (int)s.W, (int)s.H, new Color((byte)164, (byte)110, (byte)70, wa));
         }
 
-        DrawGrain(s);
-
-        if (_fxReady && s.Chromatic > 0.02f)
-        {
-            int offset = (int)MathF.Round(s.Chromatic * 4);
-            if (offset >= 1)
-            {
-                var src = new Rectangle(0, 0, _frameTarget.Texture.Width, -_frameTarget.Texture.Height);
-                var dst = new Rectangle(0, 0, s.W, s.H);
-                Raylib.BeginBlendMode(BlendMode.Additive);
-                byte ca = (byte)(MathH.Clamp(s.Chromatic * 0.15f, 0, 0.3f) * 255);
-                Raylib.DrawTexturePro(_frameTarget.Texture, src, new Rectangle(dst.X - offset, dst.Y, dst.Width, dst.Height),
-                    Vector2.Zero, 0, new Color((byte)255, (byte)255, (byte)255, ca));
-                Raylib.DrawTexturePro(_frameTarget.Texture, src, new Rectangle(dst.X + offset, dst.Y, dst.Width, dst.Height),
-                    Vector2.Zero, 0, new Color((byte)255, (byte)255, (byte)255, ca));
-                Raylib.EndBlendMode();
-            }
-        }
+        if (!_postShaderActive) DrawGrain(s);
+        // Legacy additive CA double-draw removed — feature 1.4 consumes
+        // s.Chromatic as the intensity uniform for true shader RGB-split.
     }
 
     static void DrawGrain(GameState s)
@@ -3315,14 +4006,60 @@ public static class Renderer
             Raylib.DrawTexture(_grainTexture, x + ox, y + oy, new Color((byte)255, (byte)255, (byte)255, ga));
     }
 
+    // HUD string caches (§5 2.6): DrawHUD runs every gameplay frame — each value
+    // is composed into the shared StringBuilder (alloc-free) and re-materialized
+    // as a string only when the content actually changed.
+    static readonly System.Text.StringBuilder _hudSb = new(96);
+    static string _hudWave = "", _hudScrap = "", _hudCombo = "", _hudMax = "",
+        _hudVol = "", _hudCities = "", _hudEmp = "", _hudAmmo = "", _hudHost = "",
+        _hudUfo = "", _hudRaider = "", _hudPend = "", _hudBases = "", _hudPhx = "",
+        _hudHr = "", _hudThreat = "", _hudWx = "", _hudUp = "", _ringCombo = "";
+
+    // §5 4.4 odometer digit strings — cached once; the draw path never composes
+    static readonly string[] _odoDigits = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
+
+    // Re-materialize the cached string only if the freshly built _hudSb differs.
+    static string CacheSb(ref string cache)
+    {
+        var sb = _hudSb;
+        bool same = sb.Length == cache.Length;
+        if (same)
+            for (int i = 0; i < cache.Length; i++)
+                if (sb[i] != cache[i]) { same = false; break; }
+        if (!same) cache = sb.ToString();
+        return cache;
+    }
+
+    static string HudInt(ref string cache, int v)
+    {
+        _hudSb.Clear();
+        _hudSb.Append(v);
+        return CacheSb(ref cache);
+    }
+
+    static string HudX(ref string cache, int v)
+    {
+        _hudSb.Clear();
+        _hudSb.Append('x').Append(v);
+        return CacheSb(ref cache);
+    }
+
+    // Alloc-free stand-in for text.ToUpperInvariant() in HUD composition.
+    static void AppendUpper(System.Text.StringBuilder sb, string text)
+    {
+        for (int i = 0; i < text.Length; i++) sb.Append(char.ToUpperInvariant(text[i]));
+    }
+
     // Modern HUD — rounded panel, bottom-left, clears the HellRaiser silo at center-bottom.
     static void DrawHUD(GameState s)
     {
-        if (s.Intro) return;
-        float fs = 14f;
+        if (s.Phase == GamePhase.Title) return;
+        // UI scale (§5 3.1) multiplies HUD font sizes; panel tracks the text
+        float ui = s.Settings.UiScale;
+        float fs = 14f * ui;
         float lineH = fs + 8;
         int lines = 5;
-        int panelW = (int)MathF.Min(640, s.W * 0.5f);
+        int panelW = (int)MathF.Min(640f * ui, s.W * 0.5f * MathF.Max(1f, ui));
         int panelH = (int)(lines * lineH + 20);
         int panelX = 12;
         int panelY = (int)(s.H - panelH - 8); // flush to bottom
@@ -3368,30 +4105,74 @@ public static class Renderer
         Raylib.DrawRectangle(panelX + 14, panelY + 3, 42, 2, new Color(accent.R, accent.G, accent.B, (byte)200));
         Raylib.DrawRectangle(panelX + 62, panelY + 3, 14, 2, new Color(accent.R, accent.G, accent.B, (byte)120));
 
-        int citiesAlive = s.Cities.Count(ci => !ci.Destroyed);
+        int citiesAlive = s.AliveCities; // cached count (§5 2.6) — no per-frame LINQ
         int pending = Math.Max(0, s.WavePlan.Count - s.SpawnI);
         int ufoCount = s.UFOs.Count;
         int raiderCount = s.Raiders.Count;
         int hostiles = s.Enemies.Count + ufoCount + raiderCount + (s.Demon != null ? 1 : 0);
-        int ammoLeft = s.Bases.Where(b => !b.Destroyed).Sum(b => b.Ammo) + s.Phalanxes.Where(p => !p.Destroyed).Sum(p => p.Ammo);
-        string ammo = string.Join("  ", s.Bases.Select(b => $"{b.Id}:{(b.Destroyed ? "X" : b.Ammo.ToString())}"));
-        string ph = s.Phalanxes.Count == 0 ? "--" : string.Join("  ", s.Phalanxes.Select(p =>
+        int ammoLeft = 0;
+        for (int i = 0; i < s.Bases.Count; i++)
+            if (!s.Bases[i].Destroyed) ammoLeft += s.Bases[i].Ammo;
+        for (int i = 0; i < s.Phalanxes.Count; i++)
+            if (!s.Phalanxes[i].Destroyed) ammoLeft += s.Phalanxes[i].Ammo;
+
+        var sb = _hudSb;
+        sb.Clear();
+        for (int i = 0; i < s.Bases.Count; i++)
         {
-            var label = p.Id switch
+            var b = s.Bases[i];
+            if (i > 0) sb.Append("  ");
+            sb.Append(b.Id).Append(':');
+            if (b.Destroyed) sb.Append('X'); else sb.Append(b.Ammo);
+        }
+        string ammo = CacheSb(ref _hudBases);
+
+        string ph = "--";
+        if (s.Phalanxes.Count > 0)
+        {
+            sb.Clear();
+            for (int i = 0; i < s.Phalanxes.Count; i++)
             {
-                "PHALANX_L" => "L",
-                "PHALANX_R" => "R",
-                _ => p.Id
-            };
-            return $"{label}:{(p.Destroyed ? "X" : p.Ammo.ToString())}";
-        }));
-        string hr = s.HellRaiser == null ? "--" : s.HellRaiser.Destroyed ? "X" : $"{s.HellRaiser.State.ToUpperInvariant()} {s.HellRaiser.Ammo}";
-        string volText = SynthAudio.IsMuted ? "MUTED" : $"{MathF.Round(SynthAudio.Volume * 100)}%";
-        string weather = $"{s.Weather.Mode.ToUpperInvariant()} {MathF.Round(s.Weather.Intensity * 100)}%";
-        string up = $"YLD x{s.Upgrades.BlastScale:F1}  RLD x{s.Upgrades.ReloadMult:F2}  EMP x{s.Upgrades.EmpScale:F1}";
+                var p = s.Phalanxes[i];
+                if (i > 0) sb.Append("  ");
+                sb.Append(p.Id switch
+                {
+                    "PHALANX_L" => "L",
+                    "PHALANX_R" => "R",
+                    _ => p.Id
+                }).Append(':');
+                if (p.Destroyed) sb.Append('X'); else sb.Append(p.Ammo);
+            }
+            ph = CacheSb(ref _hudPhx);
+        }
+
+        sb.Clear();
+        sb.Append("HR ");
+        if (s.HellRaiser == null) sb.Append("--");
+        else if (s.HellRaiser.Destroyed) sb.Append('X');
+        else { AppendUpper(sb, s.HellRaiser.State); sb.Append(' ').Append(s.HellRaiser.Ammo); }
+        string hrStr = CacheSb(ref _hudHr);
+
+        sb.Clear();
+        if (SynthAudio.IsMuted) sb.Append("MUTED");
+        else sb.Append(MathF.Round(SynthAudio.Volume * 100)).Append('%');
+        string volText = CacheSb(ref _hudVol);
+
+        sb.Clear();
+        AppendUpper(sb, s.Weather.Mode);
+        sb.Append(' ').Append(MathF.Round(s.Weather.Intensity * 100)).Append('%');
+        string weather = CacheSb(ref _hudWx);
+
+        sb.Clear();
+        sb.Append($"YLD x{s.Upgrades.BlastScale:F1}  RLD x{s.Upgrades.ReloadMult:F2}  EMP x{s.Upgrades.EmpScale:F1}");
+        string up = CacheSb(ref _hudUp);
+
         int bars = 14;
         int fill = (int)MathF.Round(s.Danger * bars);
-        string bar = new string('#', fill) + new string('-', bars - fill);
+        sb.Clear();
+        sb.Append('[').Append('#', fill).Append('-', bars - fill).Append("] ")
+          .Append(MathF.Round(s.Danger * 100)).Append('%');
+        string threat = CacheSb(ref _hudThreat);
 
         float y = panelY + 10;
         float x = panelX + 14;
@@ -3409,35 +4190,47 @@ public static class Renderer
             xPos += MeasureTextM(value, fs, true) + 12;
         }
 
-        DrawSegment(ref x, "WAVE", s.Level.ToString(), accent);
+        // §5 3.5: scrap currency identity color (shared with the shop panel)
+        Color gold = new Color((byte)255, (byte)214, (byte)90, (byte)255);
+
+        DrawSegment(ref x, "WAVE", HudInt(ref _hudWave, s.Level), accent);
         DrawSep(ref x);
-        DrawSegment(ref x, "SCORE", s.Score.ToString(), accent);
+        // §5 4.4 score odometer — label like DrawSegment, value as rolling digits
+        DrawTextM("SCORE", x, y, fs, dim);
+        x += MeasureTextM("SCORE", fs) + 5;
+        x = DrawScoreOdometer(s, x, y, fs, accent) + 12;
         DrawSep(ref x);
-        DrawSegment(ref x, "COMBO", $"x{Math.Max(1, s.Combo)}", s.Combo > 2 ? accent : dim);
+        float scrapX0 = x;
+        DrawSegment(ref x, "SCRAP", HudInt(ref _hudScrap, s.Scrap), gold);
+        // Live counter anchor — homing scrap sparks magnet-stream to this point
+        s.ScrapHudX = (scrapX0 + x) * 0.5f;
+        s.ScrapHudY = y + fs * 0.5f;
         DrawSep(ref x);
-        DrawSegment(ref x, "MAX", $"x{Math.Max(1, s.MaxCombo)}", accent);
+        DrawSegment(ref x, "COMBO", HudX(ref _hudCombo, Math.Max(1, s.Combo)), s.Combo > 2 ? accent : dim);
+        DrawSep(ref x);
+        DrawSegment(ref x, "MAX", HudX(ref _hudMax, Math.Max(1, s.MaxCombo)), accent);
         DrawSep(ref x);
         DrawSegment(ref x, "VOL", volText, accent);
 
         y += lineH;
         x = panelX + 14;
-        DrawSegment(ref x, "CITIES", citiesAlive.ToString(), citiesAlive <= 2 ? warn : accent);
+        DrawSegment(ref x, "CITIES", HudInt(ref _hudCities, citiesAlive), citiesAlive <= 2 ? warn : accent);
         DrawSep(ref x);
-        DrawSegment(ref x, "EMP", s.Emp.ToString(), s.Emp > 0 ? accent : dim);
+        DrawSegment(ref x, "EMP", HudInt(ref _hudEmp, s.Emp), s.Emp > 0 ? accent : dim);
         DrawSep(ref x);
-        DrawSegment(ref x, "AMMO", ammoLeft.ToString(), ammoLeft > 0 ? accent : dim);
+        DrawSegment(ref x, "AMMO", HudInt(ref _hudAmmo, ammoLeft), ammoLeft > 0 ? accent : dim);
         DrawSep(ref x);
         DrawSegment(ref x, "MODE", s.Auto ? "AUTO" : "MANUAL", s.Auto ? accent : dim);
 
         y += lineH;
         x = panelX + 14;
-        DrawSegment(ref x, "HOST", hostiles.ToString(), accent);
+        DrawSegment(ref x, "HOST", HudInt(ref _hudHost, hostiles), accent);
         DrawSep(ref x);
-        DrawSegment(ref x, "UFO", ufoCount.ToString(), accent);
+        DrawSegment(ref x, "UFO", HudInt(ref _hudUfo, ufoCount), accent);
         DrawSep(ref x);
-        DrawSegment(ref x, "RAIDER", raiderCount.ToString(), accent);
+        DrawSegment(ref x, "RAIDER", HudInt(ref _hudRaider, raiderCount), accent);
         DrawSep(ref x);
-        DrawSegment(ref x, "PEND", pending.ToString(), accent);
+        DrawSegment(ref x, "PEND", HudInt(ref _hudPend, pending), accent);
 
         y += lineH;
         x = panelX + 14;
@@ -3447,14 +4240,13 @@ public static class Renderer
 
         y += lineH;
         x = panelX + 14;
-        DrawSegment(ref x, "THREAT", $"[{bar}] {MathF.Round(s.Danger * 100)}%", s.Danger > 0.66f ? warn : accent);
+        DrawSegment(ref x, "THREAT", threat, s.Danger > 0.66f ? warn : accent);
         DrawSep(ref x);
         DrawSegment(ref x, "WX", weather, accent);
 
         // Upgrades + HR on far right column (small row above panel)
         float uy = panelY - lineH - 2;
         DrawTextM(up, panelX + 14, uy, fs, dim);
-        string hrStr = $"HR {hr}";
         int hrW = MeasureTextM(hrStr, fs);
         DrawTextM(hrStr, panelX + panelW - hrW - 14, uy, fs, accent, true);
 
@@ -3463,13 +4255,61 @@ public static class Renderer
             string dbg = $"FPS {Raylib.GetFPS()}  E{s.Enemies.Count} P{s.PlayerMissiles.Count} X{s.Explosions.Count}";
             int dw = MeasureTextM(dbg, fs);
             DrawTextM(dbg, panelX + panelW - dw - 14, panelY - lineH * 2 - 2, fs, dim);
+
+            var ec = s.Debug.EventCounts;
+            string ev = $"EV K{ec[(int)EventKind.Kill]} CD{ec[(int)EventKind.CityDestroyed]}"
+                + $" BD{ec[(int)EventKind.BaseDestroyed]} WS{ec[(int)EventKind.WaveStart]}"
+                + $" WC{ec[(int)EventKind.WaveCleared]} EMP{ec[(int)EventKind.Emp]}"
+                + $" GI{ec[(int)EventKind.GroundImpact]}";
+            int ew = MeasureTextM(ev, fs);
+            DrawTextM(ev, panelX + panelW - ew - 14, panelY - lineH * 3 - 2, fs, dim);
         }
+    }
+
+    /// <summary>§5 4.4 per-digit rolling score. Wheel i shows digit d_i scrolled
+    /// up toward d_i+1 only while every lower wheel wraps (classic odometer
+    /// cascade: roll = max(0, lower − (10^i − 1)) ∈ [0,1)). Rolling cells clip
+    /// through BeginScissorMode; static digits skip the scissor entirely, so an
+    /// idle score costs zero extra batch flushes and a full roll stays inside
+    /// the plan's ~14-flush budget. Cached digit strings — zero alloc. Returns
+    /// the cursor x past the last cell.</summary>
+    static float DrawScoreOdometer(GameState s, float x, float y, float fs, Color col)
+    {
+        double v = s.DisplayScore < 0 ? 0 : s.DisplayScore;
+        int top = Math.Max(s.Score, (int)v);
+        int nDigits = 1;
+        for (int t = top; t >= 10; t /= 10) nDigits++;
+        float cellW = MeasureTextM("8", fs, true) + 1f;
+        int scissorW = (int)MathF.Ceiling(cellW);
+        int scissorH = (int)(fs + 2f);
+        double scale = 1;
+        for (int i = 1; i < nDigits; i++) scale *= 10;
+        for (int i = nDigits - 1; i >= 0; i--)
+        {
+            int d = (int)(v / scale) % 10;
+            double lower = v % scale; // value carried by all lower wheels
+            float roll = (float)Math.Max(0.0, lower - (scale - 1));
+            if (roll > 0.002f && roll < 0.998f)
+            {
+                Raylib.BeginScissorMode((int)x, (int)(y - 1f), scissorW, scissorH);
+                DrawTextM(_odoDigits[d], x, y - roll * fs, fs, col, true);
+                DrawTextM(_odoDigits[(d + 1) % 10], x, y + (1f - roll) * fs, fs, col, true);
+                Raylib.EndScissorMode();
+            }
+            else
+            {
+                DrawTextM(_odoDigits[roll >= 0.998f ? (d + 1) % 10 : d], x, y, fs, col, true);
+            }
+            x += cellW;
+            scale /= 10;
+        }
+        return x;
     }
 
     // ?????????????? OVERLAYS ??????????????
     static void DrawOverlays(GameState s)
     {
-        if (s.Intro)
+        if (s.Phase == GamePhase.Title)
         {
             Raylib.DrawRectangle(0, 0, (int)s.W, (int)s.H, new Color((byte)0, (byte)0, (byte)0, (byte)192));
             var t = "MISSILE COMMAND OVERDRIVE";
@@ -3485,47 +4325,231 @@ public static class Renderer
             var hint = "LMB: Fire   RMB/E: EMP   C: Auto   H: HellRaiser   T: Theme   R: Restart";
             int hw = MeasureTextM(hint, 15);
             DrawTextM(hint, s.W / 2 - hw / 2, s.H / 2 + 82, 15, new Color((byte)138, (byte)158, (byte)192, (byte)170));
+            var hint2 = "D: Daily Seed Run";
+            int hw2 = MeasureTextM(hint2, 15);
+            DrawTextM(hint2, s.W / 2 - hw2 / 2, s.H / 2 + 104, 15, new Color((byte)138, (byte)158, (byte)192, (byte)170));
         }
-        if (s.GameOver)
+        if (s.Phase == GamePhase.GameOver)
         {
-            byte oa = (byte)MathH.Clamp(s.GameOverTime * 108, 0, 190);
-            Raylib.DrawRectangle(0, 0, (int)s.W, (int)s.H, new Color((byte)0, (byte)0, (byte)0, oa));
-            var go = "GAME OVER"; int gow = MeasureTextM(go, 56, true);
-            float p = 0.62f + 0.38f * MathF.Sin(s.Time * 2.2f);
-            DrawTextM(go, s.W / 2 - gow / 2, s.H / 2 - 56, 56, new Color((byte)255, (byte)90, (byte)70, (byte)(p * 255)), true);
-            var sc = $"Score: {s.Score}"; int scw = MeasureTextM(sc, 30);
-            DrawTextM(sc, s.W / 2 - scw / 2, s.H / 2 + 14, 30, new Color((byte)198, (byte)228, (byte)255, (byte)235));
-            var mc = $"Max Combo: {s.MaxCombo}x"; int mcw = MeasureTextM(mc, 22);
-            DrawTextM(mc, s.W / 2 - mcw / 2, s.H / 2 + 54, 22, new Color((byte)172, (byte)202, (byte)232, (byte)205));
-            if (s.GameOverTime > 1.5f)
-            {
-                var rs = "Press R to Restart"; int rw = MeasureTextM(rs, 20);
-                float rp = 0.38f + 0.62f * MathF.Sin(s.Time * 3.2f);
-                DrawTextM(rs, s.W / 2 - rw / 2, s.H / 2 + 96, 20, new Color((byte)120, (byte)240, (byte)255, (byte)(rp * 230)));
-            }
+            DrawGameOver(s);
         }
-        if (s.Shop)
+        if (s.Phase == GamePhase.Shop)
         {
             DrawShopPanel(s);
         }
+        float msgFs = 28f * s.Settings.UiScale;
+        float noteFs = 17f * s.Settings.UiScale;
         if (s.MsgT > 0 && s.Msg.Length > 0)
         {
             byte a = (byte)(MathH.Clamp(s.MsgT, 0, 1) * 255);
-            int mw = MeasureTextM(s.Msg, 28, true);
-            DrawTextM(s.Msg, s.W / 2 - mw / 2, s.H * 0.18f, 28, new Color((byte)120, (byte)240, (byte)255, a), true);
+            int mw = MeasureTextM(s.Msg, msgFs, true);
+            DrawTextM(s.Msg, s.W / 2 - mw / 2, s.H * 0.18f, msgFs, new Color((byte)120, (byte)240, (byte)255, a), true);
         }
         if (s.NoteT > 0 && s.Note.Length > 0)
         {
             byte a = (byte)(MathH.Clamp(s.NoteT, 0, 1) * 230);
-            int nw = MeasureTextM(s.Note, 17);
-            DrawTextM(s.Note, s.W / 2 - nw / 2, s.H - 44, 17, new Color((byte)188, (byte)218, (byte)242, a));
+            int nw = MeasureTextM(s.Note, noteFs);
+            DrawTextM(s.Note, s.W / 2 - nw / 2, s.H - 44, noteFs, new Color((byte)188, (byte)218, (byte)242, a));
         }
+        // Pause menu last — it dims the frozen world AND everything above
+        if (s.Phase == GamePhase.Paused) DrawPauseMenu(s);
+    }
+
+    // Game-over screen (§5 3.2): initials ceremony + top-10 + seed. Table/seed
+    // strings are cached in Profile (rebuilt on profile events only); the
+    // score/combo line uses the CacheSb dialect — zero steady-state allocation.
+    const string GoTitle = "GAME OVER";
+    const string GoNewHighScore = "NEW HIGH SCORE — ENTER INITIALS";
+    const string GoInitialsHint = "UP/DOWN LETTER   LEFT/RIGHT SLOT   ENTER CONFIRM";
+    const string GoTableHeader = " #  INI     SCORE  WAV  CMB"; // column-aligned with Profile.BuildRow
+    const string GoRestartHint = "Press R to Restart";
+    static string _goStats = "";
+
+    static void DrawGameOver(GameState s)
+    {
+        byte oa = (byte)MathH.Clamp(s.GameOverTime * 108, 0, 190);
+        Raylib.DrawRectangle(0, 0, (int)s.W, (int)s.H, new Color((byte)0, (byte)0, (byte)0, oa));
+        float cx = s.W * 0.5f;
+        float topY = s.H * 0.10f;
+
+        int gow = MeasureTextM(GoTitle, 52, true);
+        float p = 0.62f + 0.38f * MathF.Sin(s.Time * 2.2f);
+        DrawTextM(GoTitle, cx - gow / 2, topY, 52, new Color((byte)255, (byte)90, (byte)70, (byte)(p * 255)), true);
+
+        _hudSb.Clear();
+        _hudSb.Append("SCORE ").Append(s.Score).Append("    MAX COMBO x").Append(s.MaxCombo);
+        string stats = CacheSb(ref _goStats);
+        int stw = MeasureTextM(stats, 24);
+        DrawTextM(stats, cx - stw / 2, topY + 62, 24, new Color((byte)198, (byte)228, (byte)255, (byte)235));
+
+        if (s.GameOverTime <= 0.6f) return; // table/ceremony fade in after the slam
+
+        float y = topY + 108;
+        if (Profile.PendingInitials)
+        {
+            int hsw = MeasureTextM(GoNewHighScore, 22, true);
+            float hp = 0.55f + 0.45f * MathF.Sin(s.Time * 4.4f);
+            DrawTextM(GoNewHighScore, cx - hsw / 2, y, 22, new Color((byte)255, (byte)214, (byte)90, (byte)(hp * 255)), true);
+            y += 38;
+
+            // Three rotating A-Z slots, arcade style
+            const float slotW = 44, slotH = 54, gap = 12;
+            float sx0 = cx - (slotW * 3 + gap * 2) * 0.5f;
+            for (int i = 0; i < 3; i++)
+            {
+                bool sel = i == Profile.SlotSel;
+                var rect = new Rectangle(sx0 + i * (slotW + gap), y, slotW, slotH);
+                Raylib.DrawRectangleRounded(rect, 0.18f, 6, new Color((byte)8, (byte)18, (byte)34, (byte)225));
+                Raylib.DrawRectangleRoundedLinesEx(rect, 0.18f, 6, sel ? 2.4f : 1.2f,
+                    sel ? new Color((byte)120, (byte)240, (byte)255, (byte)255)
+                        : new Color((byte)90, (byte)130, (byte)180, (byte)190));
+                string letter = Profile.Letter(Profile.Slots[i]); // pre-baked, no alloc
+                int lw = MeasureTextM(letter, 34, true);
+                float roll = sel ? Profile.RollDir * Profile.RollT * 9f : 0f;
+                DrawTextM(letter, rect.X + slotW * 0.5f - lw * 0.5f, rect.Y + 11f + roll, 34,
+                    new Color((byte)234, (byte)245, (byte)255, (byte)(sel ? 255 : 215)), true);
+                if (sel)
+                {
+                    int aw = MeasureTextM("^", 15, true);
+                    DrawTextM("^", rect.X + slotW * 0.5f - aw * 0.5f, rect.Y - 18, 15,
+                        new Color((byte)120, (byte)240, (byte)255, (byte)220), true);
+                    int vw = MeasureTextM("v", 15, true);
+                    DrawTextM("v", rect.X + slotW * 0.5f - vw * 0.5f, rect.Y + slotH + 4, 15,
+                        new Color((byte)120, (byte)240, (byte)255, (byte)220), true);
+                }
+            }
+            y += slotH + 26;
+
+            int ihw = MeasureTextM(GoInitialsHint, 14);
+            DrawTextM(GoInitialsHint, cx - ihw / 2, y, 14, new Color((byte)138, (byte)168, (byte)202, (byte)200));
+            y += 32;
+        }
+
+        // Top-10 table (lines cached in Profile)
+        if (Profile.TableCount > 0)
+        {
+            const float rowH = 21f;
+            int thw = MeasureTextM(GoTableHeader, 17, true);
+            float tx = cx - thw / 2f;
+            DrawTextM(GoTableHeader, tx, y, 17, new Color((byte)120, (byte)240, (byte)255, (byte)230), true);
+            y += rowH + 3;
+            for (int i = 0; i < Profile.TableCount; i++)
+            {
+                bool hl = i == Profile.PendingIndex;
+                DrawTextM(Profile.TableText[i], tx, y, 17,
+                    hl ? new Color((byte)255, (byte)214, (byte)90, (byte)255)
+                       : new Color((byte)172, (byte)202, (byte)232, (byte)215), hl);
+                y += rowH;
+            }
+            y += 10;
+        }
+
+        // Seed readout — same seed ⇒ same wave plans (daily runs: D on the title)
+        if (Profile.SeedText.Length > 0)
+        {
+            int sw = MeasureTextM(Profile.SeedText, 16);
+            DrawTextM(Profile.SeedText, cx - sw / 2, y, 16, new Color((byte)140, (byte)232, (byte)255, (byte)225));
+            y += 30;
+        }
+
+        if (!Profile.PendingInitials && s.GameOverTime > 1.5f)
+        {
+            int rw = MeasureTextM(GoRestartHint, 20);
+            float rp = 0.38f + 0.62f * MathF.Sin(s.Time * 3.2f);
+            DrawTextM(GoRestartHint, cx - rw / 2, y, 20, new Color((byte)120, (byte)240, (byte)255, (byte)(rp * 230)));
+        }
+    }
+
+    // Pause/settings menu (§5 3.1) — HUD aesthetic, zero per-frame allocation:
+    // labels are constants, value strings are cached in Menu (rebuilt on key
+    // presses only).
+    const string PauseTitle = "PAUSED";
+    const string PauseHint = "UP/DOWN SELECT   LEFT/RIGHT ADJUST   ENTER ACTIVATE   ESC RESUME";
+
+    static void DrawPauseMenu(GameState s)
+    {
+        // Full-screen dim — the frozen world (and HUD) reads through it
+        Raylib.DrawRectangle(0, 0, (int)s.W, (int)s.H, new Color((byte)0, (byte)0, (byte)0, (byte)150));
+
+        Color bg, border, dim, accent;
+        switch (s.Theme)
+        {
+            case "xbox":
+                bg = new Color((byte)16, (byte)26, (byte)16, (byte)232);
+                border = new Color((byte)200, (byte)230, (byte)200, (byte)170);
+                dim = new Color((byte)168, (byte)188, (byte)168, (byte)220);
+                accent = new Color((byte)240, (byte)252, (byte)240, (byte)255);
+                break;
+            case "recharged":
+                bg = new Color((byte)6, (byte)2, (byte)2, (byte)238);
+                border = new Color((byte)255, (byte)102, (byte)40, (byte)220);
+                dim = new Color((byte)255, (byte)190, (byte)150, (byte)220);
+                accent = new Color((byte)255, (byte)255, (byte)255, (byte)255);
+                break;
+            default:
+                bg = new Color((byte)6, (byte)10, (byte)20, (byte)235);
+                border = new Color((byte)120, (byte)220, (byte)255, (byte)190);
+                dim = new Color((byte)180, (byte)210, (byte)250, (byte)195);
+                accent = new Color((byte)120, (byte)240, (byte)255, (byte)255);
+                break;
+        }
+
+        float ui = s.Settings.UiScale;
+        float fs = 17f * ui;
+        float rowH = fs + 13f;
+        float panelW = MathF.Min(s.W - 40, 560f * ui);
+        float headerH = 66f * ui;
+        float footerH = 44f * ui;
+        float panelH = headerH + Menu.ItemCount * rowH + footerH;
+        float px = s.W * 0.5f - panelW * 0.5f;
+        float py = MathF.Max(16, s.H * 0.5f - panelH * 0.5f);
+
+        // Rounded glass panel + glow + border (same dialect as HUD/shop)
+        var rect = new Rectangle(px, py, panelW, panelH);
+        Raylib.DrawRectangleRounded(rect, 0.05f, 10, bg);
+        Raylib.BeginBlendMode(BlendMode.Additive);
+        Raylib.DrawRectangleRounded(new Rectangle(px - 4, py - 4, panelW + 8, panelH + 8),
+            0.05f, 10, new Color(border.R, border.G, border.B, (byte)24));
+        Raylib.EndBlendMode();
+        Raylib.DrawRectangleRoundedLinesEx(rect, 0.05f, 10, 2f, border);
+
+        // Title
+        float titleFs = 30f * ui;
+        int tw = MeasureTextM(PauseTitle, titleFs, true);
+        DrawTextM(PauseTitle, px + panelW * 0.5f - tw * 0.5f, py + 16f * ui, titleFs, accent, true);
+
+        // Items: label left, cached value right-aligned, selection row highlighted
+        float rowY = py + headerH;
+        for (int i = 0; i < Menu.ItemCount; i++)
+        {
+            bool sel = i == Menu.Sel;
+            if (sel)
+            {
+                Raylib.DrawRectangleRounded(
+                    new Rectangle(px + 12, rowY - 4, panelW - 24, rowH),
+                    0.4f, 6, new Color(border.R, border.G, border.B, (byte)42));
+                DrawTextM(">", px + 18, rowY, fs, accent, true);
+            }
+            DrawTextM(Menu.Labels[i], px + 36, rowY, fs, sel ? accent : dim, sel);
+            string v = Menu.Values[i];
+            if (v.Length > 0)
+            {
+                int vw = MeasureTextM(v, fs, sel);
+                DrawTextM(v, px + panelW - 28 - vw, rowY, fs, sel ? accent : dim, sel);
+            }
+            rowY += rowH;
+        }
+
+        // Hint
+        float hintFs = 13f * ui;
+        int hw = MeasureTextM(PauseHint, hintFs);
+        DrawTextM(PauseHint, px + panelW * 0.5f - hw * 0.5f, py + panelH - footerH + 12f * ui, hintFs, dim);
     }
 
     static void DrawShopPanel(GameState s)
     {
         float panelW = MathF.Min(s.W * 0.72f, 820);
-        float panelH = MathF.Min(s.H * 0.82f, 540);
+        float panelH = MathF.Min(s.H * 0.86f, 600); // taller: armory draft row (§5 4.3)
         float px = s.W * 0.5f - panelW * 0.5f;
         float py = MathF.Max(24, s.H * 0.09f);
 
@@ -3545,32 +4569,50 @@ public static class Renderer
         // Title
         string title = $"WAVE {s.Level} COMPLETE — STRATEGY LINK";
         int tw = MeasureTextM(title, 30, true);
-        DrawTextM(title, px + panelW * 0.5f - tw * 0.5f, py + 26, 30,
+        DrawTextM(title, px + panelW * 0.5f - tw * 0.5f, py + 22, 30,
             new Color((byte)234, (byte)245, (byte)255, (byte)255), true);
 
-        // Funds
-        string funds = $"AVAILABLE FUNDS:  {s.Score}";
+        // Funds (§5 3.5: the shop spends SCRAP — Score is leaderboard-pure)
+        string funds = $"SCRAP RESERVE:  {s.Scrap}";
         int fw = MeasureTextM(funds, 22, true);
-        DrawTextM(funds, px + panelW * 0.5f - fw * 0.5f, py + 72, 22,
-            new Color((byte)140, (byte)232, (byte)255, (byte)255), true);
+        DrawTextM(funds, px + panelW * 0.5f - fw * 0.5f, py + 60, 22,
+            new Color((byte)255, (byte)214, (byte)90, (byte)255), true);
 
-        // Upgrade buttons
+        // Free-repair crew status (§5 3.5: earned every 3 cleared waves, banked)
+        int repairIn = Math.Max(0, 3 - s.Upgrades.WavesSinceFreeRepair);
+        string crew = repairIn == 0
+            ? "FIELD REPAIR CREW STANDING BY"
+            : $"FIELD REPAIR CREW READY IN {repairIn} WAVE{(repairIn == 1 ? "" : "S")}";
+        int cw = MeasureTextM(crew, 14);
+        DrawTextM(crew, px + panelW * 0.5f - cw * 0.5f, py + 86, 14,
+            new Color((byte)190, (byte)185, (byte)150, (byte)200));
+
+        // §5 4.1/4.3: draft cards left, intel forecast column right; the scrap
+        // buys (now keys 4-0) sit under the cards
+        float intelW = MathF.Min(212f, panelW * 0.3f);
+        float draftY = py + 108;
+        DrawShopDraft(s, px + 28, draftY, panelW - intelW - 72);
+        DrawShopIntel(s, px + panelW - intelW - 28, draftY, intelW);
+
+        // Upgrade buttons (§5 4.3: remapped to 4-0 — the draft owns 1-3)
         var items = new (int cost, string label, bool enabled)[]
         {
-            (5000, "1. REBUILD CITY",    s.Score >= 5000 && s.Cities.Any(c => c.Destroyed)),
-            (2500, "2. BUY EMP",         s.Score >= 2500 && s.Emp < s.EmpMax),
-            (4000, $"3. WARHEAD YIELD  [x{s.Upgrades.BlastScale:F1} → x{MathF.Min(2.8f, s.Upgrades.BlastScale + 0.2f):F1}]",
-                s.Score >= 4000 && s.Upgrades.BlastScale < 2.8f - 0.001f),
-            (3500, $"4. RELOAD BOOST   [x{s.Upgrades.ReloadMult:F2} → x{MathF.Min(2.2f, s.Upgrades.ReloadMult + 0.12f):F2}]",
-                s.Score >= 3500 && s.Upgrades.ReloadMult < 2.2f - 0.001f),
-            (3600, $"5. EMP AMPLIFIER  [x{s.Upgrades.EmpScale:F2} → x{MathF.Min(2.4f, s.Upgrades.EmpScale + 0.14f):F2}]",
-                s.Score >= 3600 && s.Upgrades.EmpScale < 2.4f - 0.001f),
+            (500, "4. REBUILD CITY",    s.Scrap >= 500 && s.Cities.Any(c => c.Destroyed)),
+            (250, "5. BUY EMP",         s.Scrap >= 250 && s.Emp < s.EmpMax),
+            (400, $"6. WARHEAD YIELD  [x{s.Upgrades.BlastScale:F1} → x{MathF.Min(2.8f, s.Upgrades.BlastScale + 0.2f):F1}]",
+                s.Scrap >= 400 && s.Upgrades.BlastScale < 2.8f - 0.001f),
+            (350, $"7. RELOAD BOOST   [x{s.Upgrades.ReloadMult:F2} → x{MathF.Min(2.2f, s.Upgrades.ReloadMult + 0.12f):F2}]",
+                s.Scrap >= 350 && s.Upgrades.ReloadMult < 2.2f - 0.001f),
+            (360, $"8. EMP AMPLIFIER  [x{s.Upgrades.EmpScale:F2} → x{MathF.Min(2.4f, s.Upgrades.EmpScale + 0.14f):F2}]",
+                s.Scrap >= 360 && s.Upgrades.EmpScale < 2.4f - 0.001f),
+            (300, "9. REPAIR BASE",     s.Scrap >= 300 && s.Bases.Any(b => b.Destroyed)),
+            (250, "0. REPAIR PHALANX",  s.Scrap >= 250 && s.Phalanxes.Any(p => p.Destroyed)),
         };
 
-        float btnW = MathF.Min(panelW - 80, 440);
-        float btnH = 46;
-        float btnX = px + panelW * 0.5f - btnW * 0.5f;
-        float btnY = py + 120;
+        float btnW = MathF.Min(panelW - intelW - 92, 440);
+        float btnH = 30; // 7 rows + draft row must clear the 600 px panel
+        float btnX = px + (panelW - intelW - 56 - btnW) * 0.5f + 28;
+        float btnY = py + 248;
         for (int i = 0; i < items.Length; i++)
         {
             var (cost, label, enabled) = items[i];
@@ -3583,26 +4625,217 @@ public static class Renderer
             var brCol = enabled
                 ? new Color((byte)130, (byte)210, (byte)255, (byte)230)
                 : new Color((byte)90, (byte)100, (byte)120, (byte)180);
-            var br = new Rectangle(btnX, btnY + i * (btnH + 10), btnW, btnH);
+            var br = new Rectangle(btnX, btnY + i * (btnH + 6), btnW, btnH);
             Raylib.DrawRectangleRounded(br, 0.22f, 8, bgCol);
             Raylib.DrawRectangleRoundedLinesEx(br, 0.22f, 8, 1.3f, brCol);
 
             string priced = $"{label}    [{cost}]";
-            int lw = MeasureTextM(priced, 19, true);
-            DrawTextM(priced, br.X + br.Width * 0.5f - lw * 0.5f, br.Y + br.Height * 0.5f - 11, 19, txCol, true);
+            int lw = MeasureTextM(priced, 17, true);
+            DrawTextM(priced, br.X + br.Width * 0.5f - lw * 0.5f, br.Y + br.Height * 0.5f - 9, 17, txCol, true);
         }
 
         // Timer
-        float timerY = btnY + items.Length * (btnH + 10) + 16;
+        float timerY = btnY + items.Length * (btnH + 6) + 10;
         string t = $"COMMENCING NEXT WAVE IN {MathF.Max(0, MathF.Ceiling(s.ShopTimer))}s";
         int tww = MeasureTextM(t, 22, true);
         DrawTextM(t, px + panelW * 0.5f - tww * 0.5f, timerY, 22,
             new Color((byte)189, (byte)244, (byte)255, (byte)255), true);
 
         // Hint
-        string hint = "Press 1/2/3/4/5 to purchase — SPACE to skip";
-        int hw2 = MeasureTextM(hint, 16);
-        DrawTextM(hint, px + panelW * 0.5f - hw2 * 0.5f, timerY + 34, 16,
+        int hw2 = MeasureTextM(ShopHint, 15);
+        DrawTextM(ShopHint, px + panelW * 0.5f - hw2 * 0.5f, timerY + 30, 15,
             new Color((byte)140, (byte)232, (byte)255, (byte)210));
+    }
+
+    // §5 4.3 draft card chrome — constant strings only (cached-string discipline:
+    // names/descs live on the Perk records, everything else is a literal)
+    const string ShopHint = "1-3 INSTALL PERK / R REROLL / 4-0 PURCHASE / SPACE LAUNCH";
+    const string DraftHeader = "ARMORY DRAFT - INSTALL ONE PERK";
+    const string DraftRerollReady = "R: REROLL [150]";
+    const string DraftRerollUsed = "REROLL EXPENDED";
+    const string DraftInstalled = "INSTALLED";
+    const string DraftEmpty = "OUT OF\nSTOCK";
+    static readonly string[] DraftKeys = ["1", "2", "3"];
+    static readonly string[] RarityLabels = ["COMMON", "RARE", "EPIC"]; // indexed by Rarity
+
+    static Color RarityColor(Rarity r) => r switch
+    {
+        Rarity.Epic => new Color((byte)236, (byte)128, (byte)255, (byte)255),
+        Rarity.Rare => new Color((byte)255, (byte)214, (byte)90, (byte)255),
+        _ => new Color((byte)140, (byte)220, (byte)255, (byte)255)
+    };
+
+    /// <summary>§5 4.3 perk draft: three rarity-colored cards (keys 1-3) + the
+    /// reroll status. Renders allocation-free — all strings are constants or
+    /// pre-built Perk record fields.</summary>
+    static void DrawShopDraft(GameState s, float dx, float dy, float dw)
+    {
+        Color head = new Color((byte)130, (byte)210, (byte)255, (byte)235);
+        Color dim = new Color((byte)170, (byte)195, (byte)230, (byte)215);
+        Color bright = new Color((byte)234, (byte)245, (byte)255, (byte)255);
+        DrawTextM(DraftHeader, dx, dy, 15, head, true);
+
+        // Reroll status, right-aligned on the header row
+        if (s.DraftPicked < 0)
+        {
+            string rr = s.DraftRerolled ? DraftRerollUsed : DraftRerollReady;
+            bool can = !s.DraftRerolled && s.Scrap >= PerkSystem.RerollCost
+                && (s.Draft[0] != null || s.Draft[1] != null || s.Draft[2] != null);
+            int rw = MeasureTextM(rr, 13, can);
+            DrawTextM(rr, dx + dw - rw, dy + 1, 13,
+                can ? new Color((byte)255, (byte)214, (byte)90, (byte)255)
+                    : new Color((byte)150, (byte)150, (byte)160, (byte)200), can);
+        }
+
+        float cardW = (dw - 20) / 3f;
+        const float cardH = 92f;
+        float cy = dy + 22;
+        for (int i = 0; i < 3; i++)
+        {
+            float cx = dx + i * (cardW + 10);
+            var rect = new Rectangle(cx, cy, cardW, cardH);
+            var card = s.Draft[i];
+            bool installed = s.DraftPicked == i;
+            bool dead = s.DraftPicked >= 0 && !installed; // a sibling was picked
+
+            var rc = card != null ? RarityColor(card.Rarity)
+                : new Color((byte)90, (byte)100, (byte)120, (byte)180);
+            var border = dead ? new Color(rc.R, rc.G, rc.B, (byte)70) : rc;
+            var bg = installed
+                ? new Color((byte)20, (byte)44, (byte)40, (byte)235)
+                : dead
+                    ? new Color((byte)12, (byte)16, (byte)26, (byte)200)
+                    : new Color((byte)14, (byte)24, (byte)44, (byte)235);
+            Raylib.DrawRectangleRounded(rect, 0.12f, 8, bg);
+            Raylib.DrawRectangleRoundedLinesEx(rect, 0.12f, 8, installed ? 2.2f : 1.3f, border);
+
+            if (card == null)
+            {
+                int ew = MeasureTextM(DraftEmpty, 12);
+                DrawTextM(DraftEmpty, cx + cardW * 0.5f - ew * 0.5f, cy + 34, 12, dim);
+                continue;
+            }
+
+            var txDim = dead ? new Color(dim.R, dim.G, dim.B, (byte)110) : dim;
+            var txBright = dead ? new Color(bright.R, bright.G, bright.B, (byte)120) : bright;
+            var txRare = dead ? new Color(rc.R, rc.G, rc.B, (byte)110) : rc;
+
+            DrawTextM(DraftKeys[i], cx + 8, cy + 6, 13, txBright, true);
+            string rl = RarityLabels[(int)card.Rarity];
+            int rlw = MeasureTextM(rl, 11, true);
+            DrawTextM(rl, cx + cardW - rlw - 8, cy + 7, 11, txRare, true);
+
+            int nw = MeasureTextM(card.Name, 13, true);
+            DrawTextM(card.Name, cx + cardW * 0.5f - nw * 0.5f, cy + 26, 13, txBright, true);
+            DrawTextM(card.Desc, cx + 10, cy + 45, 11, txDim);
+
+            if (installed)
+            {
+                int iw2 = MeasureTextM(DraftInstalled, 12, true);
+                DrawTextM(DraftInstalled, cx + cardW * 0.5f - iw2 * 0.5f, cy + cardH - 17, 12,
+                    new Color((byte)120, (byte)255, (byte)170, (byte)255), true);
+            }
+        }
+    }
+
+    // §5 4.1 intel forecast caches — rebuilt only when the pinned plan OBJECT
+    // changes (once per shop-open), so the panel draws allocation-free while
+    // open (cached-string discipline; the rebuild itself is a shop-path alloc).
+    static readonly string[] IntelVariants =
+        ["standard", "fast", "zig", "stealth", "decoy", "split", "cruise", "drone", "spit", "heavy", "carrier", "shield"];
+    static readonly string[] IntelLabels =
+        ["STANDARD", "FAST", "ZIG", "STEALTH", "DECOY", "SPLIT", "CRUISE", "DRONE", "SPIT", "HEAVY", "CARRIER", "SHIELD"];
+    static List<WavePlanEntry>? _intelPlanRef;
+    static readonly int[] _intelCounts = new int[IntelVariants.Length];
+    static readonly string[] _intelCountStr = new string[IntelVariants.Length];
+    static int _intelMirvCount;
+    static string _intelMirvStr = "";
+    static string _intelThreatStr = "";
+    static float _intelThreatFrac;
+
+    static void BuildIntelCache(GameState s)
+    {
+        var plan = s.PinnedPlan;
+        if (ReferenceEquals(plan, _intelPlanRef)) return;
+        _intelPlanRef = plan;
+        Array.Clear(_intelCounts);
+        _intelMirvCount = 0;
+        int threat = 0;
+        if (plan == null) return;
+        for (int i = 0; i < plan.Count; i++)
+        {
+            var e = plan[i];
+            for (int v = 0; v < IntelVariants.Length; v++)
+                if (e.Variant == IntelVariants[v]) { _intelCounts[v]++; break; }
+            // Threat meter = the director's own per-variant budget prices;
+            // MIRV-tagged heavies carry a premium (3 extra shards inbound)
+            threat += WaveSystem.ThreatOf(e.Variant);
+            if (e.Mirv) { _intelMirvCount++; threat += 8; }
+        }
+        var sb = _hudSb;
+        for (int v = 0; v < IntelVariants.Length; v++)
+        {
+            sb.Clear();
+            sb.Append('x').Append(_intelCounts[v]);
+            _intelCountStr[v] = sb.ToString();
+        }
+        sb.Clear();
+        sb.Append("MIRV TAGGED x").Append(_intelMirvCount);
+        _intelMirvStr = sb.ToString();
+        sb.Clear();
+        sb.Append("THREAT ").Append(threat);
+        _intelThreatStr = sb.ToString();
+        // Fixed scale (director budget ≈ 140 + 50·level, capped near level 21)
+        _intelThreatFrac = MathH.Clamp(threat / 1200f, 0f, 1f);
+    }
+
+    /// <summary>§5 4.1 shop intel: per-variant icon counts + threat meter for the
+    /// PINNED next-wave plan (§4.3 — the same object StartWave will execute).</summary>
+    static void DrawShopIntel(GameState s, float ix, float iy, float iw)
+    {
+        BuildIntelCache(s);
+        Color head = new Color((byte)130, (byte)210, (byte)255, (byte)235);
+        Color dim = new Color((byte)170, (byte)195, (byte)230, (byte)215);
+        Color warn = new Color((byte)255, (byte)110, (byte)90, (byte)255);
+        DrawTextM("NEXT WAVE INTEL", ix, iy, 15, head, true);
+        float y = iy + 24;
+        if (_intelPlanRef == null)
+        {
+            DrawTextM("NO TELEMETRY", ix, y, 13, dim);
+            return;
+        }
+        for (int v = 0; v < IntelVariants.Length; v++)
+        {
+            if (_intelCounts[v] == 0) continue;
+            var vc = Palette.VariantColor(IntelVariants[v]);
+            // warhead icon: small down-pointing triangle in the track color
+            Raylib.DrawPoly(new Vector2(ix + 6, y + 7), 3, 6f, 90f, vc);
+            DrawTextM(IntelLabels[v], ix + 18, y, 13, dim);
+            int cwid = MeasureTextM(_intelCountStr[v], 13, true);
+            DrawTextM(_intelCountStr[v], ix + iw - cwid, y, 13,
+                new Color((byte)234, (byte)245, (byte)255, (byte)255), true);
+            y += 19;
+        }
+        if (_intelMirvCount > 0)
+        {
+            y += 3;
+            DrawTextM(_intelMirvStr, ix, y, 13, warn, true);
+            y += 19;
+        }
+        // Threat meter — sum of the plan's per-variant threat prices
+        y += 8;
+        Color meterCol = _intelThreatFrac < 0.34f
+            ? new Color((byte)120, (byte)240, (byte)255, (byte)255)
+            : _intelThreatFrac < 0.67f
+                ? new Color((byte)255, (byte)214, (byte)90, (byte)255)
+                : warn;
+        DrawTextM(_intelThreatStr, ix, y, 13, meterCol, true);
+        y += 19;
+        float barW = iw - 2;
+        Raylib.DrawRectangle((int)ix, (int)y, (int)barW, 9,
+            new Color((byte)20, (byte)30, (byte)50, (byte)230));
+        Raylib.DrawRectangle((int)ix, (int)y, (int)(barW * _intelThreatFrac), 9, meterCol);
+        Raylib.DrawRectangleLines((int)ix, (int)y, (int)barW, 9,
+            new Color((byte)130, (byte)210, (byte)255, (byte)160));
     }
 }

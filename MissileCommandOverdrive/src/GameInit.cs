@@ -74,6 +74,10 @@ public static class GameInit
             Destroyed = false
         };
 
+        // Seed the cached alive counts (§5 2.6) — everything above is built intact
+        s.AliveCities = s.Cities.Count;
+        s.AliveBases = s.Bases.Count;
+
         // Clouds (7 wispy ambient layers)
         s.Clouds.Clear();
         for (int i = 0; i < 7; i++)
@@ -99,8 +103,8 @@ public static class GameInit
                 MathH.Rand(s.W * 0.05f, s.W * 0.95f), // x
                 MathH.Rand(s.H * 0.05f, s.H * 0.54f), // y
                 MathH.Rand(s.W * 0.11f, s.W * 0.23f), // radius
-                Random.Shared.NextSingle() < 0.5f ? 205 : 242, // hue1
-                Random.Shared.NextSingle() < 0.5f ? 272 : 188, // hue2
+                RandHelper.Chance(0.5f) ? 205 : 242, // hue1
+                RandHelper.Chance(0.5f) ? 272 : 188, // hue2
                 MathH.Rand(0.06f, 0.16f), // alpha
                 MathH.Rand(0.05f, 0.18f), // drift speed
                 MathH.Rand(0, MathF.PI * 2) // phase
@@ -118,7 +122,7 @@ public static class GameInit
                 MathH.Rand(14, 34), // thickness
                 MathH.Rand(0.14f, 0.4f), // speed
                 MathH.Rand(0, MathF.PI * 2), // phase
-                Random.Shared.NextSingle() < 0.5f ? 166 : 198, // hue
+                RandHelper.Chance(0.5f) ? 166 : 198, // hue
                 MathH.Rand(0.09f, 0.2f) // alpha
             });
         }
@@ -136,8 +140,9 @@ public static class GameInit
     };
 
     /// <summary>Reposition all defense objects to match the current screen dimensions,
-    /// preserving game state (ammo, destroyed, etc). Also rebuilds sky scenery.
-    /// Called on window resize, matching HTML's resize() → buildWorld() + buildSky().</summary>
+    /// preserving game state (ammo, destroyed, etc). Cheap and allocation-free — safe
+    /// to call every drag frame. The RNG scenery rebuild is debounced separately
+    /// (§4.10): Program.cs calls RebuildScenery once the size has been stable.</summary>
     public static void Reposition(GameState s)
     {
         int bases = 3, cities = 6;
@@ -193,13 +198,11 @@ public static class GameInit
             s.HellRaiser.X = s.W * 0.5f;
             s.HellRaiser.Y = s.GroundY + MathF.Max(18, (s.H - s.GroundY) * 0.22f);
         }
-
-        // Rebuild sky scenery (clouds, nebula, aurora depend on W/H/HorizonY)
-        RebuildScenery(s);
     }
 
-    /// <summary>Rebuild clouds, nebula, aurora for the current screen dimensions.</summary>
-    static void RebuildScenery(GameState s)
+    /// <summary>Rebuild clouds, nebula, aurora (and weather) for the current screen
+    /// dimensions. Allocates + re-randomizes — only call once a resize has settled.</summary>
+    public static void RebuildScenery(GameState s)
     {
         s.Clouds.Clear();
         for (int i = 0; i < 7; i++)
@@ -224,8 +227,8 @@ public static class GameInit
                 MathH.Rand(s.W * 0.05f, s.W * 0.95f),
                 MathH.Rand(s.H * 0.05f, s.H * 0.54f),
                 MathH.Rand(s.W * 0.11f, s.W * 0.23f),
-                Random.Shared.NextSingle() < 0.5f ? 205 : 242,
-                Random.Shared.NextSingle() < 0.5f ? 272 : 188,
+                RandHelper.Chance(0.5f) ? 205 : 242,
+                RandHelper.Chance(0.5f) ? 272 : 188,
                 MathH.Rand(0.06f, 0.16f),
                 MathH.Rand(0.05f, 0.18f),
                 MathH.Rand(0, MathF.PI * 2)
@@ -242,7 +245,7 @@ public static class GameInit
                 MathH.Rand(14, 34),
                 MathH.Rand(0.14f, 0.4f),
                 MathH.Rand(0, MathF.PI * 2),
-                Random.Shared.NextSingle() < 0.5f ? 166 : 198,
+                RandHelper.Chance(0.5f) ? 166 : 198,
                 MathH.Rand(0.09f, 0.2f)
             });
         }
@@ -254,16 +257,26 @@ public static class GameInit
     public static void ResetGame(GameState s)
     {
         bool dbgEnabled = s.Debug.Enabled;
+        // §4.3: consume a pending (daily) seed or roll a fresh master seed for the run
+        s.MasterSeed = s.PendingSeed ?? s.Cosmetic.NextULong();
+        s.PendingSeed = null;
+        Profile.CancelInitialsEntry(); // a scripted reset can land mid-ceremony
         s.Level = 1;
         s.Score = 0;
         s.Combo = 0;
         s.MaxCombo = 0;
         s.ComboTimer = 0;
-        s.GameOver = false;
+        s.DisplayScore = 0; // §5 4.4: the odometer snaps with the run
+        s.ComboPop = 0;
+        s.LowAmmoTickCd = 0;
+        s.Phase = GamePhase.Playing;
         s.GameOverSfx = false;
-        s.Intro = false;
+        s.AssistedRun = false; // re-flagged by GameUpdate if an assist is active
         s.Time = 0;
         s.Danger = 0;
+        s.Intensity = 0;       // §4.5 tension signal restarts with the run
+        s.RecentCityHits = 0;
+        s.PinnedPlan = null;   // §4.3: a pin never crosses runs (seed changed)
 
         s.UFOs.Clear();
         s.Raiders.Clear();
@@ -286,11 +299,14 @@ public static class GameInit
         s.Chromatic = 0;
         s.Emp = 1;
         s.EmpCd = 0;
-        s.Shake = 0;
+        s.Trauma = 0;
+        s.CrosshairPop = 0;
         s.Flash = 0;
-        s.Shop = false;
         s.ShopTimer = 0;
         s.Upgrades = new Upgrades();
+        s.Perks = PerkFlags.Defaults; // §5 4.3: perks are run-scoped
+        s.OwnedPerks.Clear();
+        PerkSystem.ClearDraft(s);
         s.SelectedBase = null;
 
         s.Weather.Mode = "clear";
@@ -300,6 +316,8 @@ public static class GameInit
 
         s.GameOverTime = 0;
         s.Debug = new DebugState { Enabled = dbgEnabled };
+        s.Events.Clear();
+        FeelDirector.Reset(s);
 
         BuildWorld(s);
         WaveSystem.StartWave(s, 2.5f);

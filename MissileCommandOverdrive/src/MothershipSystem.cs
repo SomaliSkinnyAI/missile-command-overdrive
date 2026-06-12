@@ -14,7 +14,7 @@ public static class MothershipSystem
         if (s.Mothership != null) return;
         if (s.Intro || s.GameOver) return;
 
-        bool fromLeft = Random.Shared.NextDouble() < 0.5;
+        bool fromLeft = RandHelper.Chance(0.5f); // §4.3: cosmetic stream
         float hullW = MathF.Max(340, s.W * 0.32f);
         float startX = fromLeft ? -hullW * 0.6f : s.W + hullW * 0.6f;
         float vx = fromLeft ? 33f : -33f; // slow cinematic traverse (+50% from original)
@@ -41,7 +41,7 @@ public static class MothershipSystem
         s.Note = "EASTER EGG: IMPERIAL MOTHERSHIP INBOUND";
         s.NoteT = 3.0f;
         s.Flash = MathF.Max(s.Flash, 0.22f);
-        s.Shake = MathF.Max(s.Shake, 8);
+        s.AddTrauma(0.3f);
         SynthAudio.Thunder(0.5f, 0.9f);
     }
 
@@ -122,7 +122,7 @@ public static class MothershipSystem
         float tx, ty;
         if (aliveCities.Count > 0)
         {
-            var pick = aliveCities[Random.Shared.Next(aliveCities.Count)];
+            var pick = RandHelper.Pick(aliveCities);
             tx = pick.X;
             ty = pick.Y - 10;
         }
@@ -142,7 +142,7 @@ public static class MothershipSystem
             Y = bayY,
             Vx = MathF.Cos(ang) * speed,
             Vy = MathF.Sin(ang) * speed,
-            Phase = (float)Random.Shared.NextDouble() * MathH.TAU,
+            Phase = RandHelper.Next01() * MathH.TAU,
             Hp = 2,
             FireCd = MathH.Rand(1.5f, 3.0f),
             TargetX = tx,
@@ -164,7 +164,7 @@ public static class MothershipSystem
                 var aliveCities = s.Cities.Where(c => !c.Destroyed).ToList();
                 if (aliveCities.Count > 0)
                 {
-                    var pick = aliveCities[Random.Shared.Next(aliveCities.Count)];
+                    var pick = RandHelper.Pick(aliveCities);
                     f.TargetX = pick.X;
                     f.TargetY = pick.Y - 10;
                 }
@@ -197,7 +197,7 @@ public static class MothershipSystem
                 var aliveCities = s.Cities.Where(c => !c.Destroyed).ToList();
                 if (aliveCities.Count > 0)
                 {
-                    var pick = aliveCities[Random.Shared.Next(aliveCities.Count)];
+                    var pick = RandHelper.Pick(aliveCities);
                     var tinfo = new TargetInfo { Type = "city", X = pick.X, Y = pick.Y, Id = pick.Id };
                     Combat.CreateEnemyProjectile(s, "fast", f.X, f.Y + 3, tinfo);
                 }

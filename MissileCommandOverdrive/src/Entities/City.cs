@@ -11,6 +11,8 @@ public class City
 
 public class Base
 {
+    public const float MuzzleFlashDur = 0.034f; // ~2 frames at 60 fps
+
     public string Id = "";
     public float X, Y;
     public int Ammo;
@@ -19,6 +21,9 @@ public class Base
     public bool Destroyed;
     public float DishAngle; // radar dish oscillation
     public float DishDir = 1f;
+    public float MuzzleT;         // additive muzzle flash timer
+    public float Recoil, RecoilV; // damped recoil spring (px, px/s)
+    public float ResupplyFlash;   // ammo-pip flash on resupply (1 → 0)
 }
 
 public class Phalanx

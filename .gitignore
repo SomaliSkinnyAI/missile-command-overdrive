@@ -4,3 +4,9 @@ obj/
 *.user
 *.suo
 MissileCommandOverdrive/publish-dev/
+
+# Demo/eval harness artifacts
+demo_*.png
+demo_log.txt
+eval-baseline/
+.DS_Store

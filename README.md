@@ -42,11 +42,23 @@ dotnet publish -c Release -o publish-dev -p:PublishAot=false --self-contained fa
 | `M` | Mute audio |
 | `+` / `-` | Volume up / down |
 | `]` / `[` (or `PgUp` / `PgDn`) | Skip level ±1 |
-| `1`–`5` | Shop upgrades (during between-wave shop) |
+| `1`–`3` | Install a perk draft card (between-wave shop) |
+| `4`–`0` | Shop upgrades & repairs (between-wave shop) |
 | `Space` | Skip shop timer |
-| `R` | Restart |
+| `R` | Reroll the perk draft, 150 scrap (in shop) / Restart (in play) |
 | `F8` | Toggle debug telemetry |
 | `F9` / `F10` | Export current-wave / full-session telemetry JSON |
+
+## Self-driving demo / evaluation harness
+
+```bash
+MCOD_DEMO=1 dotnet run -c Release
+```
+
+Plays a scripted ~50 s session via the auto-defense AI (themes, EMP, HellRaiser,
+both bosses, wave 8), captures `demo_*.png` screenshots and `demo_log.txt`
+frame stats using the game's own `TakeScreenshot`, then exits. See
+`src/DemoDriver.cs`. Enhancement roadmap: [PLAN-NEXT-LEVEL.md](PLAN-NEXT-LEVEL.md).
 
 ## Easter eggs
 

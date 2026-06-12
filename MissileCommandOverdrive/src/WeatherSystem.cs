@@ -111,7 +111,7 @@ public static class WeatherSystem
                     Segments = segments
                 });
                 s.Flash = MathF.Max(s.Flash, 0.08f + w.Intensity * 0.12f);
-                s.Shake = MathF.Max(s.Shake, 3 + w.Intensity * 5);
+                s.AddTrauma(0.1f + w.Intensity * 0.15f);
                 SynthAudio.Thunder(MathH.Clamp(w.Bolts[^1].X / s.W, 0, 1), w.Intensity);
             }
 

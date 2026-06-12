@@ -14,4 +14,9 @@
     <PackageReference Include="Raylib-cs" Version="7.0.2" />
   </ItemGroup>
 
+  <ItemGroup>
+    <EmbeddedResource Include="assets/JetBrainsMono-Regular.ttf" />
+    <EmbeddedResource Include="assets/JetBrainsMono-Bold.ttf" />
+  </ItemGroup>
+
 </Project>

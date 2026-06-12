@@ -2,6 +2,7 @@ namespace MissileCommandOverdrive.Entities;
 
 public class Explosion
 {
+    public int Id; // unique (s.NewId()) — used by Mothership.HitBy
     public float X, Y;
     public float Radius;
     public float MaxRadius;
@@ -25,6 +26,7 @@ public class UFO
     public float BobPhase;
     public bool Boss;
     public int Hp;
+    public float FlashT; // white damage-flash timer
     public bool Dead;
     public float ReserveUntil; // auto-defense reservation timer
 }
@@ -39,6 +41,7 @@ public class Raider
     public float FireCd;
     public float Angle;
     public int Hp;
+    public float FlashT; // white damage-flash timer
     public bool Dead;
 }
 
@@ -50,6 +53,7 @@ public class Daemon
     public float FireCd;
     public float Phase;
     public int Hp;
+    public float FlashT; // white damage-flash timer
     public bool Active;
 }
 
@@ -68,7 +72,9 @@ public class Mothership
     public bool ReachedMid;   // has center crossed screen-mid yet?
     public bool Dead;
     // Each explosion damages the mothership at most once (prevents per-frame re-damage bug).
-    public HashSet<Explosion> HitBy = new();
+    // Int ids (preallocated) instead of object refs: no growth reallocs in normal fights,
+    // and dead Explosion instances aren't kept alive by the set.
+    public HashSet<int> HitBy = new(256);
     // Deflector-shield state: toggles on/off with random intervals; blocks all damage while active.
     public bool ShieldActive;
     public float ShieldStateTimer; // time until next on/off toggle
@@ -83,6 +89,7 @@ public class Fighter
     public float Phase;
     public float Roll;       // wing-panel oscillation
     public int Hp = 1;
+    public float FlashT;     // white damage-flash timer
     public float FireCd;
     public float Life = 1f;
     public bool Dead;
