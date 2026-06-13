@@ -1,5 +1,10 @@
 # Missile Command Overdrive — HTML → C# Migration Progress
 
+> **This log covers the original HTML → C# migration only.** The subsequent
+> "next-level" overhaul (HDR/shader pipeline, audio engine + music director,
+> roguelite run depth, multi-phase bosses, ceremony, title/attract) is tracked in
+> [../PLAN-NEXT-LEVEL.md](../PLAN-NEXT-LEVEL.md).
+
 ## Phase 1 — Scaffolding ✅
 - [x] Project setup (csproj, Raylib-cs 7.0.2, .NET 10)
 - [x] GameState.cs — all fields matching JS `S` object
