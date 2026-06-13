@@ -18,9 +18,10 @@ public static class Menu
     public const int ItemFullscreen = 6;
     public const int ItemAssistSlow = 7;
     public const int ItemAssistAutoEmp = 8;
-    public const int ItemRestart = 9;
-    public const int ItemQuit = 10;
-    public const int ItemCount = 11;
+    public const int ItemColorblind = 9;
+    public const int ItemRestart = 10;
+    public const int ItemQuit = 11;
+    public const int ItemCount = 12;
 
     public static readonly string[] Labels =
     [
@@ -33,6 +34,7 @@ public static class Menu
         "BORDERLESS FULLSCREEN",
         "ASSIST: SLOW ENEMIES",
         "ASSIST: AUTO-EMP",
+        "COLORBLIND MODE",
         "RESTART",
         "QUIT",
     ];
@@ -145,6 +147,12 @@ public static class Menu
                 RefreshValue(s, ItemAssistAutoEmp);
                 break;
 
+            case ItemColorblind:
+                s.Settings.ColorblindMode = !s.Settings.ColorblindMode;
+                Rendering.Palette.Colorblind = s.Settings.ColorblindMode; // live-apply
+                RefreshValue(s, ItemColorblind);
+                break;
+
             case ItemRestart:
                 if (enter) GameInit.ResetGame(s); // sets Phase = Playing
                 break;
@@ -168,6 +176,7 @@ public static class Menu
         RefreshValue(s, ItemFullscreen);
         RefreshValue(s, ItemAssistSlow);
         RefreshValue(s, ItemAssistAutoEmp);
+        RefreshValue(s, ItemColorblind);
     }
 
     static void RefreshValue(GameState s, int item)
@@ -204,6 +213,9 @@ public static class Menu
                 break;
             case ItemAssistAutoEmp:
                 Values[item] = s.Settings.AssistAutoEmp ? On : Off;
+                break;
+            case ItemColorblind:
+                Values[item] = s.Settings.ColorblindMode ? On : Off;
                 break;
         }
     }

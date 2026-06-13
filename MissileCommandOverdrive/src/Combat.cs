@@ -171,6 +171,11 @@ public static class Combat
 
     static void SpawnBlastFlash(GameState s, float x, float y, float maxRadius)
     {
+        // §5 3.1 photosensitivity: the per-detonation white pop is a flash like
+        // the full-screen one (Renderer.cs:610) — suppress it under FlashReduction.
+        // Early-return keeps default-off behavior byte-identical and skips the
+        // wasted pool insert entirely.
+        if (s.Settings.FlashReduction) return;
         if (s.BlastFlashes.Count >= MaxBlastFlashes) return;
         s.BlastFlashes.Add(new BlastFlash
         {

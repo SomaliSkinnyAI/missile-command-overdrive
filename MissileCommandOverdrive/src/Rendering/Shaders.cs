@@ -56,6 +56,19 @@ uniform sampler2D lightTex;
 uniform float dayFactor;
 uniform float lightActive;
 
+// Feature 5.4 — theme identity. The analytic grade runs AFTER ACES and BEFORE the
+// vignette: graded = gain * pow(max(color + lift, 0), 1/gamma). Modern ships an
+// identity grade (lift 0 / gamma 1 / gain 1) so its output is unchanged. crtAmount
+// > 0 (Xbox) enables a cheap Lottes-style CRT branch (hardScan + slot mask + a bit
+// of extra barrel warp); it reuses the existing barrel-distorted uv so the warp is
+// not double-applied. lastCity (0..1) folds a red-shift desaturation in at one city
+// left — a state modifier riding the same pass as danger.
+uniform vec3 gradeLift;
+uniform vec3 gradeGamma;
+uniform vec3 gradeGain;
+uniform float crtAmount;
+uniform float lastCity;
+
 out vec4 finalColor;
 
 float hash12(vec2 p)
@@ -75,9 +88,12 @@ float vnoise(vec2 p)
 
 void main()
 {
-    // Subtle barrel distortion (~0.02)
+    // Subtle barrel distortion (~0.02). 5.4: the CRT branch reuses/extends THIS
+    // warp (it is not a second distortion) — crtAmount adds curvature so the tube
+    // bulge and the base barrel stay coordinated.
     vec2 d = fragTexCoord - 0.5;
-    vec2 uv = 0.5 + d * (1.0 + 0.02 * dot(d, d));
+    float barrel = 0.02 + crtAmount * 0.10;
+    vec2 uv = 0.5 + d * (1.0 + barrel * dot(d, d));
 
     // Render-texture wrap defaults to GL_REPEAT — clamp to half a texel
     vec2 px = 0.5 / resolution;
@@ -172,6 +188,21 @@ void main()
         col = clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
     }
 
+    // 5.4 — analytic theme grade. Identity (Modern) is a no-op: pow(c,1)=c, *1, +0.
+    // Runs in LDR (post-ACES) so both HDR and RGBA8 paths grade identically.
+    col = gradeGain * pow(max(col + gradeLift, 0.0), 1.0 / max(gradeGamma, vec3(1e-3)));
+    col = clamp(col, 0.0, 1.0);
+
+    // 5.4 — last-city red-shift: desaturate toward a danger red as the final city
+    // teeters. Distinct from `danger` (a continuous tension scalar) — this is the
+    // discrete "one left" state modifier the plan calls for.
+    if (lastCity > 0.001)
+    {
+        float lcl = dot(col, vec3(0.299, 0.587, 0.114));
+        vec3 redShift = mix(vec3(lcl), vec3(lcl * 1.25, lcl * 0.45, lcl * 0.4), 0.7);
+        col = mix(col, redShift, lastCity * 0.6);
+    }
+
     // Danger desaturation
     float luma = dot(col, vec3(0.299, 0.587, 0.114));
     col = mix(col, vec3(luma), danger * 0.25);
@@ -187,9 +218,31 @@ void main()
     float vig = smoothstep(0.0, 1.0, length(vp) / (0.85 * max(resolution.x, resolution.y)));
     col *= 1.0 - 0.42 * vig;
 
-    // Scanlines — every 3rd row, light blue, alpha 0.06 + danger*0.05
+    // Scanlines — every 3rd row, light blue, alpha 0.06 + danger*0.05.
+    // 5.4: the heavier CRT theme owns its own scanline look below, so suppress this
+    // subtle one when the CRT branch is active (avoids stacking two scan patterns).
     float scan = step(fract(suv.y * resolution.y / 3.0), 1.0 / 3.0);
-    col = mix(col, vec3(0.416, 0.710, 1.0), scan * (0.06 + danger * 0.05));
+    col = mix(col, vec3(0.416, 0.710, 1.0), scan * (0.06 + danger * 0.05) * (1.0 - crtAmount));
+
+    // 5.4 — Lottes-style CRT (Xbox theme). Cheap hardScan brightness modulation
+    // by scanline position + an aperture-grille slot mask, scaled by crtAmount so
+    // crtAmount==0 is a clean passthrough. Public-domain technique (Timothy Lottes).
+    if (crtAmount > 0.001)
+    {
+        // hardScan: a soft beam falloff between scanlines (period 3 device px)
+        float pos = fract(suv.y * resolution.y / 3.0) * 2.0 - 1.0;
+        float scanBeam = exp2(-1.7 * pos * pos);
+        // slot mask: 3-phase RGB aperture grille on a 3 device-px horizontal period
+        float ph = fract(suv.x * resolution.x / 3.0);
+        vec3 mask = vec3(0.62);
+        if (ph < 0.333)      mask.r = 1.0;
+        else if (ph < 0.666) mask.g = 1.0;
+        else                 mask.b = 1.0;
+        vec3 crtCol = col * scanBeam * mask;
+        // a hair of overdrive so the masked image keeps its brightness
+        crtCol *= 1.0 + 0.5 * crtAmount;
+        col = mix(col, crtCol, crtAmount);
+    }
 
     // Animated hash film grain, alpha 0.01 + danger*0.008 (legacy cap 0.04)
     vec2 gp = floor(suv * resolution) + floor(vec2(time * 91.0, time * 113.0));

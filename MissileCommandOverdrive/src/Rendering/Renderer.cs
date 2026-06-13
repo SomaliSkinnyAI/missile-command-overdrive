@@ -86,6 +86,9 @@ public static class Renderer
     static bool _lightsOn; // post shader live and not env-disabled, latched per frame
     static bool _lightDisabled = Environment.GetEnvironmentVariable("MCOD_NO_LIGHT") == "1";
     static int _locLightTex, _locDayFactor, _locLightActive;
+    // §5 5.4 theme grade + CRT + last-city state modifier (uploaded per frame; the
+    // grade triples are cheap vec3s, the rest scalars — all zero-alloc).
+    static int _locGradeLift, _locGradeGamma, _locGradeGain, _locCrtAmount, _locLastCity;
     // GL blend enums for Rlgl.SetBlendFactorsSeparate (raylib doesn't re-export them)
     const int GlSrcAlpha = 0x0302;
     const int GlOne = 1;
@@ -515,6 +518,10 @@ public static class Renderer
     {
         EnsureFxTargets(s);
 
+        // §4.4 mirror the colorblind toggle so the static Palette.VariantColor
+        // (no GameState handle at its call sites) reads the right hue table.
+        Palette.Colorblind = s.Settings.ColorblindMode;
+
         // §5 5.2: arm light collection for this frame's world pass. Without the
         // uber-shader there is no composite to consume the buffer — skip it all.
         _lightsOn = _postShaderActive && !_lightDisabled;
@@ -615,6 +622,14 @@ public static class Renderer
                 MathH.Clamp(dayF / 0.86f, 0f, 1f), ShaderUniformDataType.Float);
             Raylib.SetShaderValue(_postShader, _locLightActive, _lightsOn ? 1f : 0f, ShaderUniformDataType.Float);
             if (_lightsOn) Raylib.SetShaderValueTexture(_postShader, _locLightTex, _lightTarget.Texture);
+            // §5 5.4 theme grade + CRT (Modern = identity/0, diff-identical) + the
+            // last-city red-shift state modifier (1 when exactly one city stands).
+            var gp = Palette.Active(s);
+            Raylib.SetShaderValue(_postShader, _locGradeLift, gp.Lift.V, ShaderUniformDataType.Vec3);
+            Raylib.SetShaderValue(_postShader, _locGradeGamma, gp.Gamma.V, ShaderUniformDataType.Vec3);
+            Raylib.SetShaderValue(_postShader, _locGradeGain, gp.Gain.V, ShaderUniformDataType.Vec3);
+            Raylib.SetShaderValue(_postShader, _locCrtAmount, gp.CrtAmount, ShaderUniformDataType.Float);
+            Raylib.SetShaderValue(_postShader, _locLastCity, s.AliveCities == 1 ? 1f : 0f, ShaderUniformDataType.Float);
             UploadRefractionUniforms(s);
             Raylib.BeginShaderMode(_postShader);
         }
@@ -710,6 +725,12 @@ public static class Renderer
                 _locLightTex = Raylib.GetShaderLocation(_postShader, "lightTex");
                 _locDayFactor = Raylib.GetShaderLocation(_postShader, "dayFactor");
                 _locLightActive = Raylib.GetShaderLocation(_postShader, "lightActive");
+                // §5 5.4 theme grade + CRT + last-city
+                _locGradeLift = Raylib.GetShaderLocation(_postShader, "gradeLift");
+                _locGradeGamma = Raylib.GetShaderLocation(_postShader, "gradeGamma");
+                _locGradeGain = Raylib.GetShaderLocation(_postShader, "gradeGain");
+                _locCrtAmount = Raylib.GetShaderLocation(_postShader, "crtAmount");
+                _locLastCity = Raylib.GetShaderLocation(_postShader, "lastCity");
                 _postShaderActive = true;
             }
         }
@@ -1016,20 +1037,14 @@ public static class Renderer
     static void DrawSky(GameState s)
     {
         var (phase, day, night, twilight) = SkyCycle(s.Time);
+        var p = Palette.Active(s); // §5 5.4 color authority
 
-        // Night ? Day palette (top, mid, bottom)
-        var topN = ((byte)4, (byte)10, (byte)35);
-        var topD = ((byte)102, (byte)156, (byte)222);
-        var midN = ((byte)18, (byte)34, (byte)79);
-        var midD = ((byte)146, (byte)196, (byte)238);
-        var botN = ((byte)19, (byte)15, (byte)47);
-        var botD = ((byte)232, (byte)191, (byte)146);
-
-        var top = MixRgb(topN, topD, day);
-        var mid = MixRgb(midN, midD, day);
-        var botBase = MixRgb(botN, botD, day);
+        // Night ? Day palette (top, mid, bottom) — Modern holds the pre-sweep literals
+        var top = MixRgb(p.SkyTopN, p.SkyTopD, day);
+        var mid = MixRgb(p.SkyMidN, p.SkyMidD, day);
+        var botBase = MixRgb(p.SkyBotN, p.SkyBotD, day);
         // Twilight warmth
-        var bot = MixRgb(botBase, ((byte)255, (byte)164, (byte)112), twilight * 0.24f);
+        var bot = MixRgb(botBase, p.SkyTwilightWarm, twilight * 0.24f);
 
         // Sky gradient via quadratic Bezier through (top, mid, bot) — smooth C¹, no kinks.
         // B(t) = (1-t)² * top + 2(1-t)t * mid + t² * bot, with t biased so `mid` still dominates around 0.36..0.45.
@@ -1345,6 +1360,7 @@ public static class Renderer
         var (_, day, _, _) = SkyCycle(s.Time);
         float visA = MathH.Clamp(1 - day * 1.25f, 0.02f, 1);
         if (visA < 0.03f) return;
+        var p = Palette.Active(s); // §5 5.4: star core/halo hue per theme
 
         float mx = (s.MouseX - s.W * 0.5f) / s.W;
         float my = (s.MouseY - s.H * 0.5f) / s.H;
@@ -1367,8 +1383,8 @@ public static class Renderer
             byte a = (byte)(tw * 220 * visA);
             float sz = 0.2f + _starRand[ri + 2] * 1.2f;
             if (sz > 0.9f)
-                Raylib.DrawCircle((int)x, (int)y, sz * 2.5f, new Color((byte)140, (byte)170, (byte)255, (byte)(a / 12)));
-            Raylib.DrawCircle((int)x, (int)y, sz, new Color((byte)220, (byte)230, (byte)255, a));
+                Raylib.DrawCircle((int)x, (int)y, sz * 2.5f, new Color(p.StarHalo.R, p.StarHalo.G, p.StarHalo.B, (byte)(a / 12)));
+            Raylib.DrawCircle((int)x, (int)y, sz, new Color(p.StarCore.R, p.StarCore.G, p.StarCore.B, a));
         }
         Raylib.EndBlendMode();
     }
@@ -1378,13 +1394,14 @@ public static class Renderer
     {
         var (_, day, _, twilight) = SkyCycle(s.Time);
         float mx = (s.MouseX - s.W * 0.5f) / s.W;
+        var p = Palette.Active(s); // §5 5.4 mountain silhouette stops
 
-        // Far layer: top night=[30,40,78] ? day=[82,106,150], bot night=[10,12,25] ? day=[42,54,86]
-        var farTop = MixRgb(((byte)30, (byte)40, (byte)78), ((byte)82, (byte)106, (byte)150), day);
-        var farBot = MixRgb(((byte)10, (byte)12, (byte)25), ((byte)42, (byte)54, (byte)86), day);
-        // Near layer: top night=[40,42,65] ? day=[98,110,142], bot night=[11,10,20] ? day=[52,58,86]
-        var nearTop = MixRgb(((byte)40, (byte)42, (byte)65), ((byte)98, (byte)110, (byte)142), day);
-        var nearBot = MixRgb(((byte)11, (byte)10, (byte)20), ((byte)52, (byte)58, (byte)86), day);
+        // Far layer (Modern: top night=[30,40,78]→day=[82,106,150], bot night=[10,12,25]→day=[42,54,86])
+        var farTop = MixRgb(p.MtnFarTopN, p.MtnFarTopD, day);
+        var farBot = MixRgb(p.MtnFarBotN, p.MtnFarBotD, day);
+        // Near layer (Modern: top night=[40,42,65]→day=[98,110,142], bot night=[11,10,20]→day=[52,58,86])
+        var nearTop = MixRgb(p.MtnNearTopN, p.MtnNearTopD, day);
+        var nearBot = MixRgb(p.MtnNearBotN, p.MtnNearBotD, day);
 
         DrawMountLayerGradient(s, _ridgeFarRand, s.HorizonY + 70, s.H * 0.11f, 16, 0.6f,
             new Color(farTop.R, farTop.G, farTop.B, (byte)(210 + day * 10)),
@@ -1491,21 +1508,18 @@ public static class Renderer
     static void DrawGround(GameState s)
     {
         var (_, day, _, _) = SkyCycle(s.Time);
+        var p = Palette.Active(s); // §5 5.4 ground + grid authority
 
-        // Ground palette: night=[42,37,68]?[9,10,22], day=[86,84,108]?[28,30,44]
-        var gTopN = ((byte)42, (byte)37, (byte)68);
-        var gTopD = ((byte)86, (byte)84, (byte)108);
-        var gBotN = ((byte)9, (byte)10, (byte)22);
-        var gBotD = ((byte)28, (byte)30, (byte)44);
-        var gTop = MixRgb(gTopN, gTopD, day);
-        var gBot = MixRgb(gBotN, gBotD, day);
+        // Ground palette (Modern: night=[42,37,68]→[9,10,22], day=[86,84,108]→[28,30,44])
+        var gTop = MixRgb(p.GroundTopN, p.GroundTopD, day);
+        var gBot = MixRgb(p.GroundBotN, p.GroundBotD, day);
 
         Raylib.DrawRectangleGradientV(0, (int)s.GroundY - 8, (int)s.W, (int)(s.H - s.GroundY + 8),
             new Color(gTop.R, gTop.G, gTop.B, (byte)255),
             new Color(gBot.R, gBot.G, gBot.B, (byte)255));
 
         // Retro perspective grid � purple/blue lines receding toward horizon
-        var gridCol = MixRgb(((byte)90, (byte)80, (byte)160), ((byte)120, (byte)110, (byte)170), day);
+        var gridCol = MixRgb(p.GridN, p.GridD, day);
         byte gridA = (byte)((0.24f + day * 0.08f) * 255);
         var gc = new Color(gridCol.R, gridCol.G, gridCol.B, gridA);
         // Horizontal lines (closer together near horizon for perspective)
@@ -1613,6 +1627,7 @@ public static class Renderer
     {
         float cx = city.X - city.W * 0.5f;
         float cy = city.Y;
+        var pal = Palette.Active(s); // §5 5.4: per-theme window/trim hue set
         // §5 5.2: very dim warm neon pool over each alive skyline
         AddLight(city.X, city.Y - 26f, city.W * 1.05f, 255, 190, 130, 22);
         var rng = new DrawRand(city.Id.GetHashCode());
@@ -1726,9 +1741,10 @@ public static class Renderer
                     float fl = 0.3f + baseG * (0.4f + 0.3f * MathF.Sin(s.Time * speed + phase));
                     int ct = brng.Next(8);
                     byte rr, gg, bb;
-                    if (ct == 0) { rr = 255; gg = 80; bb = 200; }       // magenta (rare)
-                    else if (ct == 1) { rr = 255; gg = 220; bb = 100; } // yellow (rare)
-                    else { rr = 180; gg = 230; bb = 255; }              // cyan/white (common)
+                    // Modern: ct0 magenta (255,80,200), ct1 yellow (255,220,100), common cyan/white (180,230,255)
+                    if (ct == 0) { rr = pal.CityWindow0.R; gg = pal.CityWindow0.G; bb = pal.CityWindow0.B; }      // rare accent A
+                    else if (ct == 1) { rr = pal.CityWindow1.R; gg = pal.CityWindow1.G; bb = pal.CityWindow1.B; } // rare accent B
+                    else { rr = pal.CityWindowCommon.R; gg = pal.CityWindowCommon.G; bb = pal.CityWindowCommon.B; } // common
                     Color wc = new Color(
                         (byte)MathH.Clamp(rr * fl, 0, 255),
                         (byte)MathH.Clamp(gg * fl, 0, 255),
@@ -3705,6 +3721,11 @@ public static class Renderer
     /// shared explosion additive group.</summary>
     static void DrawBlastFlashes(GameState s)
     {
+        // Flash reduction (§5 3.1 accessibility): the per-detonation white pop is
+        // the same rapid bright-white flashing the full-screen flash is gated off
+        // for — suppress it too. Gated at the draw site (not spawn) so the quads
+        // still spawn identically and the cosmetic RNG stream stays in sync.
+        if (s.Settings.FlashReduction) return;
         foreach (var bf in s.BlastFlashes)
         {
             float a = MathH.Clamp(bf.Life / Combat.BlastFlashLife, 0f, 1f);

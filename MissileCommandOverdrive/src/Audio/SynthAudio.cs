@@ -238,6 +238,11 @@ public static class SynthAudio
 
     // §5 5.5 game-thread previous door/lift samples (hydraulic stroke-rate deltas)
     static float _hrPrevDoor, _hrPrevLift;
+    // Was the hydraulic channel driven last frame? Reseed prev=current across a
+    // destroyed/paused gap so the first live frame yields a 0 stroke rate — a
+    // field-repair snaps DoorOpen/Lift to 0 from the parked 0.5/0.45 and would
+    // otherwise read as a full-level hiss burst keyed to no actual motion.
+    static bool _hrWasLive;
 
     static float Prod01()
     {
@@ -339,6 +344,12 @@ public static class SynthAudio
         var hr = s.HellRaiser;
         if (live && hr != null && !hr.Destroyed)
         {
+            // First live frame after a destroyed/paused gap: reseed the baseline
+            // to the current pose so this frame's delta is 0. The destroyed visual
+            // is parked off-pose (Lift 0.45 / DoorOpen 0.5), and field-repair snaps
+            // it to 0 the same frame it clears Destroyed — without this the stroke
+            // rate would spike to ~0.95/dt and pop a full-level hiss with no motion.
+            if (!_hrWasLive) { _hrPrevDoor = hr.DoorOpen; _hrPrevLift = hr.Lift; }
             float strokeRate = dt > 1e-5f
                 ? (MathF.Abs(hr.DoorOpen - _hrPrevDoor) + MathF.Abs(hr.Lift - _hrPrevLift)) / dt
                 : 0f;
@@ -349,9 +360,13 @@ public static class SynthAudio
                 filterHz: 1150f,
                 aux: lifting ? 1f : 0f,
                 pan: MathH.Clamp(hr.X / s.W, 0f, 1f));
+            // Advance the baseline only while driven; idle/destroyed frames leave
+            // it frozen, so the next live frame reseeds rather than diffing stale.
+            _hrPrevDoor = hr.DoorOpen;
+            _hrPrevLift = hr.Lift;
+            _hrWasLive = true;
         }
-        _hrPrevDoor = hr?.DoorOpen ?? 0f;
-        _hrPrevLift = hr?.Lift ?? 0f;
+        else _hrWasLive = false;
 
         // Mothership: deflector hum while ShieldActive — the target freq drops
         // an octave the frame the shield falls, so the slow fade-out glides down
@@ -808,6 +823,7 @@ public static class SynthAudio
                     break;
                 case CmdKind.Loop:
                 {
+                    if ((uint)c.I0 >= MaxLoopCh) break; // bad producer index can never escape onto the render thread
                     ref LoopChannel lc = ref _loops[c.I0];
                     if (lc.Kind != c.B0)
                     {

@@ -25,6 +25,7 @@ public class Settings
     public string Theme { get; set; } = "modern";    // modern, xbox, recharged
     public bool AssistEnemySlow { get; set; }        // enemy speed ×0.8 (flags AssistedRun)
     public bool AssistAutoEmp { get; set; }          // auto-EMP when the last city is threatened
+    public bool ColorblindMode { get; set; }         // §5 5.4: blue/orange/white variant hues
 }
 
 public class GameState
