@@ -119,19 +119,43 @@ public static class PerkSystem
 
     static void Roll(GameState s)
     {
+        // §5 6.1 boss-wave reward floor: a boss wave (Level % 5 == 0) guarantees
+        // at least one ≥ Rare card. We clamp slot 0 up to Rare so the shop after
+        // a boss kill always offers a meaningful pick. (The boss KILL itself
+        // hands an Epic directly via GrantBossEpic — independent of the draft.)
+        bool bossFloor = s.Level % 5 == 0;
         for (int slot = 0; slot < 3; slot++)
         {
             s.Draft[slot] = null;
             // Rarity weights: Common .70 / Rare .25 / Epic .05.
-            // Phase 6 hook: boss waves (Level % 5 == 0) guarantee ≥ Rare —
-            // clamp `rar` up for slot 0 when the boss framework lands.
             float r = s.DraftRng.NextSingle();
             Rarity rar = r < 0.70f ? Rarity.Common : r < 0.95f ? Rarity.Rare : Rarity.Epic;
+            if (bossFloor && slot == 0 && rar == Rarity.Common) rar = Rarity.Rare;
             // Rolled tier first, then the others (the pool can run dry late-run)
             if (!FillSlot(s, slot, rar) && !FillSlot(s, slot, Rarity.Common)
                 && !FillSlot(s, slot, Rarity.Rare))
                 FillSlot(s, slot, Rarity.Epic);
         }
+    }
+
+    /// <summary>§5 6.1 boss-kill reward: install one Epic perk directly (no draft
+    /// pick needed). Falls back to the best available rarity if the Epic is
+    /// already owned, then to any offerable perk — a boss kill is never a no-op.
+    /// Called from the unified Combat boss-death path.</summary>
+    public static void GrantBossEpic(GameState s)
+    {
+        Perk? best = null;
+        foreach (var p in Pool)
+        {
+            if (s.OwnedPerks.Contains(p) || !p.CanOffer(s)) continue;
+            // Prefer the highest rarity on offer (Epic > Rare > Common).
+            if (best == null || p.Rarity > best.Rarity) best = p;
+        }
+        if (best == null) return; // pool fully owned — nothing left to grant
+        best.Apply(s);
+        s.OwnedPerks.Add(best);
+        s.Note = $"BOSS REWARD: {best.Name}";
+        s.NoteT = 2.6f;
     }
 
     static bool FillSlot(GameState s, int slot, Rarity rar)

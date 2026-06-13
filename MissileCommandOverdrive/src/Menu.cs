@@ -55,7 +55,9 @@ public static class Menu
 
     public static void Open(GameState s)
     {
-        if (s.Phase != GamePhase.Playing && s.Phase != GamePhase.Shop) return;
+        // §5 6.4: also openable from the Title menu (SETTINGS row) — RESUME then
+        // returns to the title rather than into a run.
+        if (s.Phase != GamePhase.Playing && s.Phase != GamePhase.Shop && s.Phase != GamePhase.Title) return;
         s.PhaseBeforePause = s.Phase;
         s.Phase = GamePhase.Paused;
         Sel = 0;
@@ -66,6 +68,9 @@ public static class Menu
     {
         if (s.Phase != GamePhase.Paused) return;
         s.Phase = s.PhaseBeforePause;
+        // §5 6.4: returning to the title re-arms the idle→attract timer so the
+        // demo doesn't trigger the instant settings closes.
+        if (s.Phase == GamePhase.Title) AttractSystem.Idle = 0f;
         // §5 3.2: GameState.Settings IS Profile.Data.Settings — one disk write on
         // menu close persists every slider/toggle (plus game-over/shutdown saves).
         Profile.Save();

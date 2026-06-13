@@ -10,7 +10,11 @@ public enum GamePhase
     Playing,
     Shop,
     Paused,
-    // Ceremony, — Phase 6 (initials/score ceremony) slots in here
+    // §5 6.3 end-of-run ceremony: the staged stat reveal + letter grade that
+    // precedes the (folded-in) top-10/initials tail. The run is already "dead"
+    // here — the GameOver bridge below reports true for BOTH Ceremony and
+    // GameOver so every score-freeze/auto-defense/boss/audio bail keeps working.
+    Ceremony,
     GameOver
 }
 
@@ -67,10 +71,27 @@ public class GameState
     // no-target bail-out) now sets Phase directly.
     public bool Intro => Phase == GamePhase.Title;
     public bool Shop => Phase == GamePhase.Shop;
-    public bool GameOver => Phase == GamePhase.GameOver;
+    // §5 6.3: the run is "dead" the moment the ceremony opens — score freeze
+    // (Combat.RegKill), auto-defense, boss spawns, mechanical-loop audio and the
+    // FeelDirector regular-event bail all key off this, so it must cover Ceremony
+    // AND the GameOver tail. The two phases differ only in presentation.
+    public bool GameOver => Phase == GamePhase.Ceremony || Phase == GamePhase.GameOver;
 
     public bool GameOverSfx;
     public float GameOverTime;
+
+    // §5 6.3 end-of-run ceremony: CeremonyT counts UP on rawDt from the death
+    // freeze; the stage + per-stat reveal are pure functions of it (the Ceremony
+    // helper; consumed by GameUpdate / Renderer). Grade is computed once
+    // (CeremonyGraded) and stamped with a Trauma pulse. Run-level intercept totals
+    // (run-wide accuracy — WaveStats resets per wave) feed the grade. All reset in
+    // GameInit.ResetGame.
+    public float CeremonyT;
+    public bool CeremonyGraded;     // grade computed + Trauma pulse fired (once)
+    public char CeremonyGrade = 'C';
+    public int RunKills;            // run-wide intercepts (EventKind.Kill in DrainEvents)
+    public int RunLeaks;            // run-wide leaks (GroundImpact in DrainEvents)
+    public bool CeremonyInitialsArmed; // initials entry sequenced AFTER the grade reveal
     public int Level = 1;
     public int Score;
     // §5 3.5 scrap economy: the shop currency (Score is leaderboard-pure).
@@ -102,6 +123,24 @@ public class GameState
     public float WavePause = 2f;
     public float WaveTime;
     public List<WavePlanEntry> WavePlan = [];
+    // §5 6.2 wave intro stinger: typewriter reveal of WaveTitle over the
+    // WavePause window. IntroT counts UP from 0 while bars/title ease in; any
+    // input zeroes IntroSkip-style by jumping it past the reveal. WaveTitle is
+    // composed once in StartWave (cached — the typewriter draws a substring, no
+    // per-frame concat). Boss waves suppress the typewriter (the boss banner owns
+    // the screen) — IntroBoss flags that.
+    public float WaveIntroT;
+    public bool WaveIntroDone; // collapsed by input OR fully elapsed
+    public bool WaveIntroBoss; // this wave's intro is a boss encounter
+    public string WaveTitle = "";
+    // §5 6.2 report card (replaces the old boxing Dictionary<string,object>
+    // telemetry): per-wave tallies fed by the event bus (DrainEvents) +
+    // salvage at clear. Reset in StartWave; the cleared-stamp count-up and the
+    // shop strategy panel both read it. Struct = zero heap, AOT-clean.
+    public WaveStats Wave;
+    // §5 6.2 cleared-stamp animation: armed at WaveCleared, drives the
+    // scale-3→1 ease-out-back stamp + the tally count-up (rawDt timer).
+    public float WaveClearT;
     public float FinaleStart; // wave-time where the finale segment begins (§4.5 spawn-hold exempt)
     // §4.3 forecast contract (§5 4.1): plan built & pinned at shop-open for
     // Level+1; StartWave for that level consumes this exact object — never
@@ -235,6 +274,32 @@ public class WavePlanEntry
     public bool Mirv;
 }
 
+/// <summary>§5 6.2 per-wave report-card tallies — the AOT-friendly replacement
+/// for the old boxing <c>Dictionary&lt;string,object&gt;</c> telemetry. Fed from
+/// the event bus in DrainEvents (Kills, Leaks via GroundImpact, City/Base losses)
+/// plus the salvage figure stamped at wave-clear and the city count snapshot.
+/// All ints — no allocation, copy-by-value. Reset in StartWave.</summary>
+public struct WaveStats
+{
+    public int Kills;          // enemies intercepted this wave (EventKind.Kill)
+    public int Leaks;          // enemy missiles that reached the ground (GroundImpact)
+    public int CitiesLost;     // CityDestroyed this wave
+    public int BasesLost;      // BaseDestroyed this wave
+    public int Salvage;        // scrap salvaged at clear (stamped once)
+    public int CitiesSaved;    // alive-city snapshot at clear (stamped once)
+
+    /// <summary>Intercept rate 0..100 (kills vs kills+leaks). 100 with no
+    /// engagements — a quiet wave reads as a perfect defense, not a div-by-zero.</summary>
+    public readonly int AccuracyPct
+    {
+        get
+        {
+            int shots = Kills + Leaks;
+            return shots <= 0 ? 100 : (int)MathF.Round(100f * Kills / shots);
+        }
+    }
+}
+
 public class Upgrades
 {
     public float BlastScale = 1.0f;
@@ -291,11 +356,9 @@ public struct LightningSegment
 public class DebugState
 {
     public bool Enabled;
+    // §5 6.2: the F8 overlay's per-kind event tallies — the only live debug
+    // telemetry. The old boxing Dictionary<string,object> Waves (+ the never-read
+    // session/wave-sequence scratch) was removed in favour of the AOT-clean
+    // WaveStats struct that drives the report card.
     public int[] EventCounts = new int[EventRing.KindCount];
-    public int MaxEventsPerWave = 120000;
-    public string SessionStartedAt = DateTime.UtcNow.ToString("o");
-    public string? CurrentWave;
-    public int WaveSeq;
-    public Dictionary<string, object> Waves = [];
-    public int SessionDrops;
 }

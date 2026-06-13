@@ -32,6 +32,11 @@ public static class GameUpdate
         if (s.CrosshairPop > 0) s.CrosshairPop = MathF.Max(0, s.CrosshairPop - rawDt * 6.5f);
         if (s.ComboPop > 0) s.ComboPop = MathF.Max(0, s.ComboPop - rawDt * 3.4f);
         if (s.LowAmmoTickCd > 0) s.LowAmmoTickCd = MathF.Max(0, s.LowAmmoTickCd - rawDt);
+        // §5 6.2 wave stinger timers (presentation — rawDt, so they ease through
+        // any hit-stop). The intro runs while the wave-pause letterbox holds and
+        // self-completes once the title has finished typing + lingered; the
+        // cleared-stamp count-up runs after the wave-clear arms WaveClearT.
+        UpdateWaveStinger(s, rawDt);
         // §5 4.4 odometer: DisplayScore chases Score — rate ∝ gap with a min step
         // so small awards still visibly roll; Score only ever drops on reset, so
         // a downward gap snaps (no reverse-rolling wheels)
@@ -83,9 +88,21 @@ public static class GameUpdate
             if (s.FloatingTexts[i].Life <= 0) s.FloatingTexts.RemoveAt(i);
         }
 
-        if (s.Phase == GamePhase.GameOver)
+        // §5 6.3 ceremony + the folded-in GameOver tail: the world keeps burning
+        // behind the overlay (the sim already updated during GameOver). simDt is
+        // held at TimeScale 0.3 during the ceremony (set on the death edge below)
+        // so the backdrop smoulders rather than races; score is frozen in RegKill.
+        if (s.Phase == GamePhase.Ceremony || s.Phase == GamePhase.GameOver)
         {
-            s.GameOverTime += rawDt;
+            // §4.5: UpdateIntensity is unreachable past the early-return below, so
+            // the shared tension signal would otherwise freeze at the (usually
+            // high) value it held at death and keep the music director banging
+            // under the reflective ceremony. Wind it down here on rawDt (simDt is
+            // hit-stopped to 0 during the death freeze) so the score strips out.
+            s.Intensity *= MathF.Exp(-rawDt / 0.8f);
+            if (s.Intensity < 0.01f) s.Intensity = 0;
+            if (s.Phase == GamePhase.Ceremony) UpdateCeremony(s, rawDt);
+            else s.GameOverTime += rawDt;
             UpdEnemies(s, simDt);
             UpdUfo(s, simDt);
             UpdRaiders(s, simDt);
@@ -256,7 +273,14 @@ public static class GameUpdate
         if (s.Phase == GamePhase.Playing
             && s.SpawnI >= s.WavePlan.Count
             && s.Enemies.Count == 0 && s.UFOs.Count == 0 && s.Raiders.Count == 0
-            && s.Explosions.Count == 0 && s.Shockwaves.Count == 0)
+            && s.Explosions.Count == 0 && s.Shockwaves.Count == 0
+            // §5 6.1: a live boss holds the wave open. The Mothership masks this
+            // via HoldSpawning (SpawnI never reaches WavePlan.Count), but the
+            // Daemon has no such hold — without this gate a Daemon wave clears to
+            // the Shop with the boss still alive, attacking, and unkillable
+            // (LaunchPlayer is disabled in the Shop). Mirrors FeelDirector's
+            // wave-final gate (FeelDirector.cs).
+            && s.Demon == null && s.Mothership == null && s.Fighters.Count == 0)
         {
             s.Phase = GamePhase.Shop;
             s.ShopTimer = 18.0f;
@@ -272,6 +296,13 @@ public static class GameUpdate
                 s.Note = $"Salvage recovered: +{salvage} scrap"; // once per wave — not a hot path
                 s.NoteT = 2.0f;
             }
+            // §5 6.2 report card: stamp the once-per-clear tallies and arm the
+            // CLEARED stamp + count-up. AliveCities is fresh (recounted at the top
+            // of UpdateAll and kept at destroy sites). The stamp animates over the
+            // shop panel's opening beat.
+            s.Wave.Salvage = salvage;
+            s.Wave.CitiesSaved = s.AliveCities;
+            s.WaveClearT = WaveClearHold;
             // §5 3.5 deterministic repairs: one free repair earned per 3 cleared
             // waves; banked (counter holds) while nothing is damaged
             s.Upgrades.WavesSinceFreeRepair++;
@@ -302,22 +333,84 @@ public static class GameUpdate
             }
         }
 
-        // Game over check
-        if (aliveCities <= 0)
-        {
-            if (s.Phase != GamePhase.GameOver)
-            {
-                s.GameOverTime = 0;
-                Audio.SynthAudio.GameOver();
-            }
-            s.Phase = GamePhase.GameOver;
-            s.Note = "Defense grid collapsed";
-            s.NoteT = 2.2f;
-        }
-        if (s.Phase == GamePhase.GameOver) s.GameOverTime += rawDt;
+        // Game over check → §5 6.3 ceremony (the GameOver tail is folded into it).
+        // The run is dead: open the ceremony, slam a 120 ms freeze, and bend the
+        // smouldering backdrop into slow-mo so the reveals breathe.
+        if (aliveCities <= 0 && s.Phase == GamePhase.Playing)
+            EnterCeremony(s);
 
         UpdateDanger(s);
         UpdateIntensity(s, simDt);
+    }
+
+    // §5 6.3: the single death edge (this and WaveSystem's no-target bail-out both
+    // call here). Profile.OnGameOver still fires from Program.cs on the phase edge;
+    // the initials ENTRY is gated until after the grade reveals (CeremonyInitialsArmed).
+    public static void EnterCeremony(GameState s)
+    {
+        s.Phase = GamePhase.Ceremony;
+        s.CeremonyT = 0;
+        s.CeremonyGraded = false;
+        s.CeremonyInitialsArmed = false;
+        s.GameOverTime = 0;
+        s.HitStop = MathF.Max(s.HitStop, Ceremony.Freeze); // §6.3 120 ms death freeze
+        s.TimeScale = 0.3f;                                 // backdrop smoulders, not races
+        s.TimeScaleTarget = 0.3f;
+        Audio.SynthAudio.GameOver();
+        s.Note = "Defense grid collapsed";
+        s.NoteT = 2.2f;
+    }
+
+    // §5 6.3 ceremony timeline (rawDt — advances through the death freeze). Computes
+    // the grade once at Ceremony.GradeAt with a Trauma pulse, then arms initials.
+    static void UpdateCeremony(GameState s, float rawDt)
+    {
+        s.CeremonyT += rawDt;
+        if (!s.CeremonyGraded && s.CeremonyT >= Ceremony.GradeAt)
+        {
+            s.CeremonyGraded = true;
+            s.CeremonyGrade = Ceremony.ComputeGrade(s);
+            s.AddTrauma(Ceremony.GradePulse); // §6.3 grade-stamp punch
+        }
+        // Once the grade has landed and the summary has dwelled, hand off to the
+        // GameOver tail — the existing top-10 table / seed / initials / retry screen
+        // (Profile.OnGameOver fires on that phase edge in Program.cs; it inserts the
+        // row and arms the initials ceremony AFTER the grade, per the plan). Folded
+        // in, not duplicated.
+        if (s.CeremonyGraded && s.CeremonyT >= Ceremony.TailAt)
+            HandoffToTail(s);
+    }
+
+    static void HandoffToTail(GameState s)
+    {
+        s.CeremonyInitialsArmed = true;
+        s.Phase = GamePhase.GameOver;
+        s.GameOverTime = 0;
+    }
+
+    /// <summary>§5 6.3: any keypress skips the current ceremony stage. Before the
+    /// grade lands it fast-forwards to the summary (grade shown, count-ups
+    /// complete); on/after the summary it advances straight to the GameOver tail.
+    /// Called from Program.HandleInput.</summary>
+    public static void SkipCeremony(GameState s)
+    {
+        if (s.CeremonyT < Ceremony.SummaryAt)
+        {
+            // First skip: land the grade immediately and jump to the summary —
+            // the verdict (grade + counted-up stats) is shown and dwells there.
+            if (!s.CeremonyGraded)
+            {
+                s.CeremonyGraded = true;
+                s.CeremonyGrade = Ceremony.ComputeGrade(s);
+                s.AddTrauma(Ceremony.GradePulse);
+            }
+            s.CeremonyT = Ceremony.SummaryAt;
+        }
+        else
+        {
+            // Second skip (already at the summary): advance to the GameOver tail.
+            HandoffToTail(s);
+        }
     }
 
     // §4.5 spawn-hold gate — tuned so only sustained, multi-source stress trips it
@@ -355,6 +448,58 @@ public static class GameUpdate
         float raw = 0.34f * city + 0.30f * inbound + 0.20f * nearMiss + 0.16f * scarcity;
         float k = 1f - MathF.Exp(-dt / 2f);
         s.Intensity += (MathH.Clamp(raw, 0, 1) - s.Intensity) * k;
+    }
+
+    // §5 6.2 wave-stinger timings (presentation seconds). The typewriter reveals
+    // one glyph every IntroCharStep; the title finishes well inside the regular
+    // 2.9 s WavePause, then lingers before self-completing. The cleared stamp's
+    // count-up runs over WaveClearCountDur after the WaveClear arms WaveClearT.
+    public const float IntroCharStep = 0.045f;
+    public const float IntroLinger = 0.7f;
+    public const float WaveClearCountDur = 1.1f;
+    public const float WaveClearHold = 2.0f; // stamp + tallies stay up this long total
+
+    /// <summary>§5 6.2 — advance the wave-intro typewriter (per-char synth tick)
+    /// and the wave-cleared count-up. Both run on rawDt. The intro plays only on
+    /// regular (non-boss) waves while the WavePause letterbox holds; boss waves
+    /// keep their 6.1 banner and leave the typewriter idle. Any input collapse is
+    /// applied in HandleInput via CollapseWaveIntro.</summary>
+    static void UpdateWaveStinger(GameState s, float rawDt)
+    {
+        // Intro: arm only while the wave-pause window is open and the player has
+        // not collapsed it. Boss waves (WaveIntroBoss) own the screen with the
+        // boss banner, so the typewriter is suppressed there.
+        if (s.Phase == GamePhase.Playing && s.WavePause > 0f
+            && !s.WaveIntroBoss && !s.WaveIntroDone && s.WaveTitle.Length > 0)
+        {
+            int prevChars = (int)(s.WaveIntroT / IntroCharStep);
+            s.WaveIntroT += rawDt;
+            int nowChars = (int)(s.WaveIntroT / IntroCharStep);
+            // One synth tick per newly-revealed NON-space glyph (spaces type
+            // silently — reads as a real typewriter, not a metronome).
+            int total = s.WaveTitle.Length;
+            for (int c = prevChars; c < nowChars && c < total; c++)
+                if (s.WaveTitle[c] != ' ') Audio.SynthAudio.UiClick();
+            // Self-complete once the full title has typed and lingered.
+            if (s.WaveIntroT >= total * IntroCharStep + IntroLinger)
+                s.WaveIntroDone = true;
+        }
+
+        // Cleared stamp + count-up: armed at the wave-clear site; runs while the
+        // shop is open (the stamp animates over the shop panel's first beat).
+        if (s.WaveClearT > 0f)
+            s.WaveClearT = MathF.Max(0f, s.WaveClearT - rawDt);
+    }
+
+    /// <summary>§5 6.2 — collapse the wave intro instantly on any input. Idempotent;
+    /// marks it done so DrawWaveIntro stops rendering this frame (the stinger
+    /// vanishes at once — "any input collapses it instantly"). The clamped
+    /// WaveIntroT keeps the self-complete predicate consistent if re-queried.</summary>
+    public static void CollapseWaveIntro(GameState s)
+    {
+        if (s.WaveIntroDone) return;
+        s.WaveIntroT = s.WaveTitle.Length * IntroCharStep + IntroLinger;
+        s.WaveIntroDone = true;
     }
 
     // --- Enemy Update ---

@@ -98,9 +98,65 @@ public static class SynthAudio
     static float _masterVol = 0.54f;
     static bool _muted;
 
-    // Game-thread beat clock (spawns cross as commands)
-    static float _beatTimer;
-    static float _beatStep = 0.42f;
+    // ── §5 6.5 procedural music director ──
+    // 16-step sequencer advanced SAMPLE-ACCURATELY inside the callback. Stems are
+    // gated by s.Intensity (§4.5, the ONE tension signal) and spawned directly
+    // into the voice pool at the exact sample offset of each step boundary, all on
+    // BusMusic so the existing sidechain duck pulls them under impacts and the
+    // music volume slider/mute govern level. Anti-fatigue (§R5): sparse by default,
+    // per-wave pattern + key rotation, swing + velocity humanization via _prodRand.
+    const int SeqSteps = 16;
+    // Tempo floor/ceiling in seconds-per-16th. The director is intentionally slower
+    // and steadier than the old kick clock so a 30-min session never feels frantic.
+    const float SeqStepHi = 0.20f;   // ~75 BPM (16ths), low intensity / Title-Shop
+    const float SeqStepLo = 0.125f;  // ~120 BPM at peak intensity
+    const float SeqSwing = 0.012f;    // base off-beat delay (s); humanized per hit
+    // Minor-pentatonic scale degrees (semitones) — the harmonic palette for the
+    // whole director. Roots transpose by wave; bass/arp/lead pick from this set.
+    static readonly int[] PentaSemis = { 0, 3, 5, 7, 10 };
+    // Per-pattern step bitmasks tested as (mask & (1 << step)), so the RIGHTMOST
+    // bit is step 0 — the downbeat. Read each literal right-to-left for the groove.
+    // Two rotating variants per stem (selected by wave parity) keep the loop from
+    // being audibly periodic across a long session.
+    // Kick: four-on-the-floor (0,4,8,12) / a syncopated variant.
+    static readonly ushort[] KickPat = { 0b0001_0001_0001_0001, 0b0001_0001_0010_0001 };
+    // Hat: straight 8ths on the off-steps / a busier variant.
+    static readonly ushort[] HatPat = { 0b0101_0101_0101_0101, 0b0101_0100_1101_0100 };
+    // Bass: roots on 0 and the &-of-3 / a walking variant.
+    static readonly ushort[] BassPat = { 0b0001_0100_0100_0001, 0b0010_0001_0001_1001 };
+    // Arp: 16th texture on the up-steps / a sparser variant.
+    static readonly ushort[] ArpPat = { 0b1010_1010_1010_1010, 0b0100_1010_0101_0010 };
+    // Lead: a couple of stabs per bar, off the downbeat.
+    static readonly ushort[] LeadPat = { 0b0100_0000_0001_0000, 0b0000_0100_0000_0001 };
+    // Boss ostinato: a heavy two-against-three pulse / an alternating variant.
+    static readonly ushort[] BossPat = { 0b0100_0001_0100_0001, 0b0000_0101_0000_0101 };
+    // Arp/lead degree walks (indices into PentaSemis), one per pattern variant.
+    static readonly int[][] ArpWalk = {
+        new[] { 0, 2, 4, 2, 1, 3, 4, 3 },
+        new[] { 0, 3, 2, 4, 1, 4, 2, 3 },
+    };
+
+    // §6.5 cross-thread music params via a DOUBLE-BUFFERED SEQLOCK (§4.5: NOT bare
+    // multi-field struct writes — Volatile can't make a multi-field publish atomic).
+    // Producer (game thread) writes the back buffer, then bumps an odd→even version
+    // with release fences; consumer (audio thread) snapshots between two equal even
+    // reads. These are continuous "latest-state" params (intensity/key/phase), which
+    // is exactly what a seqlock is for — the discrete-event ring stays for spawns.
+    struct MusicParams
+    {
+        public float Intensity;  // s.Intensity, [0,1] — the master gate + tempo driver
+        public float TempoScale; // slow-mo factor [0.25,1] — stretches the step period
+        public int Root;         // transpose in semitones, keyed to wave number
+        public byte PatSel;      // pattern-variant select (0/1), rotates per wave
+        public bool Boss;        // (s.Mothership != null || s.Demon != null)
+        public bool Quiet;       // Title/Shop/GameOver — strip to a pad only
+    }
+    static MusicParams _mpA, _mpB;       // double buffer
+    static int _mpVersion;               // even = stable; odd = write in progress
+    // Audio-thread sequencer state (only the render path touches these post-Init)
+    static int _seqStep;                 // 0..15 current step
+    static float _seqSamplesToStep;      // fractional sample countdown to next step
+    static MusicParams _mpLive;          // last consistent snapshot (render thread)
 
     enum WaveType : byte { Sine, Square, Sawtooth, Triangle, Noise }
     enum FilterMode : byte { None, LP, BP, HP }
@@ -291,16 +347,19 @@ public static class SynthAudio
 
     /// <summary>Call every frame. dt must be rawDt (§4.6 — pumping/params never stall);
     /// timeScale only bends beat tempo and voice pitch.</summary>
+    // Game-thread cache: the title attract backdrop runs a live auto-played sim
+    // that can fire run-level stings (GameOver/WaveStab); suppress them so the
+    // title screen stays musically quiet.
+    static bool _titleSilent;
+
     public static void Update(GameState s, float dt, float timeScale = 1f)
     {
         if (!_initialized) return;
+        _titleSilent = s.Phase == GamePhase.Title;
 
-        float inten = MathH.Clamp(s.Danger * 0.78f + s.Level * 0.035f, 0, 1);
-        _beatStep = MathF.Max(0.14f, 0.42f - s.Level * 0.009f - inten * 0.08f);
-        // §4.7: _beatStep is overwritten above every frame, so slow-mo scaling
-        // must apply here, after the recompute
+        // §4.7: slow-mo only bends voice pitch + (via the seqlock) the sequencer
+        // tempo; it is applied as a parameter, never as a recompute on this thread.
         float ts = MathH.Clamp(timeScale, 0.25f, 1f);
-        _beatStep /= ts;
 
         // Danger hum, slow-mo pitch bend, master/mute — cross as one command
         Enqueue(new AudioCmd
@@ -387,20 +446,11 @@ public static class SynthAudio
                 pan: 0.5f); // <120 Hz mono rule — detuned partials carry the width
         }
 
-        // Beat clock (game thread; voices cross as spawn commands) → Music bus.
-        // The kick fires a light sidechain accent that scales with intensity —
-        // the Ambient bed pumps with the groove (§5 3.4).
-        _beatTimer -= dt;
-        if (_beatTimer <= 0 && !s.GameOver && !s.Intro)
-        {
-            _beatTimer = _beatStep;
-            AddVoice(new VoiceDesc { Type = WaveType.Sine, Freq = 92 + s.Level * 2, FreqEnd = 46,
-                Volume = 0.08f + inten * 0.12f, Duration = 0.2f, Priority = PrioBeat, Bus = BusMusic });
-            if (inten > 0.58f)
-                AddVoice(new VoiceDesc { Type = WaveType.Triangle, Freq = 220 + inten * 90, FreqEnd = 145,
-                    Volume = 0.01f + inten * 0.015f, Duration = 0.13f, Priority = PrioBeat, Bus = BusMusic });
-            Duck(0.1f + inten * 0.08f);
-        }
+        // §6.5: publish the music-director state to the audio thread (seqlock).
+        // The 16-step sequencer itself runs sample-accurately inside the callback;
+        // here we only cross the latest tension/key/phase. Boss-active follows the
+        // plan's contract: any boss instance present (not just .Active).
+        PublishMusic(s, ts);
 
         // Polled fallback: pump the same synth core from the game thread
         if (_polled && Raylib.IsAudioStreamProcessed(_stream))
@@ -530,6 +580,45 @@ public static class SynthAudio
             P3 = aux, P4 = MathF.Cos(a) * Sqrt2, P5 = MathF.Sin(a) * Sqrt2 });
     }
 
+    /// <summary>§6.5 seqlock publish (game thread). Writes the inactive buffer,
+    /// then flips the version odd→even so the consumer only ever reads a fully
+    /// consistent snapshot. Per-wave pattern + key rotation derives from s.Level
+    /// (a deterministic transpose so a 30-min session never loops audibly — and
+    /// drawn from neither the plan stream nor _prodRand, so SELFTEST is untouched).</summary>
+    static void PublishMusic(GameState s, float tempoScale)
+    {
+        // Root walks a perfect-fourth circle by wave so consecutive waves modulate;
+        // ±7 semitone span keeps it in a comfortable register over a long session.
+        int root = ((s.Level * 5) % 13) - 6;
+        bool boss = s.Mothership != null || s.Demon != null;
+        // Title/Shop/GameOver strip to a pad. (Paused keeps the current pad too —
+        // Update still pumps every phase per §4.6, and a frozen pad reads as "held".)
+        bool quiet = s.Phase == GamePhase.Title || s.Phase == GamePhase.Shop
+            || s.Phase == GamePhase.GameOver || s.Phase == GamePhase.Paused
+            || s.Phase == GamePhase.Ceremony; // strip to the pad during the death ceremony
+
+        var p = new MusicParams
+        {
+            Intensity = MathH.Clamp(s.Intensity, 0f, 1f),
+            TempoScale = tempoScale,
+            Root = root,
+            PatSel = (byte)(s.Level & 1),
+            Boss = boss,
+            Quiet = quiet,
+        };
+
+        // Seqlock over a double buffer. Versions are always even when stable; bit
+        // (version>>1)&1 selects the CURRENTLY-PUBLISHED buffer, so the producer
+        // writes the OTHER one, then advances the version by 2 — which both flips
+        // that select bit (publishing the fresh buffer) and signals readers that
+        // raced an in-progress write to retry. The odd intermediate value is the
+        // "write in progress" marker the consumer spins on.
+        int ver = _mpVersion;                  // even (single producer)
+        Volatile.Write(ref _mpVersion, ver + 1); // odd — write in progress
+        if ((((ver >> 1) & 1)) == 0) _mpB = p; else _mpA = p; // write the idle buffer
+        Volatile.Write(ref _mpVersion, ver + 2); // even — publishes the buffer just written
+    }
+
     static void Enqueue(in AudioCmd cmd)
     {
         int tail = _cmdTail; // single producer: game thread
@@ -560,6 +649,15 @@ public static class SynthAudio
     {
         ProcessCommands();
 
+        // §6.5 snapshot the music-director params once per block (tear-free), then
+        // derive this block's step period in samples. Intensity drives tempo; the
+        // slow-mo TempoScale stretches it. The per-step countdown is fractional and
+        // carried across blocks, so beats land sample-exact regardless of block size.
+        SnapshotMusic();
+        float stepSec = MathH.Lerp(SeqStepHi, SeqStepLo, _mpLive.Intensity)
+            / MathH.Clamp(_mpLive.TempoScale, 0.25f, 1f);
+        float stepSamples = stepSec * SampleRate;
+
         // §5 5.5 watchdog: flag loop channels whose params went quiet for 0.25 s.
         // _loopClock is constant within the block, so this is a per-block check;
         // a fresh stamp from ProcessCommands above clears the flag.
@@ -568,6 +666,23 @@ public static class SynthAudio
 
         for (int i = 0; i < frames; i++)
         {
+            // §6.5 sample-accurate sequencer: when the countdown elapses, advance to
+            // the next step and fire its stems AT THIS SAMPLE — the voices spawned
+            // below begin rendering from index i, so there is zero frame-quantized
+            // jitter. The fractional remainder rolls into the next step period.
+            _seqSamplesToStep -= 1f;
+            if (_seqSamplesToStep <= 0f)
+            {
+                _seqStep = (_seqStep + 1) & (SeqSteps - 1);
+                FireStep(_seqStep);
+                // Swing: delay odd 16ths a hair, humanized so it never sounds robotic.
+                float swing = (_seqStep & 1) == 1
+                    ? (SeqSwing * (0.6f + (NextNoise() * 0.5f + 0.5f) * 0.8f)) * SampleRate
+                    : 0f;
+                _seqSamplesToStep += stepSamples + swing;
+                if (_seqSamplesToStep < 1f) _seqSamplesToStep = 1f; // guard tiny periods
+            }
+
             _atMaster += (_atMasterT - _atMaster) * MasterCoef;
             _atPitch += (_atPitchT - _atPitch) * PitchCoef;
             _atDanger += (_atDangerT - _atDanger) * DangerCoef;
@@ -802,6 +917,186 @@ public static class SynthAudio
 
         // Watchdog timebase: wrapping int subtraction stays correct at rollover
         _loopClock += frames;
+    }
+
+    /// <summary>§6.5 seqlock snapshot (render thread). Acquire-reads the version,
+    /// copies the published buffer, then re-reads: an even, unchanged version means
+    /// the copy was tear-free. Bounded retries (never spin in real-time); on a lost
+    /// race the previous consistent snapshot is kept — one stale block is inaudible.</summary>
+    static void SnapshotMusic()
+    {
+        for (int attempt = 0; attempt < 4; attempt++)
+        {
+            int v1 = Volatile.Read(ref _mpVersion); // acquire
+            if ((v1 & 1) != 0) continue;            // writer mid-flight — retry
+            MusicParams snap = (((v1 >> 1) & 1) == 0) ? _mpA : _mpB;
+            int v2 = Volatile.Read(ref _mpVersion); // re-acquire
+            if (v1 == v2) { _mpLive = snap; return; } // consistent → commit
+        }
+        // Lost every race: keep _mpLive (last good). Steady-state this never trips.
+    }
+
+    /// <summary>§6.5 audio-thread stem spawn. Builds a Voice in place and hands it
+    /// to the pooled SpawnVoice — NO ring, NO allocation, NO producer RNG. Spawned
+    /// inside the per-sample loop, so the voice's first rendered sample IS the step
+    /// boundary: stepping is sample-exact with no frame quantization. Humanization
+    /// (velocity/detune) uses the audio-thread noise (NextNoise), never _prodRand.</summary>
+    static void SpawnStem(WaveType type, float freq, float freqEnd, float volume,
+        float duration, float attack, float decay, byte priority, float pan,
+        FilterMode filter, float q)
+    {
+        float pan2 = freq < SubMonoHz ? 0.5f : 0.5f + (MathH.Clamp(pan, 0f, 1f) - 0.5f) * PanCeiling;
+        float a = pan2 * (MathF.PI * 0.5f);
+
+        int dur = (int)(duration * SampleRate);
+        if (dur < 16) dur = 16;
+        int atk = (int)(attack * dur);
+        if (atk < 0) atk = 0;
+        if (atk > dur - 1) atk = dur - 1;
+        float decaySamples = MathF.Max(1f, (dur - atk) / (1f + MathF.Max(0f, decay)));
+
+        var v = new Voice
+        {
+            Active = true,
+            Type = (byte)type,
+            Priority = priority,
+            Volume = volume,
+            Freq = freq,
+            FreqStep = (freqEnd - freq) / dur,
+            Env = atk == 0 ? 1f : 0f,
+            AttackLeft = atk,
+            AttackMul = atk > 0 ? MathF.Exp(-4.6f / atk) : 0f,
+            DecayMul = MathF.Exp(-6.907755f / decaySamples),
+            SamplesLeft = dur,
+            Bus = BusMusic, // §6.5: all stems duck under impacts via the existing sidechain
+            Reverb = 0f,
+        };
+        v.TGainL = MathF.Cos(a) * Sqrt2;
+        v.TGainR = MathF.Sin(a) * Sqrt2;
+        v.GainL = v.TGainL;
+        v.GainR = v.TGainR;
+        if (type == WaveType.Noise)
+        {
+            var mode = filter == FilterMode.None ? FilterMode.LP : filter;
+            float fs = MathH.Clamp(MathF.Tau * freq * InvSR, 1e-4f, 0.95f);
+            float fe = MathH.Clamp(MathF.Tau * freqEnd * InvSR, 1e-4f, 0.95f);
+            v.FilterMode = (byte)mode;
+            v.FilterF = fs;
+            v.FilterFMul = MathF.Exp(MathF.Log(fe / fs) / dur);
+            v.FilterQ = q;
+        }
+        SpawnVoice(in v);
+    }
+
+    /// <summary>§6.5 semitone → Hz (equal temperament, A440-relative octaves).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static float SemiToHz(int semi) => 440f * MathF.Pow(2f, semi / 12f);
+
+    /// <summary>§6.5 RENDER-THREAD duck trigger. The kick fires the sidechain from
+    /// inside the callback, so it must NOT use Enqueue() (that is the single-producer
+    /// game-thread ring). It writes the same _duckTarget/_duckAtkLeft state the
+    /// CmdKind.Duck handler does — summed-not-stacked via max — directly.</summary>
+    static void DuckAudioThread(float depth)
+    {
+        _duckTarget = MathF.Min(DuckCap, MathF.Max(MathF.Max(_duckTarget, _duckEnv),
+            MathH.Clamp(depth, 0f, DuckCap)));
+        _duckAtkLeft = DuckAtkSamples;
+    }
+
+    /// <summary>§6.5 fire one sequencer step's stems (audio thread). Reads _mpLive
+    /// (already snapshotted this block). Stems gate on intensity: kick+hat skeleton
+    /// always; sub-bass ≥0.3; arp ≥0.5; lead ≥0.8; a boss tritone/brass ostinato
+    /// supersedes the melodic stems while a boss is present; Quiet phases play only
+    /// a held pad on downbeats. Velocity/timing humanized via NextNoise.</summary>
+    static void FireStep(int step)
+    {
+        ref MusicParams m = ref _mpLive;
+        float inten = m.Intensity;
+        int sel = m.PatSel & 1;
+        int root = m.Root;
+        // Velocity humanization: ±12% per hit so repeated steps never sound stamped.
+        float vel = 0.88f + (NextNoise() * 0.5f + 0.5f) * 0.24f;
+
+        if (m.Quiet)
+        {
+            // Title/Shop/Paused/GameOver: a sparse held pad on the downbeat only.
+            if (step == 0)
+            {
+                int pr = -24 + root; // deep, calm
+                SpawnStem(WaveType.Triangle, SemiToHz(pr), SemiToHz(pr),
+                    0.05f, 2.6f, 0.5f, 0.4f, PrioBeat, 0.45f, FilterMode.None, 1f);
+                SpawnStem(WaveType.Sine, SemiToHz(pr + 7), SemiToHz(pr + 7),
+                    0.035f, 2.6f, 0.55f, 0.4f, PrioBeat, 0.55f, FilterMode.None, 1f);
+            }
+            return;
+        }
+
+        if (m.Boss)
+        {
+            // Boss ostinato: low-brass pulse + a tritone above on the BossPat steps.
+            if ((BossPat[sel] & (1 << step)) != 0)
+            {
+                int br = -22 + root;
+                SpawnStem(WaveType.Sawtooth, SemiToHz(br), SemiToHz(br - 2),
+                    (0.11f + inten * 0.05f) * vel, 0.34f, 0.01f, 1.1f, PrioBeat, 0.5f,
+                    FilterMode.None, 1f);
+                SpawnStem(WaveType.Square, SemiToHz(br + 6), SemiToHz(br + 6), // +6 = tritone
+                    (0.05f + inten * 0.03f) * vel, 0.26f, 0.02f, 1.3f, PrioBeat, 0.5f,
+                    FilterMode.None, 1f);
+            }
+            // The skeleton still drives the boss groove underneath.
+        }
+
+        // ── Always-on skeleton: kick + hat ──
+        if ((KickPat[sel] & (1 << step)) != 0)
+        {
+            SpawnStem(WaveType.Sine, 92f, 44f, (0.10f + inten * 0.10f) * vel,
+                0.20f, 0.0f, 1.2f, PrioBeat, 0.5f, FilterMode.None, 1f);
+            // Light sidechain accent so Ambient/Music pump with the kick (§5 3.4).
+            // Render-thread path — must not touch the game-thread command ring.
+            DuckAudioThread(0.08f + inten * 0.06f);
+        }
+        if ((HatPat[sel] & (1 << step)) != 0)
+        {
+            // BP-noise hat; off-beats slightly quieter for groove.
+            float hv = ((step & 1) == 0 ? 0.06f : 0.04f) * vel;
+            SpawnStem(WaveType.Noise, 7200f, 6400f, hv, 0.045f, 0.0f, 2.2f,
+                PrioBeat, 0.52f, FilterMode.BP, 0.6f);
+        }
+
+        if (m.Boss) return; // boss ostinato replaces the melodic stems
+
+        // ── Sub-bass roots (minor pentatonic), ≥0.3 intensity ──
+        if (inten >= 0.30f && (BassPat[sel] & (1 << step)) != 0)
+        {
+            int deg = PentaSemis[(step >> 1) % PentaSemis.Length];
+            int note = -24 + root + deg; // deep root (mono-sub register)
+            SpawnStem(WaveType.Triangle, SemiToHz(note), SemiToHz(note),
+                (0.12f + inten * 0.05f) * vel, 0.26f, 0.005f, 1.0f, PrioBeat, 0.5f,
+                FilterMode.None, 1f);
+        }
+
+        // ── Arp, ≥0.5 intensity ──
+        if (inten >= 0.50f && (ArpPat[sel] & (1 << step)) != 0)
+        {
+            int[] walk = ArpWalk[sel];
+            int deg = PentaSemis[walk[step % walk.Length] % PentaSemis.Length];
+            int note = root + deg; // mid register
+            // Pan the arp gently by step for a touch of stereo movement.
+            float pan = 0.42f + ((step & 3) * 0.04f);
+            SpawnStem(WaveType.Square, SemiToHz(note), SemiToHz(note),
+                (0.045f + inten * 0.03f) * vel, 0.13f, 0.004f, 1.6f, PrioBeat, pan,
+                FilterMode.None, 1f);
+        }
+
+        // ── Lead stabs, ≥0.8 intensity ──
+        if (inten >= 0.80f && (LeadPat[sel] & (1 << step)) != 0)
+        {
+            int deg = PentaSemis[(step >> 1) % PentaSemis.Length];
+            int note = 12 + root + deg; // an octave up — a bright stab
+            SpawnStem(WaveType.Sawtooth, SemiToHz(note), SemiToHz(note - 2),
+                0.06f * vel, 0.22f, 0.006f, 1.0f, PrioBeat, 0.5f, FilterMode.None, 1f);
+        }
     }
 
     static void ProcessCommands()
@@ -1102,6 +1397,7 @@ public static class SynthAudio
     /// <summary>Game over — descending sawtooth.</summary>
     public static void GameOver()
     {
+        if (_titleSilent) return; // don't sting on attract-backdrop wipes
         AddVoice(new VoiceDesc { Type = WaveType.Sawtooth, Freq = 170, FreqEnd = 42,
             Volume = 0.22f, Duration = 1.2f, Attack = 0.01f, Decay = 0.7f, Priority = PrioHigh });
     }
@@ -1245,6 +1541,7 @@ public static class SynthAudio
     /// <summary>Wave-banner stab — saw fifth over a square sub edge (StartWave).</summary>
     public static void WaveStab()
     {
+        if (_titleSilent) return; // attract backdrop loops waves; keep the title quiet
         AddVoice(new VoiceDesc { Type = WaveType.Sawtooth, Freq = 196, FreqEnd = 185,
             Volume = 0.13f, Duration = 0.3f, Attack = 0.03f, Decay = 1.5f,
             Priority = PrioMed, Bus = BusUi });

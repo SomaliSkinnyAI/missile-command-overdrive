@@ -17,6 +17,12 @@ public static class FeelDirector
     const float MultiKillRearm = 0.8f;
     const float WaveFinalScale = 0.25f;
     const float WaveFinalEase = 0.8f;
+    // §5 6.1 boss feel: phase crossings punch with a short freeze, the killing
+    // blow gets a heavy freeze + directed slow-mo.
+    const float BossPhaseHitStop = 0.12f;
+    const float BossDeathHitStop = 0.18f;
+    const float BossDeathScale = 0.3f;
+    const float BossDeathEase = 1.0f;
 
     static float _clock; // real-time clock (rawDt), never frozen
 
@@ -99,6 +105,17 @@ public static class FeelDirector
                     _waveSlowmoFired = true;
                     SlowMo(s, WaveFinalScale, WaveFinalEase);
                 }
+                break;
+
+            case EventKind.BossPhase:
+                // A phase threshold crossed — short freeze so the escalation reads.
+                s.HitStop = MathF.Max(s.HitStop, BossPhaseHitStop);
+                break;
+
+            case EventKind.BossDeath:
+                // The milestone kill: heavy freeze + directed slow-mo to savor it.
+                s.HitStop = MathF.Max(s.HitStop, BossDeathHitStop);
+                SlowMo(s, BossDeathScale, BossDeathEase);
                 break;
 
             case EventKind.WaveStart:

@@ -76,8 +76,11 @@ while (!Raylib.WindowShouldClose() && !S.QuitRequested)
     switch (S.Phase)
     {
         case GamePhase.Title:
+            // §5 6.4: the title is a living, auto-played seeded backdrop wave —
+            // AttractSystem promotes to Playing for the UpdateAll call, restores
+            // Title, and re-seeds endlessly so the screen never stalls.
             FeelDirector.Tick(S, rawDt);
-            S.Time += rawDt;
+            AttractSystem.UpdateTitle(S, rawDt);
             break;
         case GamePhase.Paused:
             break; // world frozen; audio still pumps below (§4.6)
@@ -88,8 +91,9 @@ while (!Raylib.WindowShouldClose() && !S.QuitRequested)
             break;
     }
     DrainEvents(S);
-    // §5 3.2: run-ended edge — covers both the GameUpdate collapse and the
-    // WaveSystem no-target bail-out (single hook for every GameOver writer)
+    // §5 3.2 / 6.3: run-ended edge — fires when the ceremony hands off to the
+    // GameOver tail (Ceremony → GameOver). Inserts the top-10 row and arms the
+    // initials ceremony, so initials are sequenced AFTER the letter grade.
     if (S.Phase == GamePhase.GameOver && prevPhase != GamePhase.GameOver)
         Profile.OnGameOver(S);
     prevPhase = S.Phase;
@@ -119,12 +123,44 @@ static void DrainEvents(GameState s)
     {
         ref readonly var e = ref ring.At(i);
         s.Debug.EventCounts[(int)e.Kind]++;
-        // Lifetime stats (§5 3.2) — persisted with the profile
-        if (e.Kind == EventKind.Kill) Profile.Data.Lifetime.Kills++;
-        else if (e.Kind == EventKind.WaveCleared) Profile.Data.Lifetime.WavesCleared++;
-        // §4.5 tension input: city losses feed the decaying accumulator behind
-        // s.Intensity (GameUpdate.UpdateIntensity owns the decay + blend)
-        else if (e.Kind == EventKind.CityDestroyed) s.RecentCityHits += 1f;
+        // §5 6.2 report-card tallies — fed straight off the bus (the AOT-clean
+        // WaveStats struct that replaced the boxing telemetry dictionary).
+        switch (e.Kind)
+        {
+            // §5 6.3: RunKills/RunLeaks are the run-wide totals the ceremony grades
+            // on (WaveStats resets every wave; the grade needs the whole run).
+            case EventKind.Kill: s.Wave.Kills++; s.RunKills++; break;
+            case EventKind.GroundImpact: s.Wave.Leaks++; s.RunLeaks++; break;
+            case EventKind.CityDestroyed: s.Wave.CitiesLost++; break;
+            case EventKind.BaseDestroyed: s.Wave.BasesLost++; break;
+        }
+        // Lifetime stats (§5 3.2) — persisted with the profile. §5 6.4: the
+        // Title backdrop is an auto-played attract wave, NOT a real run — its
+        // kills/clears must never inflate the saved lifetime totals.
+        if (!s.Intro)
+        {
+            if (e.Kind == EventKind.Kill) Profile.Data.Lifetime.Kills++;
+            else if (e.Kind == EventKind.WaveCleared) Profile.Data.Lifetime.WavesCleared++;
+        }
+        // Tension input + boss cues are INDEPENDENT of the lifetime gate above
+        // (they must fire during real play, where s.Intro is false) — keep them
+        // out of that if/else chain.
+        switch (e.Kind)
+        {
+            // §4.5 tension input: city losses feed the decaying accumulator behind
+            // s.Intensity (GameUpdate.UpdateIntensity owns the decay + blend)
+            case EventKind.CityDestroyed:
+                s.RecentCityHits += 1f;
+                break;
+            // §5 6.1 boss audio cues (calling the synth — not editing it)
+            case EventKind.BossPhase:
+                SynthAudio.Thunder(MathH.Clamp(e.X / s.W, 0, 1), 0.7f);
+                break;
+            case EventKind.BossDeath:
+                SynthAudio.Thunder(MathH.Clamp(e.X / s.W, 0, 1), 1.0f);
+                SynthAudio.Impact(MathH.Clamp(e.X / s.W, 0, 1), heavy: true);
+                break;
+        }
         FeelDirector.OnEvent(s, in e);
     }
     ring.Clear();
@@ -156,6 +192,25 @@ static void HandleInput(GameState s, float rawDt)
         return;
     }
 
+    // ----- §5 6.3 CEREMONY — every stage is skippable: any key fast-forwards to
+    // the summary, then to the GameOver tail. Mouse is ignored so a click that
+    // killed the last city doesn't instantly blow past the grade reveal.
+    if (s.Phase == GamePhase.Ceremony)
+    {
+        if (Raylib.GetKeyPressed() != 0) GameUpdate.SkipCeremony(s);
+        return; // no gameplay input while the run grades out
+    }
+
+    // ----- TITLE / ATTRACT (§5 6.4) — the title menu + idle demo own all input;
+    // there is no gameplay underneath to fall through to (a left-click here is a
+    // menu confirm, not a fire). START/D begin a run, SETTINGS opens the pause
+    // panel, QUIT exits, any input wakes the demo back to the menu. -----
+    if (s.Phase == GamePhase.Title)
+    {
+        AttractSystem.HandleInput(s);
+        return;
+    }
+
     // ----- PAUSE (§5 3.1; ESC is free — SetExitKey(Null) above) -----
     if (s.Phase == GamePhase.Paused)
     {
@@ -166,6 +221,15 @@ static void HandleInput(GameState s, float rawDt)
         && (s.Phase == GamePhase.Playing || s.Phase == GamePhase.Shop))
     {
         Menu.Open(s);
+        return;
+    }
+    // ----- GAME OVER → TITLE (§5 6.4) — ESC from the death tail returns to the
+    // living title/attract (R still restarts straight into a fresh run). The
+    // initials ceremony swallows input above until confirmed, so this only fires
+    // once the run has fully graded out. -----
+    if (s.Phase == GamePhase.GameOver && Raylib.IsKeyPressed(KeyboardKey.Escape))
+    {
+        AttractSystem.Enter(s);
         return;
     }
 
@@ -194,6 +258,17 @@ static void HandleInput(GameState s, float rawDt)
             }
             keyCh = Raylib.GetCharPressed();
         }
+    }
+
+    // ----- WAVE INTRO COLLAPSE (§5 6.2) — any input skips the typewriter
+    // stinger instantly. Checked before the gameplay actions below so the very
+    // click/key that collapses it also performs its normal action (fire, EMP…).
+    if (s.Phase == GamePhase.Playing && !s.WaveIntroDone
+        && (Raylib.IsMouseButtonPressed(MouseButton.Left)
+            || Raylib.IsMouseButtonPressed(MouseButton.Right)
+            || Raylib.GetKeyPressed() != 0))
+    {
+        GameUpdate.CollapseWaveIntro(s);
     }
 
     // ----- SHOP INPUT (between waves; §5 3.5 — spends SCRAP, Score stays
@@ -405,22 +480,8 @@ static void HandleInput(GameState s, float rawDt)
         s.MsgT = 1.0f;
     }
 
-    // Daily seeded run (§4.3): FNV-1a64 of the UTC date — same plans on every
-    // machine for the same date
-    if (s.Phase == GamePhase.Title && Raylib.IsKeyPressed(KeyboardKey.D))
-    {
-        s.PendingSeed = SeedUtil.DailySeed();
-        GameInit.ResetGame(s);
-        s.Msg = "DAILY SEED RUN";
-        s.MsgT = 1.6f;
-        return;
-    }
-
-    // Start game on click during the title screen
-    if (s.Phase == GamePhase.Title && Raylib.IsMouseButtonPressed(MouseButton.Left))
-    {
-        GameInit.ResetGame(s);
-    }
+    // §5 6.4: the title menu, daily-seed (D) and start-run handling moved into
+    // AttractSystem.HandleInput (the Title block returns early above).
 }
 
 // Update is now handled by GameUpdate.UpdateAll()

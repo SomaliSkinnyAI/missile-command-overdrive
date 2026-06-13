@@ -8,6 +8,13 @@ public enum EventKind
     WaveStart,
     WaveCleared,
     Emp,
+    // §5 6.1 boss framework: a phase threshold crossed (Magnitude = new phase
+    // index) and the killing blow (Magnitude = boss score value). Both feed
+    // hit-stop/trauma + the audio cue from FeelDirector/the drain loop.
+    BossPhase,
+    BossDeath,
+    // GroundImpact MUST stay the LAST member — EventRing.KindCount and
+    // DebugState.EventCounts size off it.
     GroundImpact
 }
 

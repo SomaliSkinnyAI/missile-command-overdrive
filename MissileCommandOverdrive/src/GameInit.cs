@@ -270,6 +270,7 @@ public static class GameInit
         s.ComboPop = 0;
         s.LowAmmoTickCd = 0;
         s.Phase = GamePhase.Playing;
+        s.Auto = false;        // §5 6.4: a fresh run is manual (the attract backdrop forces Auto on)
         s.GameOverSfx = false;
         s.AssistedRun = false; // re-flagged by GameUpdate if an assist is active
         s.Time = 0;
@@ -315,6 +316,13 @@ public static class GameInit
         s.Weather.Bolts.Clear();
 
         s.GameOverTime = 0;
+        // §5 6.3 ceremony state resets with the run
+        s.CeremonyT = 0;
+        s.CeremonyGraded = false;
+        s.CeremonyInitialsArmed = false;
+        s.CeremonyGrade = 'C';
+        s.RunKills = 0;
+        s.RunLeaks = 0;
         s.Debug = new DebugState { Enabled = dbgEnabled };
         s.Events.Clear();
         FeelDirector.Reset(s);

@@ -569,6 +569,12 @@ public static class Renderer
         Raylib.EndBlendMode();
         DrawDebris(s);
         DrawFloatingTexts(s);
+        // §5 6.4: the title logo rides the WORLD pass (before EndTextureMode) so
+        // the GPU bloom threshold feeds on it — a bloom-lit layered wordmark over
+        // the living attract backdrop. The menu/marquee/demo text stay on the
+        // backbuffer (crisp, unrefracted) in DrawOverlays. The attract demo hides
+        // the logo so the self-playing wave reads as the showcase.
+        if (s.Phase == GamePhase.Title && !AttractSystem.Demo) DrawTitleLogo(s);
 
         Raylib.EndTextureMode();
 
@@ -2611,6 +2617,62 @@ public static class Renderer
         var d = s.Demon;
         if (d == null) return;
 
+        // --------- §5 6.1 rune-telegraphed meteor warnings ----------
+        // A glowing rune circle marks the ground impact for ≥1.2 s before the
+        // interceptable blast lands; it pulses faster + brighter as impact nears.
+        Raylib.BeginBlendMode(BlendMode.Additive);
+        for (int mi = 0; mi < d.Meteors.Length; mi++)
+        {
+            if (!d.Meteors[mi].Active) continue;
+            float prog = 1f - MathH.Clamp(d.Meteors[mi].WarnT / MathF.Max(0.001f, d.Meteors[mi].MaxWarn), 0f, 1f); // 0→1
+            float mx = d.Meteors[mi].X, my = d.Meteors[mi].Y;
+            float pulse = 0.5f + 0.5f * MathF.Sin(s.Time * (8f + prog * 14f));
+            byte a = (byte)((0.3f + prog * 0.6f) * (0.6f + pulse * 0.4f) * 255);
+            float ringR = 46f * (1f - prog * 0.35f);
+            // rune circle + inner cross + rotating triangle (sigil)
+            Raylib.DrawCircleLines((int)mx, (int)my, ringR, new Color((byte)255, (byte)90, (byte)60, a));
+            Raylib.DrawCircleLines((int)mx, (int)my, ringR * 0.62f, new Color((byte)255, (byte)140, (byte)70, (byte)(a * 0.8f)));
+            float rot = s.Time * 2.4f + mi;
+            for (int k = 0; k < 3; k++)
+            {
+                float a1 = rot + k * (MathH.TAU / 3f);
+                float a2 = rot + (k + 1) * (MathH.TAU / 3f);
+                Raylib.DrawLineEx(
+                    new Vector2(mx + MathF.Cos(a1) * ringR * 0.62f, my + MathF.Sin(a1) * ringR * 0.62f),
+                    new Vector2(mx + MathF.Cos(a2) * ringR * 0.62f, my + MathF.Sin(a2) * ringR * 0.62f),
+                    1.4f, new Color((byte)255, (byte)110, (byte)80, a));
+            }
+            // descending streak line from the demon as impact nears
+            if (prog > 0.5f)
+            {
+                float sk = (prog - 0.5f) * 2f;
+                Raylib.DrawLineEx(new Vector2(mx, my - 200f * (1f - sk)), new Vector2(mx, my),
+                    2f, new Color((byte)255, (byte)160, (byte)90, (byte)(sk * a)));
+            }
+        }
+        // --------- §5 6.1 firewall sweep (telegraph + active) ----------
+        if (d.SweepWarnT > 0f)
+        {
+            // charging: a vertical seam flickers where the wall will rise
+            float chg = 0.5f + 0.5f * MathF.Sin(s.Time * 22f);
+            Raylib.DrawRectangle((int)(d.SweepX - 3), (int)s.HorizonY, 6, (int)(s.GroundY - s.HorizonY),
+                new Color((byte)255, (byte)70, (byte)40, (byte)(chg * 150)));
+        }
+        if (d.SweepT > 0f)
+        {
+            // active wall of fire crossing the sky
+            float top = s.HorizonY + 10;
+            float h = s.GroundY - top;
+            for (int b = 0; b < 5; b++)
+            {
+                float bw = 10f - b * 1.5f;
+                byte fa = (byte)((0.5f - b * 0.08f) * 255);
+                Raylib.DrawRectangle((int)(d.SweepX - bw * 0.5f - b * 4f * d.SweepDir), (int)top, (int)bw, (int)h,
+                    new Color((byte)255, (byte)(110 - b * 14), (byte)(40 - b * 6), fa));
+            }
+        }
+        Raylib.EndBlendMode();
+
         float wing = 1f + MathF.Sin(s.Time * 11f + d.Phase) * 0.1f;
         float beat = 0.45f + 0.55f * MathF.Max(0f, MathF.Sin(s.Time * 8.6f + d.Phase));
 
@@ -2713,7 +2775,7 @@ public static class Renderer
         Raylib.EndBlendMode();
 
         // HP bar if damaged
-        int maxHp = 6;
+        int maxHp = d.MaxHp; // §5 6.1: was a duplicated magic-6
         float hpR = MathH.Clamp((float)d.Hp / maxHp, 0, 1);
         if (hpR < 0.999f)
         {
@@ -2895,6 +2957,80 @@ public static class Renderer
                 new Color((byte)225, (byte)255, (byte)210, (byte)(fl * alpha * 180)));
         }
         Raylib.EndBlendMode();
+
+        // --------- §5 6.1 turbolaser telegraph tracers ----------
+        // Telegraphed for ~0.5 s: a thin pulsing aim line from muzzle to target
+        // that brightens as the shot nears (gives the player time to clear out).
+        Raylib.BeginBlendMode(BlendMode.Additive);
+        for (int li = 0; li < m.Lasers.Length; li++)
+        {
+            if (!m.Lasers[li].Active) continue;
+            float warn = 1f - MathH.Clamp(m.Lasers[li].WarnT / MathF.Max(0.001f, m.Lasers[li].MaxWarn), 0f, 1f); // 0→1
+            byte la = (byte)((0.25f + warn * 0.65f) * alpha * 255);
+            var o = new Vector2(m.Lasers[li].Ox, m.Lasers[li].Oy);
+            var t = new Vector2(m.Lasers[li].Tx, m.Lasers[li].Ty);
+            Raylib.DrawLineEx(o, t, 1f + warn * 2.2f, new Color((byte)255, (byte)90, (byte)70, la));
+            // target reticle pulsing on the ground
+            float rr = 10f + (1f - warn) * 8f;
+            Raylib.DrawCircleLines((int)t.X, (int)t.Y, rr, new Color((byte)255, (byte)120, (byte)80, la));
+            Raylib.DrawCircleLines((int)t.X, (int)t.Y, rr * 0.55f, new Color((byte)255, (byte)160, (byte)120, (byte)(la * 0.7f)));
+        }
+        Raylib.EndBlendMode();
+
+        // --------- §5 6.1 shield-generator pods ----------
+        // Two glowing ellipse sub-hitboxes; killing both drops the hull shield.
+        var boss = m.Boss;
+        for (int pi = 0; pi < boss.PodCount; pi++)
+        {
+            ref readonly var pod = ref boss.Pods[pi];
+            float px = cx + pod.OffX * forward;
+            float py = cy + pod.OffY;
+            if (pod.Dead)
+            {
+                // brief death burst then nothing
+                if (pod.DeathT > 0.02f)
+                {
+                    Raylib.BeginBlendMode(BlendMode.Additive);
+                    DrawGradientCircle(px, py, 26f * (0.5f + pod.DeathT),
+                        new Color((byte)255, (byte)180, (byte)110, (byte)(pod.DeathT * alpha * 200)));
+                    Raylib.EndBlendMode();
+                }
+                continue;
+            }
+            float podHp = pod.MaxHp > 0 ? pod.Hp / (float)pod.MaxHp : 1f;
+            float pulse = 0.6f + 0.4f * MathF.Sin(s.Time * 5f + pi * 2.1f);
+            // glow halo (color shifts toward red as the pod is damaged)
+            byte gr = 120, gg = (byte)MathH.Lerp(120, 230, podHp), gb = (byte)MathH.Lerp(90, 255, podHp);
+            Raylib.BeginBlendMode(BlendMode.Additive);
+            DrawGradientCircle(px, py, pod.Rx * (1.4f + pulse * 0.3f),
+                new Color(gr, gg, gb, (byte)(alpha * (0.4f + pulse * 0.3f) * 200)));
+            Raylib.EndBlendMode();
+            // pod body
+            Raylib.DrawEllipse((int)px, (int)py, pod.Rx, pod.Ry,
+                new Color((byte)70, (byte)80, (byte)96, aByte));
+            Raylib.DrawEllipseLines((int)px, (int)py, pod.Rx, pod.Ry,
+                new Color((byte)160, (byte)220, (byte)255, (byte)(alpha * 230)));
+            // bright core
+            Raylib.BeginBlendMode(BlendMode.Additive);
+            Raylib.DrawCircle((int)px, (int)py, pod.Rx * 0.4f,
+                new Color((byte)190, gg, gb, (byte)(pulse * alpha * 230)));
+            Raylib.EndBlendMode();
+            // hit flash
+            if (pod.FlashT > 0.01f)
+            {
+                Raylib.BeginBlendMode(BlendMode.Additive);
+                DrawGradientCircle(px, py, pod.Rx * 2.2f,
+                    new Color((byte)255, (byte)255, (byte)255, (byte)(pod.FlashT * 4f * alpha * 200)));
+                Raylib.EndBlendMode();
+            }
+            // small HP pips above the pod
+            for (int h = 0; h < pod.MaxHp; h++)
+            {
+                Color pc = h < pod.Hp ? new Color((byte)120, (byte)220, (byte)255, aByte)
+                                      : new Color((byte)50, (byte)60, (byte)74, aByte);
+                Raylib.DrawRectangle((int)(px - pod.MaxHp * 2.5f + h * 5f), (int)(py - pod.Ry - 8), 3, 3, pc);
+            }
+        }
 
         // --------- Deflector force-field (shield active state) ----------
         if (m.ShieldActive)
@@ -4332,23 +4468,11 @@ public static class Renderer
     {
         if (s.Phase == GamePhase.Title)
         {
-            Raylib.DrawRectangle(0, 0, (int)s.W, (int)s.H, new Color((byte)0, (byte)0, (byte)0, (byte)192));
-            var t = "MISSILE COMMAND OVERDRIVE";
-            int tw = MeasureTextM(t, 44, true);
-            Raylib.DrawRectangleRounded(
-                new Rectangle(s.W / 2 - tw / 2 - 28, s.H / 2 - 58, tw + 56, 72),
-                0.2f, 10, new Color((byte)0, (byte)28, (byte)48, (byte)140));
-            DrawTextM(t, s.W / 2 - tw / 2, s.H / 2 - 46, 44, new Color((byte)120, (byte)240, (byte)255, (byte)255), true);
-            var sub = "Click to Start";
-            int sw = MeasureTextM(sub, 24);
-            float p = 0.38f + 0.62f * MathF.Sin(s.Time * 3.2f);
-            DrawTextM(sub, s.W / 2 - sw / 2, s.H / 2 + 28, 24, new Color((byte)198, (byte)228, (byte)255, (byte)(108 + p * 148)));
-            var hint = "LMB: Fire   RMB/E: EMP   C: Auto   H: HellRaiser   T: Theme   R: Restart";
-            int hw = MeasureTextM(hint, 15);
-            DrawTextM(hint, s.W / 2 - hw / 2, s.H / 2 + 82, 15, new Color((byte)138, (byte)158, (byte)192, (byte)170));
-            var hint2 = "D: Daily Seed Run";
-            int hw2 = MeasureTextM(hint2, 15);
-            DrawTextM(hint2, s.W / 2 - hw2 / 2, s.H / 2 + 104, 15, new Color((byte)138, (byte)158, (byte)192, (byte)170));
+            DrawTitleScreen(s); // §5 6.4 menu / scores / marquee / attract demo
+        }
+        if (s.Phase == GamePhase.Ceremony)
+        {
+            DrawCeremony(s);
         }
         if (s.Phase == GamePhase.GameOver)
         {
@@ -4358,6 +4482,11 @@ public static class Renderer
         {
             DrawShopPanel(s);
         }
+        // §5 6.2 wave stinger: the intro typewriter rides the WavePause window
+        // (regular waves only — boss waves keep their 6.1 banner); the CLEARED
+        // stamp + count-up animates over the shop panel's opening beat.
+        DrawWaveIntro(s);
+        DrawWaveCleared(s);
         float msgFs = 28f * s.Settings.UiScale;
         float noteFs = 17f * s.Settings.UiScale;
         if (s.MsgT > 0 && s.Msg.Length > 0)
@@ -4376,6 +4505,345 @@ public static class Renderer
         if (s.Phase == GamePhase.Paused) DrawPauseMenu(s);
     }
 
+    // ===== §5 6.2 wave stingers + report card =================================
+
+    // Letterbox bar height (fraction of screen) and the ease-in window.
+    const float IntroBarFrac = 0.11f;
+    const float IntroBarEase = 0.32f; // bars slide fully in over this many seconds
+    // Intro threat-icon row: cached per WavePlan reference so the draw path stays
+    // allocation-free while the intro holds (same discipline as the shop intel).
+    static List<WavePlanEntry>? _introPlanRef;
+    static readonly int[] _introCounts = new int[12]; // mirrors IntelVariants order
+    static readonly string[] _introCountStr = new string[12];
+
+    static void BuildIntroCache(GameState s)
+    {
+        if (ReferenceEquals(s.WavePlan, _introPlanRef)) return;
+        _introPlanRef = s.WavePlan;
+        Array.Clear(_introCounts);
+        var plan = s.WavePlan;
+        for (int i = 0; i < plan.Count; i++)
+            for (int v = 0; v < IntelVariants.Length; v++)
+                if (plan[i].Variant == IntelVariants[v]) { _introCounts[v]++; break; }
+        var sb = _hudSb;
+        for (int v = 0; v < IntelVariants.Length; v++)
+        {
+            sb.Clear();
+            sb.Append('x').Append(_introCounts[v]);
+            _introCountStr[v] = sb.ToString();
+        }
+    }
+
+    /// <summary>§5 6.2 wave intro: letterbox bars ease in, the WaveTitle types out
+    /// a glyph at a time (substring of the cached title — no per-frame concat),
+    /// and the live WavePlan's threat composition reads as a row of colored
+    /// warhead icons. Regular waves only; boss waves keep the 6.1 banner.</summary>
+    static void DrawWaveIntro(GameState s)
+    {
+        if (s.Phase != GamePhase.Playing || s.WaveIntroDone || s.WaveIntroBoss
+            || s.WaveTitle.Length == 0 || s.WavePause <= 0f)
+            return;
+
+        float t = s.WaveIntroT;
+        // Bars + content fade out over the final 0.18 s of the linger so the
+        // stinger dissolves rather than snapping off. `full` is the self-complete
+        // time (matches UpdateWaveStinger) so the dissolve lands exactly as the
+        // intro flips WaveIntroDone.
+        float full = s.WaveTitle.Length * GameUpdate.IntroCharStep + GameUpdate.IntroLinger;
+        float fade = full > 0f ? MathH.Clamp((full - t) / 0.18f, 0f, 1f) : 1f;
+        float barIn = MathH.Clamp(t / IntroBarEase, 0f, 1f);
+        float barIn2 = barIn * barIn * (3f - 2f * barIn); // smoothstep
+        float barH = s.H * IntroBarFrac * barIn2 * fade;
+        byte barA = (byte)(232 * fade);
+        Raylib.DrawRectangle(0, 0, (int)s.W, (int)barH, new Color((byte)6, (byte)9, (byte)16, barA));
+        Raylib.DrawRectangle(0, (int)(s.H - barH), (int)s.W, (int)MathF.Ceiling(barH),
+            new Color((byte)6, (byte)9, (byte)16, barA));
+        // thin accent edge on each bar
+        var edge = new Color((byte)120, (byte)210, (byte)255, (byte)(150 * fade * barIn2));
+        if (barH > 1f)
+        {
+            Raylib.DrawRectangle(0, (int)barH - 1, (int)s.W, 1, edge);
+            Raylib.DrawRectangle(0, (int)(s.H - barH), (int)s.W, 1, edge);
+        }
+
+        // Typewriter title — draw the revealed substring of the cached string.
+        int shown = Math.Min(s.WaveTitle.Length, (int)(t / GameUpdate.IntroCharStep));
+        if (shown <= 0) return;
+        float titleFs = MathF.Round(34f * s.Settings.UiScale);
+        // Measure the FULL title so the revealed text stays left-anchored on the
+        // final centered position (no horizontal jitter as glyphs appear).
+        int fullW = MeasureTextM(s.WaveTitle, titleFs, true);
+        float tx = s.W * 0.5f - fullW * 0.5f;
+        float ty = s.H * 0.5f - titleFs * 0.5f - 16f;
+        byte ta = (byte)(255 * fade);
+        // substring(0, shown) is the only allocation-free reveal raylib offers via
+        // DrawTextM — but Substring allocates. Instead draw glyph-by-glyph through
+        // the cached full string using a scratch buffer is overkill; the reveal is
+        // a once-per-wave UI path (not a hot loop), so a single Substring here is
+        // acceptable and matches the plan's "reveals a substring of a cached
+        // string" intent without per-FRAME concat (the string is cached; only the
+        // cut grows). Cache the last cut to avoid re-allocating every frame.
+        string cut = WaveTitleCut(s.WaveTitle, shown);
+        // blink a caret while typing
+        DrawTextM(cut, tx, ty, titleFs, new Color((byte)234, (byte)245, (byte)255, ta), true);
+        if (shown < s.WaveTitle.Length && ((int)(t * 3f) & 1) == 0)
+        {
+            int cw = MeasureTextM(cut, titleFs, true);
+            DrawTextM("_", tx + cw + 2, ty, titleFs, new Color((byte)120, (byte)210, (byte)255, ta), true);
+        }
+
+        // Threat-icon row under the title once the title has fully typed.
+        if (shown >= s.WaveTitle.Length)
+        {
+            BuildIntroCache(s);
+            float iconFs = MathF.Round(14f * s.Settings.UiScale);
+            // measure total row width to center it
+            float rowW = 0f;
+            for (int v = 0; v < IntelVariants.Length; v++)
+            {
+                if (_introCounts[v] == 0) continue;
+                rowW += 16f + MeasureTextM(_introCountStr[v], iconFs, true) + 14f;
+            }
+            float rx = s.W * 0.5f - rowW * 0.5f;
+            float ry = ty + titleFs + 12f;
+            for (int v = 0; v < IntelVariants.Length; v++)
+            {
+                if (_introCounts[v] == 0) continue;
+                var vc = Palette.VariantColor(IntelVariants[v]);
+                vc.A = ta;
+                Raylib.DrawPoly(new Vector2(rx + 6, ry + iconFs * 0.5f), 3, 6f, 90f, vc);
+                float lx = rx + 16f;
+                DrawTextM(_introCountStr[v], lx, ry, iconFs,
+                    new Color((byte)206, (byte)224, (byte)244, ta), true);
+                rx = lx + MeasureTextM(_introCountStr[v], iconFs, true) + 14f;
+            }
+        }
+    }
+
+    // §5 6.2 typewriter cut cache: the revealed substring grows by glyphs once
+    // per char-step (not every frame), so caching the last cut keeps the reveal
+    // allocation-free on the frames between steps.
+    static string _waveCut = "";
+    static int _waveCutLen = -1;
+    static string _waveCutSrc = "";
+    static string WaveTitleCut(string src, int len)
+    {
+        if (_waveCutLen == len && ReferenceEquals(_waveCutSrc, src)) return _waveCut;
+        _waveCut = src.Substring(0, len);
+        _waveCutLen = len;
+        _waveCutSrc = src;
+        return _waveCut;
+    }
+
+    // §5 6.2 cleared-stamp count-up: tally label strings are constants; the
+    // running values are cached against their last integer so the count-up only
+    // re-materializes a string when a digit actually changes.
+    const string ClearedStamp = "WAVE CLEARED";
+    static string _clrAcc = "", _clrSaved = "", _clrSalvage = "";
+    static int _clrAccV = -1, _clrSavedV = -1, _clrSalvageV = -1;
+
+    static string ClrVal(ref string cache, ref int last, int v, char suffix)
+    {
+        if (last == v) return cache;
+        last = v;
+        _hudSb.Clear();
+        _hudSb.Append(v);
+        if (suffix != '\0') _hudSb.Append(suffix);
+        cache = _hudSb.ToString();
+        return cache;
+    }
+
+    /// <summary>§5 6.2 report card: the CLEARED stamp punches in (scale 3→1,
+    /// ease-out-back) over the shop panel's opening beat, then count-up tallies
+    /// (intercept rate, cities saved, salvage) tick from 0 to their WaveStats
+    /// values. Drawn above the shop dim so it reads as the wave's verdict before
+    /// the strategy panel settles.</summary>
+    static void DrawWaveCleared(GameState s)
+    {
+        if (s.WaveClearT <= 0f) return;
+        // elapsed since the clear armed WaveClearT (= hold − remaining)
+        float elapsed = GameUpdate.WaveClearHold - s.WaveClearT;
+        // Stamp: scale 3→1 ease-out-back over the first 0.45 s, then hold.
+        float sp = MathH.Clamp(elapsed / 0.45f, 0f, 1f);
+        float scale = 3f - 2f * EaseOutBack(sp);
+        float fade = MathH.Clamp(s.WaveClearT / 0.4f, 0f, 1f); // dissolve at the end
+        float stampFs = MathF.Round(40f * s.Settings.UiScale * scale);
+        int sw = MeasureTextM(ClearedStamp, stampFs, true);
+        float cx = s.W * 0.5f;
+        float syy = s.H * 0.30f;
+        byte sa = (byte)(255 * fade);
+        // subtle drop shadow for punch
+        DrawTextM(ClearedStamp, cx - sw * 0.5f + 2, syy + 2, stampFs, new Color((byte)0, (byte)0, (byte)0, (byte)(150 * fade)), true);
+        DrawTextM(ClearedStamp, cx - sw * 0.5f, syy, stampFs, new Color((byte)140, (byte)245, (byte)255, sa), true);
+
+        // Count-up tallies: each value ramps 0→target over WaveClearCountDur,
+        // starting after the stamp lands (0.3 s in).
+        float cu = MathH.Clamp((elapsed - 0.3f) / GameUpdate.WaveClearCountDur, 0f, 1f);
+        int acc = (int)MathF.Round(s.Wave.AccuracyPct * cu);
+        int saved = (int)MathF.Round(s.Wave.CitiesSaved * cu);
+        int salv = (int)MathF.Round(s.Wave.Salvage * cu);
+        float ly = syy + stampFs + 14f;
+        float labFs = MathF.Round(18f * s.Settings.UiScale);
+        byte la = (byte)(235 * fade);
+        DrawTallyLine(s, "INTERCEPT RATE", ClrVal(ref _clrAcc, ref _clrAccV, acc, '%'),
+            cx, ly, labFs, new Color((byte)206, (byte)224, (byte)244, la));
+        DrawTallyLine(s, "CITIES SAVED", ClrVal(ref _clrSaved, ref _clrSavedV, saved, '\0'),
+            cx, ly + labFs + 8f, labFs, new Color((byte)206, (byte)224, (byte)244, la));
+        DrawTallyLine(s, "SALVAGE", ClrVal(ref _clrSalvage, ref _clrSalvageV, salv, '\0'),
+            cx, ly + (labFs + 8f) * 2f, labFs, new Color((byte)255, (byte)214, (byte)90, la));
+    }
+
+    // One "LABEL  value" tally row, centered on cx. Label dim, value bright.
+    static void DrawTallyLine(GameState s, string label, string val, float cx, float y, float fs, Color valCol)
+    {
+        int lw = MeasureTextM(label, fs);
+        int vw = MeasureTextM(val, fs, true);
+        float gap = 14f;
+        float total = lw + gap + vw;
+        float x = cx - total * 0.5f;
+        DrawTextM(label, x, y, fs, new Color((byte)150, (byte)172, (byte)200, valCol.A), false);
+        DrawTextM(val, x + lw + gap, y, fs, valCol, true);
+    }
+
+    // ===== §5 6.3 end-of-run ceremony =========================================
+
+    // Stat-row labels are constants; the count-up values are cached against their
+    // last integer (ClrVal dialect) so a string only re-materialises when a digit
+    // actually changes — zero steady-state allocation through the reveal.
+    const string CeremonyTitle = "RUN COMPLETE";
+    static readonly string[] CeremonyLabels = ["SCORE", "WAVE REACHED", "ACCURACY", "MAX COMBO"];
+    static readonly string[] _cerVal = ["", "", "", ""];
+    static readonly int[] _cerValV = [-1, -1, -1, -1];
+    // Pre-baked grade glyph strings (S/A/B/C/D) — the draw path never allocates
+    // from the grade char.
+    static readonly string[] _gradeStr = ["S", "A", "B", "C", "D"];
+    static string GradeStr(char g) => g switch
+    {
+        'S' => _gradeStr[0], 'A' => _gradeStr[1], 'B' => _gradeStr[2],
+        'C' => _gradeStr[3], _ => _gradeStr[4]
+    };
+    // Grade hue: S gold, A green, B cyan, C amber, D red.
+    static Color GradeColor(char g, byte a) => g switch
+    {
+        'S' => new Color((byte)255, (byte)214, (byte)90, a),
+        'A' => new Color((byte)120, (byte)240, (byte)150, a),
+        'B' => new Color((byte)120, (byte)240, (byte)255, a),
+        'C' => new Color((byte)255, (byte)186, (byte)90, a),
+        _ => new Color((byte)255, (byte)96, (byte)80, a)
+    };
+
+    static int CerStatTarget(GameState s, int i) => i switch
+    {
+        0 => s.Score,
+        1 => s.Level,
+        2 => Ceremony.RunAccuracyPct(s),
+        _ => s.MaxCombo
+    };
+
+    /// <summary>§5 6.3: the staged stat reveal + letter grade. A slow curtain
+    /// fades in over the smouldering (TimeScale 0.3) world, four stat rows reveal
+    /// every ~0.6 s with count-up ticks (cached strings — not per-frame), then the
+    /// grade stamps (scale 3→1 ease-out-back). Every stage is skippable; the
+    /// GameOver phase (folded-in top-10/initials/retry tail) takes over after.</summary>
+    static void DrawCeremony(GameState s)
+    {
+        float ct = s.CeremonyT;
+        // Slow curtain — eases in after the death freeze, never fully opaque so
+        // the world keeps smouldering behind the verdict.
+        float fade = MathH.Clamp((ct - Ceremony.FadeStart) / Ceremony.FadeDur, 0f, 1f);
+        byte oa = (byte)(fade * 196);
+        Raylib.DrawRectangle(0, 0, (int)s.W, (int)s.H, new Color((byte)2, (byte)4, (byte)9, oa));
+
+        float cx = s.W * 0.5f;
+        float ui = s.Settings.UiScale;
+
+        // Title — fades in with the curtain.
+        byte ta = (byte)(fade * 255);
+        float titleFs = MathF.Round(40f * ui);
+        int tw = MeasureTextM(CeremonyTitle, titleFs, true);
+        DrawTextM(CeremonyTitle, cx - tw / 2f, s.H * 0.14f, titleFs,
+            new Color((byte)198, (byte)228, (byte)255, ta), true);
+
+        // Stat rows — reveal one at a time, value counts up over CountDur.
+        float rowFs = MathF.Round(22f * ui);
+        float rowH = rowFs + 16f;
+        float ry = s.H * 0.30f;
+        for (int i = 0; i < Ceremony.StatCount; i++)
+        {
+            float rev = Ceremony.StatReveal(ct, i);
+            if (rev <= 0f) continue;
+            int target = CerStatTarget(s, i);
+            int shown = (int)MathF.Round(target * rev);
+            char suffix = i == 2 ? '%' : '\0';
+            // x-prefix for the MAX COMBO row reads as the in-HUD combo style.
+            string val = i == 3
+                ? CerComboVal(shown)
+                : ClrVal(ref _cerVal[i], ref _cerValV[i], shown, suffix);
+            byte ra = (byte)(MathH.Clamp(rev * 1.4f, 0f, 1f) * 240);
+            Color valCol = i == 2
+                ? new Color((byte)140, (byte)245, (byte)200, ra) // accuracy: green
+                : new Color((byte)206, (byte)224, (byte)244, ra);
+            DrawCerRow(CeremonyLabels[i], val, cx, ry + i * rowH, rowFs, valCol, ra);
+        }
+
+        // Letter grade — stamps once every row is in.
+        float gr = Ceremony.GradeReveal(ct);
+        if (gr > 0f && s.CeremonyGraded)
+        {
+            float scale = 3f - 2f * EaseOutBack(gr);
+            float gradeFs = MathF.Round(96f * ui * scale);
+            char g = s.CeremonyGrade;
+            string gs = GradeStr(g);
+            int gw = MeasureTextM(gs, gradeFs, true);
+            float gy = ry + Ceremony.StatCount * rowH + 18f;
+            // "GRADE" caption above the glyph
+            float capFs = MathF.Round(16f * ui);
+            int cw = MeasureTextM("GRADE", capFs, true);
+            DrawTextM("GRADE", cx - cw / 2f, gy, capFs, new Color((byte)150, (byte)172, (byte)200, (byte)220), true);
+            float glyphY = gy + capFs + 6f;
+            // drop shadow for punch, then the graded glyph
+            DrawTextM(gs, cx - gw / 2f + 3, glyphY + 3, gradeFs, new Color((byte)0, (byte)0, (byte)0, (byte)150), true);
+            DrawTextM(gs, cx - gw / 2f, glyphY, gradeFs, GradeColor(g, (byte)255), true);
+        }
+
+        // Skip hint — once the curtain is up, before the tail takes over.
+        if (fade > 0.6f && ct < Ceremony.SummaryAt)
+        {
+            const string hint = "Press any key to skip";
+            float hp = 0.4f + 0.6f * MathF.Sin(FeelDirector.Clock * 3.2f);
+            float hintFs = MathF.Round(15f * ui);
+            int hw = MeasureTextM(hint, hintFs);
+            DrawTextM(hint, cx - hw / 2f, s.H - 40f, hintFs,
+                new Color((byte)138, (byte)158, (byte)192, (byte)(hp * 170)));
+        }
+    }
+
+    // MAX COMBO count-up value ("xNN") cached against its last int.
+    static string _cerCombo = "";
+    static int _cerComboV = -1;
+    static string CerComboVal(int v)
+    {
+        if (_cerComboV == v) return _cerCombo;
+        _cerComboV = v;
+        _hudSb.Clear();
+        _hudSb.Append('x').Append(v);
+        _cerCombo = _hudSb.ToString();
+        return _cerCombo;
+    }
+
+    // One ceremony "LABEL ........ value" row centered on cx. Label dim/left,
+    // value bright/right, sharing a fixed total span so the column stays steady.
+    static void DrawCerRow(string label, string val, float cx, float y, float fs, Color valCol, byte alpha)
+    {
+        int lw = MeasureTextM(label, fs);
+        int vw = MeasureTextM(val, fs, true);
+        float gap = 28f;
+        float total = lw + gap + vw;
+        float x = cx - total * 0.5f;
+        DrawTextM(label, x, y, fs, new Color((byte)150, (byte)172, (byte)200, alpha), false);
+        DrawTextM(val, x + lw + gap, y, fs, valCol, true);
+    }
+
     // Game-over screen (§5 3.2): initials ceremony + top-10 + seed. Table/seed
     // strings are cached in Profile (rebuilt on profile events only); the
     // score/combo line uses the CacheSb dialect — zero steady-state allocation.
@@ -4383,7 +4851,7 @@ public static class Renderer
     const string GoNewHighScore = "NEW HIGH SCORE — ENTER INITIALS";
     const string GoInitialsHint = "UP/DOWN LETTER   LEFT/RIGHT SLOT   ENTER CONFIRM";
     const string GoTableHeader = " #  INI     SCORE  WAV  CMB"; // column-aligned with Profile.BuildRow
-    const string GoRestartHint = "Press R to Restart";
+    const string GoRestartHint = "Press R to Restart    ESC for Title";
     static string _goStats = "";
 
     static void DrawGameOver(GameState s)
@@ -4396,6 +4864,15 @@ public static class Renderer
         int gow = MeasureTextM(GoTitle, 52, true);
         float p = 0.62f + 0.38f * MathF.Sin(s.Time * 2.2f);
         DrawTextM(GoTitle, cx - gow / 2, topY, 52, new Color((byte)255, (byte)90, (byte)70, (byte)(p * 255)), true);
+
+        // §5 6.3: the ceremony's letter grade persists into the tail, badged to
+        // the right of the title so the run's verdict stays visible over the table.
+        char g = s.CeremonyGrade;
+        string gs = GradeStr(g);
+        int gbw = MeasureTextM(gs, 38, true);
+        float gbx = cx + gow / 2f + 24f;
+        DrawTextM("GRADE", gbx, topY + 4, 13, new Color((byte)150, (byte)172, (byte)200, (byte)210), true);
+        DrawTextM(gs, gbx + 8f, topY + 16, 38, GradeColor(g, (byte)255), true);
 
         _hudSb.Clear();
         _hudSb.Append("SCORE ").Append(s.Score).Append("    MAX COMBO x").Append(s.MaxCombo);
@@ -4479,6 +4956,206 @@ public static class Renderer
             float rp = 0.38f + 0.62f * MathF.Sin(s.Time * 3.2f);
             DrawTextM(GoRestartHint, cx - rw / 2, y, 20, new Color((byte)120, (byte)240, (byte)255, (byte)(rp * 230)));
         }
+    }
+
+    // ===== §5 6.4 title screen + attract mode ================================
+
+    const string TitleWord = "MISSILE COMMAND";
+    const string TitleWord2 = "OVERDRIVE";
+    const string DemoFlash = "DEMO  —  PRESS ANY KEY";
+    const string ScoresTitle = "HIGH SCORES";
+    const string ScoresEmpty = "NO SCORES YET — BE THE FIRST";
+    const string MarqueePrefix = "TOP PILOTS:   ";
+
+    /// <summary>§5 6.4 bloom-fed layered wordmark — drawn in the WORLD pass so the
+    /// GPU bloom threshold (0.6) feeds on the bright additive core. Three layers:
+    /// a wide soft glow halo (additive), a dark plate, and the bright wordmark
+    /// (additive over the plate) with a faint pulse on the unscaled clock.</summary>
+    static void DrawTitleLogo(GameState s)
+    {
+        float cx = s.W * 0.5f;
+        float baseY = s.H * 0.20f;
+        // Scale the wordmark to the viewport so it never clips on narrow windows.
+        float fs1 = MathF.Min(72f, s.W * 0.066f);
+        float fs2 = fs1 * 0.78f;
+        float pulse = 0.85f + 0.15f * MathF.Sin(FeelDirector.Clock * 1.7f);
+
+        int w1 = MeasureTextM(TitleWord, fs1, true);
+        int w2 = MeasureTextM(TitleWord2, fs2, true);
+        float y1 = baseY;
+        float y2 = baseY + fs1 * 0.96f;
+
+        // Soft glow halo — wide, low-alpha additive rounded plate behind the text
+        // so the bloom pass has a bright, blurred seed (cheap stand-in for a real
+        // emissive logo mask).
+        Raylib.BeginBlendMode(BlendMode.Additive);
+        float gw = MathF.Max(w1, w2) + fs1 * 1.4f;
+        float gh = (y2 + fs2) - y1 + fs1 * 0.9f;
+        Raylib.DrawRectangleRounded(
+            new Rectangle(cx - gw * 0.5f, y1 - fs1 * 0.45f, gw, gh),
+            0.5f, 12, new Color((byte)20, (byte)90, (byte)120, (byte)(34 * pulse)));
+        Raylib.EndBlendMode();
+
+        // Dark backing plate for contrast against the busy backdrop.
+        Raylib.DrawRectangleRounded(
+            new Rectangle(cx - gw * 0.5f + fs1 * 0.2f, y1 - fs1 * 0.22f, gw - fs1 * 0.4f, gh - fs1 * 0.5f),
+            0.32f, 10, new Color((byte)2, (byte)10, (byte)20, (byte)170));
+
+        // Bright wordmark — additive so overlapping bloom mips light it. Two
+        // tints stack: a hot cyan core over a slightly offset deep-blue shadow.
+        DrawTextM(TitleWord, cx - w1 / 2f + 2, y1 + 3, fs1, new Color((byte)8, (byte)40, (byte)80, (byte)200), true);
+        DrawTextM(TitleWord2, cx - w2 / 2f + 2, y2 + 3, fs2, new Color((byte)8, (byte)40, (byte)80, (byte)200), true);
+        Raylib.BeginBlendMode(BlendMode.Additive);
+        byte core = (byte)(255 * pulse);
+        DrawTextM(TitleWord, cx - w1 / 2f, y1, fs1, new Color((byte)120, (byte)238, (byte)255, core), true);
+        DrawTextM(TitleWord2, cx - w2 / 2f, y2, fs2, new Color((byte)255, (byte)196, (byte)92, core), true);
+        Raylib.EndBlendMode();
+    }
+
+    /// <summary>§5 6.4 title overlay (backbuffer): the START/SCORES/SETTINGS/QUIT
+    /// menu + a scrolling top-10 marquee, or — after 15 s idle — the flashing
+    /// attract-demo prompt with the menu hidden so the self-playing wave reads
+    /// full-screen. The logo itself is drawn in the world pass (DrawTitleLogo).</summary>
+    static void DrawTitleScreen(GameState s)
+    {
+        float cx = s.W * 0.5f;
+
+        if (AttractSystem.Demo)
+        {
+            // Attract presentation: no menu, no dim — the living wave is the show.
+            // A blinking banner on the unscaled clock invites any input back.
+            float blink = MathF.Sin(FeelDirector.Clock * 4.2f);
+            if (blink > -0.2f)
+            {
+                float fs = MathF.Min(30f, s.W * 0.028f);
+                int dw = MeasureTextM(DemoFlash, fs, true);
+                float dy = s.H * 0.86f;
+                byte a = (byte)(190 + 65 * MathF.Max(0f, blink));
+                Raylib.DrawRectangle((int)(cx - dw / 2f - 18), (int)(dy - 8),
+                    dw + 36, (int)(fs + 14), new Color((byte)2, (byte)8, (byte)16, (byte)150));
+                DrawTextM(DemoFlash, cx - dw / 2f, dy, fs, new Color((byte)255, (byte)214, (byte)90, a), true);
+            }
+            return;
+        }
+
+        // Light full-screen dim so the menu/logo read over the living backdrop
+        // without hiding it (the old title used a near-opaque 192 plate).
+        Raylib.DrawRectangle(0, 0, (int)s.W, (int)s.H, new Color((byte)0, (byte)2, (byte)8, (byte)96));
+
+        // ----- menu -----
+        float ui = s.Settings.UiScale;
+        float fsItem = 26f * ui;
+        float rowH = fsItem + 16f;
+        float menuTop = s.H * 0.46f;
+        for (int i = 0; i < AttractSystem.ItemCount; i++)
+        {
+            bool sel = i == AttractSystem.Sel;
+            float ry = menuTop + i * rowH;
+            string label = AttractSystem.Labels[i];
+            int lw = MeasureTextM(label, fsItem, sel);
+            if (sel)
+            {
+                // Selection chevrons + a soft highlight bar (additive glow).
+                float gw = lw + 84f;
+                Raylib.BeginBlendMode(BlendMode.Additive);
+                Raylib.DrawRectangleRounded(new Rectangle(cx - gw / 2f, ry - 4, gw, rowH - 6),
+                    0.5f, 8, new Color((byte)40, (byte)120, (byte)150, (byte)34));
+                Raylib.EndBlendMode();
+                DrawTextM(">", cx - lw / 2f - 34, ry, fsItem, new Color((byte)120, (byte)240, (byte)255, (byte)255), true);
+                DrawTextM("<", cx + lw / 2f + 16, ry, fsItem, new Color((byte)120, (byte)240, (byte)255, (byte)255), true);
+            }
+            Color c = sel ? new Color((byte)160, (byte)246, (byte)255, (byte)255)
+                          : new Color((byte)150, (byte)186, (byte)220, (byte)205);
+            DrawTextM(label, cx - lw / 2f, ry, fsItem, c, sel);
+        }
+
+        // ----- controls hint under the menu -----
+        const string hint = "UP/DOWN SELECT   ENTER START   D DAILY SEED   ESC QUIT";
+        int hw = MeasureTextM(hint, 14f * ui);
+        DrawTextM(hint, cx - hw / 2f, menuTop + AttractSystem.ItemCount * rowH + 14f,
+            14f * ui, new Color((byte)128, (byte)156, (byte)190, (byte)180));
+
+        // ----- SCORES panel (toggled) OR the scrolling marquee at the bottom -----
+        if (AttractSystem.ScoresOpen) DrawScoresPanel(s);
+        else DrawScoreMarquee(s);
+    }
+
+    // Centered top-10 panel shown when SCORES is toggled (reuses the cached
+    // Profile.TableText rows — same data the game-over tail renders).
+    static void DrawScoresPanel(GameState s)
+    {
+        float cx = s.W * 0.5f;
+        float panelW = MathF.Min(s.W - 60, 560f);
+        float rowH = 22f;
+        float panelH = 84f + MathF.Max(1, Profile.TableCount) * rowH;
+        float px = cx - panelW * 0.5f;
+        float py = MathF.Max(20, s.H * 0.5f - panelH * 0.5f);
+
+        Raylib.DrawRectangle(0, 0, (int)s.W, (int)s.H, new Color((byte)0, (byte)0, (byte)0, (byte)170));
+        var rect = new Rectangle(px, py, panelW, panelH);
+        Raylib.DrawRectangleRounded(rect, 0.05f, 10, new Color((byte)6, (byte)12, (byte)24, (byte)238));
+        Raylib.DrawRectangleRoundedLinesEx(rect, 0.05f, 10, 2f, new Color((byte)120, (byte)220, (byte)255, (byte)190));
+
+        int tlw = MeasureTextM(ScoresTitle, 26, true);
+        DrawTextM(ScoresTitle, cx - tlw / 2f, py + 16, 26, new Color((byte)120, (byte)240, (byte)255, (byte)255), true);
+
+        float y = py + 58;
+        if (Profile.TableCount == 0)
+        {
+            int ew = MeasureTextM(ScoresEmpty, 16);
+            DrawTextM(ScoresEmpty, cx - ew / 2f, y, 16, new Color((byte)172, (byte)202, (byte)232, (byte)210));
+        }
+        else
+        {
+            int thw = MeasureTextM(GoTableHeader, 16, true);
+            DrawTextM(GoTableHeader, cx - thw / 2f, y, 16, new Color((byte)120, (byte)240, (byte)255, (byte)220), true);
+            y += rowH + 2;
+            for (int i = 0; i < Profile.TableCount; i++)
+            {
+                DrawTextM(Profile.TableText[i], cx - thw / 2f, y, 16,
+                    new Color((byte)172, (byte)202, (byte)232, (byte)220));
+                y += rowH;
+            }
+        }
+
+        const string close = "ESC / SCORES TO CLOSE";
+        int clw = MeasureTextM(close, 13);
+        DrawTextM(close, cx - clw / 2f, py + panelH - 22, 13, new Color((byte)128, (byte)156, (byte)190, (byte)180));
+    }
+
+    // Single-line scrolling marquee of the top pilots along the bottom edge.
+    // The text is cached in Profile (TableText); the scroll offset is the only
+    // per-frame compute (no string building in the hot path).
+    static void DrawScoreMarquee(GameState s)
+    {
+        if (Profile.TableCount == 0) return;
+        float fs = 16f;
+        float y = s.H - 30f;
+        Raylib.DrawRectangle(0, (int)(y - 6), (int)s.W, (int)(fs + 12), new Color((byte)2, (byte)8, (byte)16, (byte)120));
+
+        // Scroll right-to-left; wrap on the measured run width. Draw each pilot
+        // entry spaced out — measured once per entry per frame (TableCount ≤ 10).
+        float speed = 70f;
+        float scroll = (AttractSystem.MarqueeT * speed) % MarqueeSpan(s);
+        float x = s.W - scroll;
+        DrawTextM(MarqueePrefix, x, y, fs, new Color((byte)120, (byte)240, (byte)255, (byte)200), true);
+        x += MeasureTextM(MarqueePrefix, fs, true);
+        for (int i = 0; i < Profile.TableCount; i++)
+        {
+            string row = Profile.TableText[i];
+            DrawTextM(row, x, y, fs, new Color((byte)172, (byte)202, (byte)232, (byte)205));
+            x += MeasureTextM(row, fs) + 48f;
+        }
+    }
+
+    // Total scrollable span of the marquee run (prefix + all rows + gaps) — the
+    // wrap period so the strip loops seamlessly off the right edge.
+    static float MarqueeSpan(GameState s)
+    {
+        float span = MeasureTextM(MarqueePrefix, 16f, true) + s.W;
+        for (int i = 0; i < Profile.TableCount; i++)
+            span += MeasureTextM(Profile.TableText[i], 16f) + 48f;
+        return span;
     }
 
     // Pause/settings menu (§5 3.1) — HUD aesthetic, zero per-frame allocation:
@@ -4599,13 +5276,23 @@ public static class Renderer
         DrawTextM(funds, px + panelW * 0.5f - fw * 0.5f, py + 60, 22,
             new Color((byte)255, (byte)214, (byte)90, (byte)255), true);
 
+        // §5 6.2 report card: the just-cleared wave's tallies, centered under the
+        // funds line (the animated CLEARED stamp shows the same numbers over the
+        // shop's opening beat; this is the persistent record). Shop path — string
+        // interpolation here matches the panel's existing non-hot-path style.
+        var rc = s.Wave;
+        string card = $"LAST WAVE   INTERCEPT {rc.AccuracyPct}%   CITIES {rc.CitiesSaved}   SALVAGE +{rc.Salvage}";
+        int rcw = MeasureTextM(card, 14, true);
+        DrawTextM(card, px + panelW * 0.5f - rcw * 0.5f, py + 84, 14,
+            new Color((byte)175, (byte)205, (byte)238, (byte)225), true);
+
         // Free-repair crew status (§5 3.5: earned every 3 cleared waves, banked)
         int repairIn = Math.Max(0, 3 - s.Upgrades.WavesSinceFreeRepair);
         string crew = repairIn == 0
             ? "FIELD REPAIR CREW STANDING BY"
             : $"FIELD REPAIR CREW READY IN {repairIn} WAVE{(repairIn == 1 ? "" : "S")}";
-        int cw = MeasureTextM(crew, 14);
-        DrawTextM(crew, px + panelW * 0.5f - cw * 0.5f, py + 86, 14,
+        int cw = MeasureTextM(crew, 12);
+        DrawTextM(crew, px + panelW * 0.5f - cw * 0.5f, py + 100, 12,
             new Color((byte)190, (byte)185, (byte)150, (byte)200));
 
         // §5 4.1/4.3: draft cards left, intel forecast column right; the scrap

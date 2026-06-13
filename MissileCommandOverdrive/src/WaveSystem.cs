@@ -259,6 +259,11 @@ public static class WaveSystem
         s.DebrisParts.Clear();
         s.Shockwaves.Clear();
         s.LightBursts.Clear();
+        // §5 6.1: a lingering boss from the previous wave is cleared at wave start
+        // so a scheduled boss is the only one on screen (and a level-skip is clean).
+        s.Mothership = null;
+        s.Demon = null;
+        s.Fighters.Clear();
 
         // §5 3.5: the old 33/40/58% coin-flip self-repairs are gone — structures
         // only come back via the free repair (every 3 cleared waves, FreeRepair
@@ -324,12 +329,67 @@ public static class WaveSystem
         PerkSystem.ClearDraft(s);
         s.Perks.CityShieldUsed = false;
 
-        s.Note = $"Wave {s.Level} incoming | {s.Weather.Mode.ToUpperInvariant()} FRONT";
-        s.NoteT = 2.1f;
+        // §5 6.2 wave stinger: reset the report-card tallies for the new wave and
+        // arm the intro typewriter (WeatherSystem.SetWaveWeather runs below, so the
+        // flavour reads off the weather chosen for THIS wave).
+        s.Wave = default;
+        s.WaveClearT = 0f;
+        s.WaveIntroT = 0f;
+        s.WaveIntroDone = false;
+        s.WaveIntroBoss = s.Level % 5 == 0;
+
+        // §5 6.1 scheduled boss every 5th wave (deterministic, Level-keyed):
+        // Mothership at 5/15/25…, Daemon at 10/20/30…. The 666/777 cheat codes
+        // remain independent instant summons. The boss spawns into the wave-pause
+        // window so its intro banner reads before regular spawns begin; the
+        // Mothership additionally holds spawning (HoldSpawning) for the cinematic.
+        if (s.Level % 5 == 0)
+        {
+            if (s.Level % 10 == 0) DemonSystem.Spawn(s, scheduled: true);
+            else MothershipSystem.Spawn(s, scheduled: true);
+            s.WavePause = MathF.Max(s.WavePause, 3.0f); // longer cinematic intro
+            s.Note = $"WAVE {s.Level} — BOSS ENCOUNTER";
+            s.NoteT = 2.6f;
+        }
+        else
+        {
+            s.Note = $"Wave {s.Level} incoming | {s.Weather.Mode.ToUpperInvariant()} FRONT";
+            s.NoteT = 2.1f;
+        }
         s.Events.Emit(EventKind.WaveStart, s.W * 0.5f, s.H * 0.5f, s.Level);
         SynthAudio.WaveStab(); // §5 4.5 wave-banner stab
 
         WeatherSystem.SetWaveWeather(s);
+
+        // §5 6.2 typewriter title — composed ONCE here so the intro draws a
+        // substring of this cached string (no per-frame concat). Boss waves keep
+        // the boss banner (s.Note) and skip the typewriter, so build the title
+        // only for regular waves.
+        s.WaveTitle = s.WaveIntroBoss ? "" : $"WAVE {s.Level} — {WaveFlavor(s)}";
+    }
+
+    // §5 6.2 weather/level-flavoured wave name (deterministic, per-wave plan
+    // stream — same seed ⇒ same name; picked from the slice matching the wave's
+    // weather mode so the title and the sky agree).
+    static readonly string[] FlavorClear =
+        ["CLEAR SKIES", "NIGHT WATCH", "DEAD CALM", "FIRST LIGHT", "SILENT RUN", "OPEN FIELD"];
+    static readonly string[] FlavorAsh =
+        ["ASHFALL", "CINDER VEIL", "EMBER DRIFT", "GREY DAWN", "SCORCHED AIR", "FALLOUT"];
+    static readonly string[] FlavorStorm =
+        ["STORM FRONT", "THUNDERHEAD", "SQUALL LINE", "TEMPEST", "BLACK RAIN", "GALE WARNING"];
+
+    static string WaveFlavor(GameState s)
+    {
+        var pool = s.Weather.Mode switch
+        {
+            "ash" => FlavorAsh,
+            "storm" => FlavorStorm,
+            _ => FlavorClear
+        };
+        // Deterministic index from (seed, level) — own derivation so it can't
+        // perturb the plan stream (which is already consumed by this point).
+        ulong h = (s.MasterSeed ^ ((ulong)s.Level * 0x9E3779B97F4A7C15UL));
+        return pool[(int)(h % (ulong)pool.Length)];
     }
 
     /// <summary>§5 3.5 deterministic repairs: one free structure repair earned per
@@ -441,7 +501,10 @@ public static class WaveSystem
     public static void SpawnEnemy(GameState s, WavePlanEntry e)
     {
         var t = ChooseTarget(s, e.Variant);
-        if (t == null) { s.Phase = GamePhase.GameOver; return; }
+        // §5 6.3: no valid target = every city is gone — route through the single
+        // death edge so the ceremony (freeze/grade/initials) plays here too, not
+        // just on the GameUpdate aliveCities check.
+        if (t == null) { if (s.Phase == GamePhase.Playing) GameUpdate.EnterCeremony(s); return; }
 
         bool cruise = e.Variant == "cruise";
         bool carrier = e.Variant == "carrier";
